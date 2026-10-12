@@ -2,11 +2,13 @@ pub mod config;
 pub mod error;
 pub mod models;
 pub mod state_store_dynamo;
+pub mod state_store_memory;
 
 pub use config::DynamoDbConfig;
 pub use error::{Error, Result};
 pub use models::{ExecutionStatus, Query, QueryMetric, SessionRecord, Variable, ViewRecord};
 pub use state_store_dynamo::DynamoDbStateStore;
+pub use state_store_memory::InMemoryStateStore;
 
 #[mockall::automock]
 #[async_trait::async_trait]

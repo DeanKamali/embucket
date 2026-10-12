@@ -45,11 +45,23 @@ impl Display for ExecutionStatus {
 }
 
 /// Session entity persisted in `DynamoDB`.
+///
+/// This record is the durable representation of a session: it survives process
+/// restarts so that a reconnecting client can be rehydrated on any
+/// `embucketd`/router instance (Avalanche workstream A).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    /// Login-time context (account, client app, initial database/schema/warehouse).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
+    /// Unix-seconds inactivity expiry; sessions past this point are dead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry: Option<u64>,
     #[serde(default)]
     pub variables: HashMap<String, Variable>,
     #[serde(default)]
@@ -71,6 +83,9 @@ impl SessionRecord {
         Self {
             session_id: session_id.to_string(),
             ttl_seconds: None,
+            user_name: None,
+            metadata: HashMap::new(),
+            expiry: None,
             variables: HashMap::new(),
             views: HashMap::new(),
             created_at,

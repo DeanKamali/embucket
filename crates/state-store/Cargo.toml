@@ -19,6 +19,7 @@ snafu = { workspace = true }
 chrono = { workspace = true }
 mockall = { workspace = true }
 uuid = { workspace = true }
+tokio = { workspace = true }
 
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 

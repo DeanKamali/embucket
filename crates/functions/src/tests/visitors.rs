@@ -97,7 +97,7 @@ fn test_like_ilike_any_expr_rewriter() -> DFResult<()> {
     ];
 
     for (input, expected) in cases {
-        let mut statement = state.sql_to_statement(input, "snowflake")?;
+        let mut statement = state.sql_to_statement(input, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut stmt) = statement {
             like_ilike_any::visit(stmt);
         }
@@ -138,7 +138,7 @@ fn test_rlike_regexp_expr_rewriter() -> DFResult<()> {
     ];
 
     for (input, expected) in cases {
-        let mut statement = state.sql_to_statement(input, "snowflake")?;
+        let mut statement = state.sql_to_statement(input, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut stmt) = statement {
             rlike_regexp_expr_rewriter::visit(stmt);
         }
@@ -170,7 +170,7 @@ fn test_json_element() -> DFResult<()> {
     ];
 
     for (input, expected) in cases {
-        let mut statement = state.sql_to_statement(input, "snowflake")?;
+        let mut statement = state.sql_to_statement(input, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut stmt) = statement {
             json_element::visit(stmt);
         }
@@ -258,7 +258,7 @@ fn test_functions_rewriter() -> DFResult<()> {
     ];
 
     for (input, expected) in cases {
-        let mut statement = state.sql_to_statement(input, "snowflake")?;
+        let mut statement = state.sql_to_statement(input, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut stmt) = statement {
             functions_rewriter::visit(stmt);
         }
@@ -294,7 +294,7 @@ fn test_select_expr_aliases() -> DFResult<()> {
     ];
 
     for (input, expected) in cases {
-        let mut statement = state.sql_to_statement(input, "snowflake")?;
+        let mut statement = state.sql_to_statement(input, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut stmt) = statement {
             select_expr_aliases::visit(stmt);
         }
@@ -431,7 +431,7 @@ fn test_inline_aliases_in_query() -> DFResult<()> {
     ];
 
     for (input, expected) in cases {
-        let mut statement = state.sql_to_statement(input, "snowflake")?;
+        let mut statement = state.sql_to_statement(input, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut stmt) = statement {
             inline_aliases_in_query::visit(stmt);
         }
@@ -459,7 +459,7 @@ fn test_table_function_result_scan() -> DFResult<()> {
         (
             "select a.*, b.IS_ICEBERG as 'is_iceberg'
             from table(result_scan(last_query_id(-1))) a left join test as b on a.t = b.t",
-            "SELECT a.*, b.IS_ICEBERG AS 'is_iceberg' FROM result_scan(last_query_id(-1)) AS a LEFT JOIN test AS b ON a.t = b.t",
+            "SELECT a.*, b.IS_ICEBERG AS 'is_iceberg' FROM result_scan(last_query_id(-1)) a LEFT JOIN test AS b ON a.t = b.t",
         ),
         (
             "SELECT * FROM TABLE(FLATTEN(input => parse_json('[1, 77]')))",
@@ -468,7 +468,7 @@ fn test_table_function_result_scan() -> DFResult<()> {
     ];
 
     for (input, expected) in cases {
-        let mut statement = state.sql_to_statement(input, "snowflake")?;
+        let mut statement = state.sql_to_statement(input, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut stmt) = statement {
             table_functions::visit(stmt);
         }
@@ -481,7 +481,7 @@ fn test_table_function_result_scan() -> DFResult<()> {
 fn test_fetch_to_limit_error_on_missing_quantity() -> DFResult<()> {
     let state = SessionContext::new().state();
     let sql = "SELECT * FROM test FETCH FIRST ROWS ONLY";
-    let mut statement = state.sql_to_statement(sql, "snowflake")?;
+    let mut statement = state.sql_to_statement(sql, &datafusion::config::Dialect::Snowflake)?;
 
     if let DFStatement::Statement(ref mut stmt) = statement {
         let result = fetch_to_limit::visit(stmt);
@@ -510,7 +510,7 @@ fn test_table_function_cte() -> DFResult<()> {
             SELECT * FROM intermediate;"#,
             "WITH base AS (SELECT '{\"a\": 1}' AS jsontext), intermediate AS \
            (SELECT value FROM base, LATERAL FLATTEN(INPUT => parse_json((SELECT jsontext FROM \
-           (SELECT '{\"a\": 1}' AS jsontext) AS base))) AS d) SELECT * FROM intermediate",
+           (SELECT '{\"a\": 1}' AS jsontext) base))) d) SELECT * FROM intermediate",
         ),
         (
             "WITH source AS (
@@ -528,9 +528,9 @@ fn test_table_function_cte() -> DFResult<()> {
                 SELECT * FROM data_points_flushed_out;",
             "WITH source AS (SELECT jsontext FROM test), metric_per_row AS \
             (SELECT value AS datapoints FROM source, LATERAL FLATTEN(INPUT => parse_json(\
-            (SELECT jsontext FROM (SELECT jsontext FROM test) AS source))) AS d), data_points_flushed_out AS \
+            (SELECT jsontext FROM (SELECT jsontext FROM test) source))) d), data_points_flushed_out AS \
             (SELECT metric_value FROM metric_per_row, LATERAL FLATTEN(INPUT => \
-            (SELECT datapoints FROM (SELECT value AS datapoints FROM (SELECT jsontext FROM test), LATERAL FLATTEN(INPUT => parse_json(jsontext)) AS d) AS metric_per_row)) AS dp) \
+            (SELECT datapoints FROM (SELECT value AS datapoints FROM (SELECT jsontext FROM test), LATERAL FLATTEN(INPUT => parse_json(jsontext)) d) metric_per_row)) dp) \
             SELECT * FROM data_points_flushed_out",
         ),
         (
@@ -543,13 +543,13 @@ fn test_table_function_cte() -> DFResult<()> {
                 )
                 SELECT * FROM recursive_cte;",
             "WITH recursive_cte AS (SELECT 1 AS id, '[1,2,3]' AS arr UNION ALL SELECT id + 1, arr \
-             FROM recursive_cte, LATERAL FLATTEN(INPUT => parse_json(arr)) AS f) \
+             FROM recursive_cte, LATERAL FLATTEN(INPUT => parse_json(arr)) f) \
              SELECT * FROM recursive_cte",
         ),
     ];
 
     for (input, expected) in cases {
-        let mut statement = state.sql_to_statement(input, "snowflake")?;
+        let mut statement = state.sql_to_statement(input, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut stmt) = statement {
             table_functions_cte_relation::visit(stmt);
         }

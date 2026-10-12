@@ -95,6 +95,10 @@ fn validate_input_percentile_expr(expr: &Arc<dyn PhysicalExpr>) -> Result<f64> {
 }
 
 impl AggregateUDFImpl for PercentileCont {
+    fn supports_within_group_clause(&self) -> bool {
+        true
+    }
+
 
     fn name(&self) -> &'static str {
         "percentile_cont"

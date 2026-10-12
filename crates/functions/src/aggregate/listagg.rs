@@ -2,6 +2,7 @@ use crate::aggregate::macros::make_udaf_function;
 use datafusion::arrow::array::{Array, ArrayRef, as_string_array};
 use datafusion::arrow::compute;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
@@ -13,6 +14,29 @@ use std::sync::Arc;
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct ListAggUDAF {
     signature: Signature,
+}
+
+/// Resolves the value and delimiter column indices for the accumulator.
+///
+/// DataFusion 55 prepends the `WITHIN GROUP (ORDER BY ...)` expression to the
+/// argument list. Snowflake requires the ordering column to be the same as the
+/// aggregated column, so the duplicated leading expression is skipped.
+fn value_and_delimiter_indices(
+    exprs: &[Arc<dyn PhysicalExpr>],
+) -> Result<(usize, Option<usize>)> {
+    match exprs.len() {
+        1 => Ok((0, None)),
+        2 => {
+            if exprs[0].as_ref() == exprs[1].as_ref() {
+                // WITHIN GROUP (ORDER BY value): ordering expr is prepended
+                Ok((1, None))
+            } else {
+                Ok((0, Some(1)))
+            }
+        }
+        3 => Ok((1, Some(2))),
+        n => exec_err!("LISTAGG requires 1 or 2 arguments, got {}", n - 1),
+    }
 }
 
 impl Default for ListAggUDAF {
@@ -30,6 +54,10 @@ impl ListAggUDAF {
 }
 
 impl AggregateUDFImpl for ListAggUDAF {
+    fn supports_within_group_clause(&self) -> bool {
+        true
+    }
+
 
     fn name(&self) -> &'static str {
         "listagg"
@@ -44,13 +72,12 @@ impl AggregateUDFImpl for ListAggUDAF {
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        if acc_args.exprs.is_empty() || acc_args.exprs.len() > 2 {
-            return exec_err!(
-                "LISTAGG requires 1 or 2 arguments, got {}",
-                acc_args.exprs.len()
-            );
-        }
-        Ok(Box::new(ListAggAccumulator::new(acc_args.is_distinct)))
+        let (value_idx, delim_idx) = value_and_delimiter_indices(acc_args.exprs)?;
+        Ok(Box::new(ListAggAccumulator::new(
+            acc_args.is_distinct,
+            value_idx,
+            delim_idx,
+        )))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -80,16 +107,20 @@ struct ListAggAccumulator {
     delimiter: String,
     delimiter_set: bool,
     is_distinct: bool,
+    value_idx: usize,
+    delim_idx: Option<usize>,
     seen_values: HashSet<String>,
 }
 
 impl ListAggAccumulator {
-    fn new(is_distinct: bool) -> Self {
+    fn new(is_distinct: bool, value_idx: usize, delim_idx: Option<usize>) -> Self {
         Self {
             result: None,
             delimiter: String::new(),
             delimiter_set: false,
             is_distinct,
+            value_idx,
+            delim_idx,
             seen_values: HashSet::new(),
         }
     }
@@ -121,21 +152,24 @@ impl Accumulator for ListAggAccumulator {
             return Ok(());
         }
 
-        let arr = &values[0];
+        let arr = &values[self.value_idx];
 
         // Handle delimiter if present
-        if values.len() > 1 && !self.delimiter_set {
-            if values[1].data_type() == &DataType::Null {
-                // Delimiter is NULL, keep default empty string
-            } else {
-                // Convert delimiter to string
-                let delim_string_arr = compute::cast(&values[1], &DataType::Utf8)?;
-                let delim_arr = as_string_array(&delim_string_arr);
-                for i in 0..delim_arr.len() {
-                    if !delim_arr.is_null(i) {
-                        self.delimiter = delim_arr.value(i).to_string();
-                        self.delimiter_set = true;
-                        break;
+        if let Some(delim_idx) = self.delim_idx {
+            if !self.delimiter_set {
+                if values[delim_idx].data_type() == &DataType::Null {
+                    // Delimiter is NULL, keep default empty string
+                } else {
+                    // Convert delimiter to string
+                    let delim_string_arr =
+                        compute::cast(&values[delim_idx], &DataType::Utf8)?;
+                    let delim_arr = as_string_array(&delim_string_arr);
+                    for i in 0..delim_arr.len() {
+                        if !delim_arr.is_null(i) {
+                            self.delimiter = delim_arr.value(i).to_string();
+                            self.delimiter_set = true;
+                            break;
+                        }
                     }
                 }
             }

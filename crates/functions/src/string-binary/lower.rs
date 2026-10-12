@@ -133,7 +133,6 @@ mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion_common::ToDFSchema;
-    use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
 
     #[tokio::test]
@@ -141,8 +140,12 @@ mod tests {
         let f = LowerFunc::new();
 
         let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]).to_dfschema_ref()?;
-        let props = ExecutionProps::new();
-        let context = SimplifyContext::new(&props).with_schema(schema);
+        let context = SimplifyContext::builder()
+            .with_config_options(std::sync::Arc::new(
+                datafusion::config::ConfigOptions::default(),
+            ))
+            .with_schema(schema)
+            .build();
         let resp = f.simplify(
             vec![Expr::Literal(
                 ScalarValue::Utf8(Some("ABC".to_string())),

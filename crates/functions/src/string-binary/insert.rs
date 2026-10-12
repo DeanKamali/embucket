@@ -458,10 +458,16 @@ mod tests {
 
             match result {
                 Err(e) => {
-                    assert!(
-                        matches!(e, DataFusionError::ArrowError(..)),
-                        "Expected Arrow error, got: {e}",
-                    );
+                    // DataFusion 55 surfaces constant-evaluation errors from the
+                    // optimizer wrapped in a Context error.
+                    let is_arrow_error = match &e {
+                        DataFusionError::ArrowError(..) => true,
+                        DataFusionError::Context(_, inner) => {
+                            matches!(**inner, DataFusionError::ArrowError(..))
+                        }
+                        _ => false,
+                    };
+                    assert!(is_arrow_error, "Expected Arrow error, got: {e}");
                 }
                 Ok(_) => panic!("Expected error but query succeeded"),
             }

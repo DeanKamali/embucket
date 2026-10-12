@@ -18,6 +18,7 @@ pub mod table_functions_cte_relation;
 pub mod timestamp;
 pub mod top_limit;
 pub mod unimplemented;
+pub mod within_group_rewriter;
 
 #[must_use]
 pub fn query_with_body(inner_select: Select) -> Query {

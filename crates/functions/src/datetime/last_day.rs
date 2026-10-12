@@ -12,7 +12,6 @@ use datafusion_common::types::logical_string;
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 use snafu::OptionExt;
-use std::any::Any;
 use std::sync::Arc;
 
 /// `LAST_DAY` SQL function
@@ -141,9 +140,6 @@ impl LastDayFunc {
 }
 
 impl ScalarUDFImpl for LastDayFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "last_day"

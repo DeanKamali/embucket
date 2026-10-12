@@ -11,7 +11,6 @@ use datafusion_common::cast::{
 };
 use datafusion_common::types::logical_string;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `TO_BINARY` function implementation
@@ -65,9 +64,6 @@ impl ToBinaryFunc {
 }
 
 impl ScalarUDFImpl for ToBinaryFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         if self.try_mode {

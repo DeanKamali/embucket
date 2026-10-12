@@ -23,6 +23,7 @@ impl ArraySortUDF {
             signature: Signature {
                 type_signature: TypeSignature::VariadicAny,
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -118,9 +119,6 @@ impl Default for ArraySortUDF {
 }
 
 impl ScalarUDFImpl for ArraySortUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_sort"

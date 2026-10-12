@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use chrono::prelude::*;
@@ -146,9 +145,6 @@ impl TimestampFromPartsFunc {
     }
 }
 impl ScalarUDFImpl for TimestampFromPartsFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "timestamp_from_parts"

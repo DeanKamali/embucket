@@ -32,9 +32,6 @@ macro_rules! create_extremum_udf {
         }
 
         impl ScalarUDFImpl for $name {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
 
             fn name(&self) -> &'static str {
                 $func_name

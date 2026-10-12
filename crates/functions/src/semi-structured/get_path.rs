@@ -10,7 +10,6 @@ use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use serde_json::Value;
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -36,9 +35,6 @@ impl GetPathFunc {
 }
 
 impl ScalarUDFImpl for GetPathFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "get_path"

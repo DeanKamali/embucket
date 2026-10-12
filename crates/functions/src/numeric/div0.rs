@@ -9,7 +9,6 @@ use datafusion::logical_expr::{
 use datafusion::scalar::ScalarValue;
 use rust_decimal::Decimal;
 use snafu::ResultExt;
-use std::any::Any;
 use std::cmp::{max, min};
 use std::sync::Arc;
 
@@ -51,9 +50,6 @@ impl Div0Func {
 }
 
 impl ScalarUDFImpl for Div0Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         if self.null { "div0null" } else { "div0" }

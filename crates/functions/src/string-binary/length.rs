@@ -9,7 +9,6 @@ use datafusion_common::cast::{
 };
 use datafusion_common::exec_err;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `LENGTH` SQL function
@@ -44,6 +43,7 @@ impl LengthFunc {
             signature: Signature {
                 type_signature: TypeSignature::Any(1),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
             aliases: vec![String::from("len")],
         }
@@ -51,9 +51,6 @@ impl LengthFunc {
 }
 
 impl ScalarUDFImpl for LengthFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "length"

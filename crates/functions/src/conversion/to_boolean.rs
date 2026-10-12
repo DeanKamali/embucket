@@ -8,7 +8,6 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{ColumnarValue, Signature, TypeSignature, Volatility};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::sync::Arc;
 
 const TRUE: [&str; 6] = ["true", "t", "yes", "y", "on", "1"];
@@ -53,9 +52,6 @@ impl ToBooleanFunc {
 }
 
 impl ScalarUDFImpl for ToBooleanFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         if self.try_ {

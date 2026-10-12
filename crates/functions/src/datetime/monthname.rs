@@ -7,7 +7,6 @@ use datafusion::logical_expr::TypeSignature::Coercible;
 use datafusion::logical_expr::{Coercion, ColumnarValue, TypeSignatureClass};
 use datafusion_common::types::logical_date;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `MONTHNAME` SQL function
@@ -52,9 +51,6 @@ impl MonthNameFunc {
 }
 
 impl ScalarUDFImpl for MonthNameFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "monthname"

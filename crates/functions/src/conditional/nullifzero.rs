@@ -8,7 +8,6 @@ use datafusion::error::Result as DFResult;
 use datafusion_common::arrow::array::Decimal128Array;
 use datafusion_common::exec_err;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 
 macro_rules! build_array {
@@ -61,9 +60,6 @@ impl NullIfZeroFunc {
 }
 
 impl ScalarUDFImpl for NullIfZeroFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "nullifzero"

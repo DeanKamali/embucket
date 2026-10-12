@@ -17,7 +17,6 @@ use datafusion_common::cast::{
 use datafusion_common::types::{logical_binary, logical_string};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 
 ///
@@ -109,9 +108,6 @@ impl ToVarcharFunc {
 }
 
 impl ScalarUDFImpl for ToVarcharFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         if self.try_mode {

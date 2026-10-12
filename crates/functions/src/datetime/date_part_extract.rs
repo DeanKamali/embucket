@@ -12,7 +12,6 @@ use datafusion_common::cast::as_timestamp_nanosecond_array;
 use datafusion_expr::registry::FunctionRegistry;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use snafu::OptionExt;
-use std::any::Any;
 use std::sync::Arc;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
@@ -98,9 +97,6 @@ impl DatePartExtractFunc {
 }
 
 impl ScalarUDFImpl for DatePartExtractFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         match self.interval {

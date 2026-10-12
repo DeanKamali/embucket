@@ -6,7 +6,6 @@ use datafusion::error::Result as DFResult;
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{DataFusionError, exec_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 // This function returns one of two values based on whether a given Boolean condition is true or false.
 // It works like a basic if-then-else statement and is simpler than a CASE expression, since it only checks one condition.
@@ -35,9 +34,6 @@ impl IffFunc {
 }
 
 impl ScalarUDFImpl for IffFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "iff"

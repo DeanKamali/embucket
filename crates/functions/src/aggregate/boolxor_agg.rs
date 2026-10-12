@@ -7,7 +7,6 @@ use datafusion::logical_expr::Accumulator;
 use datafusion_common::ScalarValue;
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::{AggregateUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 /// Boolxor function
 /// Returns TRUE if exactly one Boolean record in the group evaluates to TRUE.
@@ -36,9 +35,6 @@ impl BoolXorAggUDAF {
 }
 
 impl AggregateUDFImpl for BoolXorAggUDAF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "boolxor_agg"

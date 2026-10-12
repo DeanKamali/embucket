@@ -1,5 +1,7 @@
 use datafusion_expr::sqlparser::ast::VisitMut;
-use datafusion_expr::sqlparser::ast::{BinaryOperator, Expr, Statement, Value, VisitorMut};
+use datafusion_expr::sqlparser::ast::{
+    BinaryOperator, Expr, Statement, ValueWithSpan, VisitorMut,
+};
 use std::ops::ControlFlow;
 
 #[derive(Debug, Default)]
@@ -10,7 +12,7 @@ impl LikeILikeAny {
         negated: bool,
         inner_expr: Box<Expr>,
         pattern: Box<Expr>,
-        escape_char: Option<Value>,
+        escape_char: Option<ValueWithSpan>,
         case_sensitive: bool,
     ) -> Expr {
         if let Expr::Tuple(patterns) = &*pattern {
@@ -70,7 +72,7 @@ impl LikeILikeAny {
                     any: false,
                     expr: inner_expr,
                     pattern: pattern.clone(),
-                    escape_char,
+                    escape_char: escape_char.clone(),
                 }
             } else {
                 Expr::Like {
@@ -78,7 +80,7 @@ impl LikeILikeAny {
                     any: false,
                     expr: inner_expr,
                     pattern: pattern.clone(),
-                    escape_char,
+                    escape_char: escape_char.clone(),
                 }
             }
         } else {

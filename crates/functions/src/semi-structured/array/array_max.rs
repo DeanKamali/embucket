@@ -29,6 +29,7 @@ impl ArrayMaxUDF {
                     NativeType::String,
                 )]),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -105,9 +106,6 @@ impl Default for ArrayMaxUDF {
 }
 
 impl ScalarUDFImpl for ArrayMaxUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_max"

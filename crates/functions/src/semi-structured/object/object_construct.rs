@@ -27,6 +27,7 @@ impl ObjectConstructUDF {
                     TypeSignature::Nullary,
                 ]),
                 volatility: Volatility::Volatile,
+                parameter_names: None,
             },
             aliases: vec!["make_object".to_string()],
             keep_null,
@@ -41,9 +42,6 @@ impl Default for ObjectConstructUDF {
 }
 
 impl ScalarUDFImpl for ObjectConstructUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         if self.keep_null {

@@ -7,7 +7,6 @@ use datafusion::logical_expr::{Coercion, ColumnarValue, TypeSignatureClass};
 use datafusion_common::types::logical_string;
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `NEXT_DAY` SQL function
@@ -55,9 +54,6 @@ impl NextDayFunc {
 }
 
 impl ScalarUDFImpl for NextDayFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "next_day"

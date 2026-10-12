@@ -23,6 +23,7 @@ impl ArraysOverlapUDF {
             signature: Signature {
                 type_signature: TypeSignature::Any(2),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -55,9 +56,6 @@ impl Default for ArraysOverlapUDF {
 }
 
 impl ScalarUDFImpl for ArraysOverlapUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "arrays_overlap"

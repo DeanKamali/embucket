@@ -26,7 +26,6 @@ use datafusion_common::{ScalarValue, internal_err};
 use datafusion_expr::{ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 use regex::Regex;
 use snafu::{OptionExt, ResultExt};
-use std::any::Any;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -116,9 +115,6 @@ impl ToTimestampFunc {
 }
 
 impl ScalarUDFImpl for ToTimestampFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         &self.name

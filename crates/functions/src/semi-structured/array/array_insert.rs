@@ -30,6 +30,7 @@ impl ArrayInsertUDF {
             signature: Signature {
                 type_signature: TypeSignature::Any(3),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -83,9 +84,6 @@ impl Default for ArrayInsertUDF {
 }
 
 impl ScalarUDFImpl for ArrayInsertUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_insert"

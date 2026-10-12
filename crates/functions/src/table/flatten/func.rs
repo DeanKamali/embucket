@@ -1,6 +1,6 @@
 use crate::json::{PathToken, tokenize_path};
 use crate::table::flatten::provider::{FlattenArgs, FlattenMode, FlattenTableProvider, Out};
-use datafusion::catalog::{TableFunctionImpl, TableProvider};
+use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider};
 use datafusion_common::{Result as DFResult, ScalarValue, exec_err};
 use datafusion_expr::Expr;
 use serde_json::Value;
@@ -176,21 +176,26 @@ impl std::hash::Hash for FlattenTableFunc {
 }
 
 impl TableFunctionImpl for FlattenTableFunc {
-    fn call(&self, args: &[(Expr, Option<String>)]) -> DFResult<Arc<dyn TableProvider>> {
-        let named_args_count = args.iter().filter(|(_, name)| name.is_some()).count();
-        if named_args_count > 0 && named_args_count != args.len() {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DFResult<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        let names = args.names();
+        let named_args_count = names
+            .map(|n| n.iter().filter(|name| name.is_some()).count())
+            .unwrap_or(0);
+        if named_args_count > 0 && named_args_count != exprs.len() {
             return exec_err!("flatten() supports either all named arguments or positional");
         }
 
         let flatten_args = if named_args_count > 0 {
-            get_named_args(args)?
+            let named: Vec<(Expr, Option<String>)> = exprs
+                .iter()
+                .cloned()
+                .zip(names.unwrap_or_default().iter().cloned())
+                .collect();
+            get_named_args(&named)?
         } else {
-            get_args(
-                args.iter()
-                    .map(|(expr, _)| expr)
-                    .collect::<Vec<_>>()
-                    .as_ref(),
-            )?
+            let refs: Vec<&Expr> = exprs.iter().collect();
+            get_args(&refs)?
         };
         Ok(Arc::new(FlattenTableProvider::new(flatten_args)?))
     }

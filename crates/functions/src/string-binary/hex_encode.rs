@@ -12,7 +12,6 @@ use datafusion_common::cast::{
     as_string_view_array,
 };
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `HEX_ENCODE` function implementation
@@ -53,9 +52,6 @@ impl HexEncodeFunc {
 }
 
 impl ScalarUDFImpl for HexEncodeFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "hex_encode"

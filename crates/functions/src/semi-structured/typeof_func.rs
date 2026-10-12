@@ -7,7 +7,6 @@ use datafusion_common::ScalarValue;
 use datafusion_common::arrow::array::StringBuilder;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use serde_json::Value;
-use std::any::Any;
 use std::sync::Arc;
 
 /// typeof SQL function
@@ -39,9 +38,6 @@ impl TypeofFunc {
 }
 
 impl ScalarUDFImpl for TypeofFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "typeof"

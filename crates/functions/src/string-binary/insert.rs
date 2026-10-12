@@ -6,7 +6,6 @@ use datafusion_common::{exec_err, plan_err};
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 // insert SQL function
@@ -77,9 +76,6 @@ impl Insert {
 }
 
 impl ScalarUDFImpl for Insert {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "insert"

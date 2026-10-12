@@ -13,7 +13,6 @@ use datafusion_common::types::{
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use ipnet::IpNet;
 use serde_json::json;
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::string_binary::errors::{
@@ -79,9 +78,6 @@ impl ParseIpFunc {
 }
 
 impl ScalarUDFImpl for ParseIpFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "parse_ip"

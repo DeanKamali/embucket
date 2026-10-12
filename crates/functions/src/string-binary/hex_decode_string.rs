@@ -10,7 +10,6 @@ use datafusion_common::ScalarValue;
 use datafusion_common::cast::{as_large_string_array, as_string_array, as_string_view_array};
 use datafusion_common::types::logical_string;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::str::from_utf8;
 use std::sync::Arc;
 
@@ -59,9 +58,6 @@ impl HexDecodeStringFunc {
 }
 
 impl ScalarUDFImpl for HexDecodeStringFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &str {
         if self.try_mode {

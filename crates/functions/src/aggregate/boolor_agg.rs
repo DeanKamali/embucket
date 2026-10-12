@@ -7,7 +7,6 @@ use datafusion::logical_expr::Accumulator;
 use datafusion_common::ScalarValue;
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::{AggregateUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 /// Boolor function
 /// Returns TRUE if at least one Boolean record in a group evaluates to TRUE.
@@ -36,9 +35,6 @@ impl BoolOrAggUDAF {
 }
 
 impl AggregateUDFImpl for BoolOrAggUDAF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "boolor_agg"

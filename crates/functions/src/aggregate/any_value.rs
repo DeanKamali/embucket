@@ -27,7 +27,6 @@ use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{Accumulator, AggregateUDFImpl, Documentation, Signature, Volatility};
 use datafusion_macros::user_doc;
-use std::any::Any;
 use std::fmt::Debug;
 use std::mem::size_of_val;
 use std::sync::Arc;
@@ -78,9 +77,6 @@ impl AnyValue {
 }
 
 impl AggregateUDFImpl for AnyValue {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "any_value"

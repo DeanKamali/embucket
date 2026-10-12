@@ -27,6 +27,7 @@ impl ArrayConstructUDF {
                     TypeSignature::Nullary,
                 ]),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
             aliases: vec!["make_array".to_string(), "make_list".to_string()],
         }
@@ -40,9 +41,6 @@ impl Default for ArrayConstructUDF {
 }
 
 impl ScalarUDFImpl for ArrayConstructUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_construct"

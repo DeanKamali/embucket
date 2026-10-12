@@ -3,7 +3,6 @@ use datafusion::arrow::array::builder::BooleanBuilder;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::error::Result as DFResult;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 
 // booland SQL function
@@ -36,9 +35,6 @@ impl BoolAndFunc {
 }
 
 impl ScalarUDFImpl for BoolAndFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "booland"

@@ -1,7 +1,6 @@
 use datafusion::arrow::datatypes::DataType;
 use datafusion_common::{Result as DFResult, ScalarValue};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct SystemTypeofFunc {
@@ -24,9 +23,6 @@ impl SystemTypeofFunc {
 }
 
 impl ScalarUDFImpl for SystemTypeofFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "system$typeof"

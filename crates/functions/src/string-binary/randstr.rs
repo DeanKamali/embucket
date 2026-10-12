@@ -10,7 +10,6 @@ use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signatur
 use rand::SeedableRng;
 use rand::distr::{Alphanumeric, SampleString};
 use rand::rngs::StdRng;
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::string_binary::errors::{
@@ -55,9 +54,6 @@ impl RandStrFunc {
 }
 
 impl ScalarUDFImpl for RandStrFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "randstr"

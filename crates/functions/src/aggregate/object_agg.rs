@@ -2,7 +2,6 @@ use super::errors as agg_errors;
 use crate::macros::make_udaf_function;
 use serde_json::Value as JsonValue;
 use snafu::ResultExt;
-use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -41,9 +40,6 @@ impl ObjectAggUDAF {
 }
 
 impl AggregateUDFImpl for ObjectAggUDAF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "object_agg"

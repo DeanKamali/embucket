@@ -61,6 +61,7 @@ impl VisitorMut for TableFunctionVisitor {
                             args: args.args.clone(),
                             alias: alias.clone(),
                             lateral: false,
+                            with_ordinality: false,
                         };
                     }
                 }

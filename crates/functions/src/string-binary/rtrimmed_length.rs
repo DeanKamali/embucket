@@ -2,7 +2,6 @@ use datafusion::arrow::{array::UInt64Array, datatypes::DataType};
 use datafusion::error::Result as DFResult;
 use datafusion_common::cast::as_string_array;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 
 // rtrimmed_length SQL function
@@ -29,9 +28,6 @@ impl RTrimmedLengthFunc {
 }
 
 impl ScalarUDFImpl for RTrimmedLengthFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "rtrimmed_length"

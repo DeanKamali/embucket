@@ -10,7 +10,6 @@ use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use regex::Regex;
 use serde_json::{Map, Value};
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::{Arc, LazyLock};
 
 #[allow(clippy::unwrap_used)]
@@ -49,9 +48,6 @@ impl ArrayFlattenFunc {
 }
 
 impl ScalarUDFImpl for ArrayFlattenFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_flatten"

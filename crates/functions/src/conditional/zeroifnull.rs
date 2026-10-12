@@ -8,7 +8,6 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::sync::Arc;
 
 macro_rules! handle_numeric_type {
@@ -61,9 +60,6 @@ impl ZeroIfNullFunc {
 }
 
 impl ScalarUDFImpl for ZeroIfNullFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "zeroifnull"

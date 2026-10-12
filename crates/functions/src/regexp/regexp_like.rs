@@ -8,7 +8,6 @@ use datafusion_common::ScalarValue;
 use datafusion_common::arrow::array::Array;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use snafu::ResultExt;
-use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -67,9 +66,6 @@ impl RegexpLikeFunc {
 }
 
 impl ScalarUDFImpl for RegexpLikeFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "regexp_like"

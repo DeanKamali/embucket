@@ -7,7 +7,6 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use serde_json::Value;
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 
 // function object_keys
@@ -37,9 +36,6 @@ impl ObjectKeysFunc {
     }
 }
 impl ScalarUDFImpl for ObjectKeysFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "object_keys"

@@ -5,7 +5,6 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::physical_plan::internal_err;
 use datafusion_expr::{ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -29,9 +28,6 @@ impl ToVariantFunc {
 }
 
 impl ScalarUDFImpl for ToVariantFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "to_variant"

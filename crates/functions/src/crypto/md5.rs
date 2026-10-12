@@ -2,12 +2,10 @@ use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
-use datafusion::functions::crypto::basic::{DigestAlgorithm, digest_process};
 use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
-use datafusion_common::cast::as_binary_array;
 use datafusion_common::utils::take_function_args;
 use datafusion_expr::ScalarFunctionArgs;
-use std::any::Any;
+use md5::{Digest, Md5};
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -42,9 +40,6 @@ impl Md5Func {
     }
 }
 impl ScalarUDFImpl for Md5Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "md5"
@@ -73,15 +68,16 @@ impl ScalarUDFImpl for Md5Func {
         ) {
             arr = cast(&arr, &DataType::Utf8)?;
         }
-        let data = ColumnarValue::Array(Arc::new(arr));
-        let value = digest_process(&data, DigestAlgorithm::Md5)?.into_array(number_rows)?;
-
-        let binary_array = as_binary_array(&value)?;
-        let string_array: StringArray = binary_array
-            .iter()
-            .map(|opt| opt.map(hex_encode::<_>))
+        let strings = cast(&arr, &DataType::Utf8)?;
+        let string_array = datafusion_common::cast::as_string_array(&strings)?;
+        let hashed: StringArray = (0..string_array.len())
+            .map(|i| {
+                string_array
+                    .is_valid(i)
+                    .then(|| hex_encode(Md5::digest(string_array.value(i).as_bytes())))
+            })
             .collect();
-        Ok(ColumnarValue::Array(Arc::new(string_array)))
+        Ok(ColumnarValue::Array(Arc::new(hashed)))
     }
     fn aliases(&self) -> &[String] {
         &self.aliases

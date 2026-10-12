@@ -5,7 +5,6 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion_common::ScalarValue;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `AS_ARRAY` / `AS_OBJECT` SQL function
@@ -46,9 +45,6 @@ impl AsFunc {
 }
 
 impl ScalarUDFImpl for AsFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "as_array"

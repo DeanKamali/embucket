@@ -9,7 +9,6 @@ use datafusion_common::cast::as_timestamp_nanosecond_array;
 use datafusion_common::types::logical_string;
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `PREVIOUS_DAY` SQL function
@@ -57,9 +56,6 @@ impl PreviousDayFunc {
 }
 
 impl ScalarUDFImpl for PreviousDayFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "previous_day"

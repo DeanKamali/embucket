@@ -9,7 +9,6 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::AggregateUDFImpl;
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
-use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -46,9 +45,6 @@ impl ArrayUniqueAggUDAF {
 }
 
 impl AggregateUDFImpl for ArrayUniqueAggUDAF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_unique_agg"

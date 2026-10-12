@@ -13,7 +13,6 @@ use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use serde_json::{Number, Value};
 use snafu::ResultExt;
-use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -39,9 +38,6 @@ impl ArrayUnionAggUDAF {
 }
 
 impl AggregateUDFImpl for ArrayUnionAggUDAF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_union_agg"

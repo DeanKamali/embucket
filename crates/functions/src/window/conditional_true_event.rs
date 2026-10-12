@@ -7,7 +7,6 @@ use datafusion_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
 use datafusion_expr::{
     Documentation, PartitionEvaluator, Signature, TypeSignature, Volatility, WindowUDFImpl,
 };
-use std::any::Any;
 use std::sync::Arc;
 
 /// `CONDITIONAL_TRUE_EVENT` window function
@@ -56,9 +55,6 @@ impl Default for ConditionalTrueEvent {
 }
 
 impl WindowUDFImpl for ConditionalTrueEvent {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "conditional_true_event"

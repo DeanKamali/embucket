@@ -24,6 +24,7 @@ impl ArrayGenerateRangeUDF {
                     TypeSignature::Exact(vec![DataType::Int64, DataType::Int64, DataType::Int64]),
                 ]),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
             aliases: vec!["generate_range".to_string()],
         }
@@ -38,9 +39,6 @@ impl Default for ArrayGenerateRangeUDF {
 
 #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
 impl ScalarUDFImpl for ArrayGenerateRangeUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_generate_range"

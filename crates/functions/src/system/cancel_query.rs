@@ -3,7 +3,6 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::TypeSignature;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 // This is actually a stub, as it's implementation is by `cancel_query` function in `session_context.rs`
 // of the executor crate.
@@ -49,15 +48,13 @@ impl SystemCancelQuery {
                     TypeSignature::Nullary,
                 ]),
                 volatility: Volatility::Volatile,
+                parameter_names: None,
             },
         }
     }
 }
 
 impl ScalarUDFImpl for SystemCancelQuery {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "system$cancel_query"

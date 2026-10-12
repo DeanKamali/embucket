@@ -29,6 +29,7 @@ impl ArrayMinUDF {
                     NativeType::String,
                 )]),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -105,9 +106,6 @@ impl Default for ArrayMinUDF {
 }
 
 impl ScalarUDFImpl for ArrayMinUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_min"

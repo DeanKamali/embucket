@@ -11,7 +11,6 @@ use datafusion_common::arrow::array::Array;
 use datafusion_common::types::logical_string;
 use datafusion_expr::{Coercion, ScalarFunctionArgs, ScalarUDFImpl};
 use snafu::ResultExt;
-use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -249,9 +248,6 @@ impl RegexpInstrFunc {
 }
 
 impl ScalarUDFImpl for RegexpInstrFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "regexp_instr"

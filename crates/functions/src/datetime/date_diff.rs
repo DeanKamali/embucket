@@ -10,7 +10,6 @@ use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatili
 use datafusion::scalar::ScalarValue;
 use datafusion_common::cast::{as_int32_array, as_int64_array};
 use snafu::OptionExt;
-use std::any::Any;
 use std::sync::Arc;
 use std::vec;
 
@@ -230,9 +229,6 @@ impl DateDiffFunc {
 }
 
 impl ScalarUDFImpl for DateDiffFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "datediff"

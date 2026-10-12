@@ -23,6 +23,7 @@ impl ObjectPickUDF {
             signature: Signature {
                 type_signature: TypeSignature::VariadicAny,
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -56,9 +57,6 @@ impl Default for ObjectPickUDF {
 }
 
 impl ScalarUDFImpl for ObjectPickUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "object_pick"

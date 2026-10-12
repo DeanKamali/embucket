@@ -10,7 +10,6 @@ use datafusion::logical_expr::{ColumnarValue, Signature, TypeSignature, TypeSign
 use datafusion_common::ScalarValue;
 use datafusion_common::arrow::array::{Array, ArrayRef, StringArray};
 use datafusion_expr::{Coercion, ScalarFunctionArgs, ScalarUDFImpl, Volatility};
-use std::any::Any;
 use std::ops::Add;
 use std::sync::Arc;
 
@@ -254,9 +253,6 @@ impl ToDateFunc {
 }
 
 impl ScalarUDFImpl for ToDateFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         if self.try_mode {

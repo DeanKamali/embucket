@@ -10,7 +10,6 @@ use datafusion_common::internal_err;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use serde_json::Value;
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 
 /// `array_to_string` SQL function
@@ -52,9 +51,6 @@ impl ArrayToStringFunc {
 }
 
 impl ScalarUDFImpl for ArrayToStringFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_to_string"

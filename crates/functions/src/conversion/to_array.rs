@@ -11,7 +11,6 @@ use datafusion_common::{ScalarValue, internal_err};
 use datafusion_expr::{ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl};
 use serde_json::Value;
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 
 /// `TO_ARRAY` function
@@ -51,9 +50,6 @@ impl ToArrayFunc {
 }
 
 impl ScalarUDFImpl for ToArrayFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "to_array"

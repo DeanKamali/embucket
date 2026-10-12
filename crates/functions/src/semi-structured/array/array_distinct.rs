@@ -29,6 +29,7 @@ impl ArrayDistinctUDF {
                     NativeType::String,
                 )]),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -68,9 +69,6 @@ impl Default for ArrayDistinctUDF {
 }
 
 impl ScalarUDFImpl for ArrayDistinctUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_distinct"

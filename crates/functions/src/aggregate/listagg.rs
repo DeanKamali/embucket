@@ -6,7 +6,6 @@ use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{Accumulator, AggregateUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::collections::HashSet;
 use std::mem::size_of_val;
 use std::sync::Arc;
@@ -31,9 +30,6 @@ impl ListAggUDAF {
 }
 
 impl AggregateUDFImpl for ListAggUDAF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "listagg"

@@ -5,7 +5,6 @@ use datafusion::logical_expr::{Coercion, TypeSignature, TypeSignatureClass};
 use datafusion_common::cast::as_string_array;
 use datafusion_common::types::logical_string;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 use strsim::jaro_winkler;
 
@@ -36,9 +35,6 @@ impl JarowinklerSimilarityFunc {
 }
 
 impl ScalarUDFImpl for JarowinklerSimilarityFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "jarowinkler_similarity"

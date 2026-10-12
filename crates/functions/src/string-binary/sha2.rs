@@ -6,7 +6,6 @@ use datafusion_common::cast::as_int64_array;
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `SHA2` SQL function
@@ -53,9 +52,6 @@ impl Sha2Func {
 }
 
 impl ScalarUDFImpl for Sha2Func {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "sha2"

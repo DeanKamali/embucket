@@ -10,7 +10,6 @@ use datafusion_expr::{
     TypeSignatureClass, Volatility,
 };
 use datafusion_macros::user_doc;
-use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -67,9 +66,6 @@ impl StrtokFunc {
 }
 
 impl ScalarUDFImpl for StrtokFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "strtok"

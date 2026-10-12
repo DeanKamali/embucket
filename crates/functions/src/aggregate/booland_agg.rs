@@ -7,7 +7,6 @@ use datafusion::logical_expr::Accumulator;
 use datafusion_common::ScalarValue;
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::{AggregateUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 /// Booland Agg function
 /// Returns TRUE if all non-NULL Boolean records in a group evaluate to TRUE.
@@ -35,9 +34,6 @@ impl BoolAndAggUDAF {
 }
 
 impl AggregateUDFImpl for BoolAndAggUDAF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "booland_agg"

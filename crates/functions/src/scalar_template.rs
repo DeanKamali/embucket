@@ -51,10 +51,6 @@ impl ScalarUDFImpl for YourFunctionName {
     // REQUIRED METHODS - MUST IMPLEMENT ALL
     // ========================================
 
-    /// REQUIRED: Always implement this exactly as shown
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     /// REQUIRED: Return the function name (should match SQL usage)
     fn name(&self) -> &str {

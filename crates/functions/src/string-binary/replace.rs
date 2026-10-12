@@ -11,7 +11,6 @@ use datafusion::arrow::compute::cast;
 use datafusion::logical_expr::TypeSignature;
 use datafusion_expr::binary::string_coercion;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `REPLACE` SQL function
@@ -59,9 +58,6 @@ impl ReplaceFunc {
 }
 
 impl ScalarUDFImpl for ReplaceFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "replace"

@@ -3,7 +3,6 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::TypeSignature;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 
 /// Returns the ID of a specified query in the current session.
 /// If no query is specified, the most recently-executed query is returned.
@@ -27,15 +26,13 @@ impl LastQueryId {
                     TypeSignature::Nullary,
                 ]),
                 volatility: Volatility::Volatile,
+                parameter_names: None,
             },
         }
     }
 }
 
 impl ScalarUDFImpl for LastQueryId {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "last_query_id"

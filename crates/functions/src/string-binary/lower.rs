@@ -8,8 +8,7 @@ use datafusion::logical_expr::{
 use datafusion_common::ScalarValue;
 use datafusion_common::cast::as_string_array;
 use datafusion_expr::Expr;
-use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
-use std::any::Any;
+use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use std::sync::Arc;
 
 /// `LOWER` SQL function
@@ -49,9 +48,6 @@ impl LowerFunc {
 }
 
 impl ScalarUDFImpl for LowerFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "lower"
@@ -110,7 +106,7 @@ impl ScalarUDFImpl for LowerFunc {
         }
     }
 
-    fn simplify(&self, args: Vec<Expr>, _info: &dyn SimplifyInfo) -> DFResult<ExprSimplifyResult> {
+    fn simplify(&self, args: Vec<Expr>, _info: &SimplifyContext) -> DFResult<ExprSimplifyResult> {
         if args.len() == 1
             && let Expr::Literal(scalar, _) = &args[0]
         {

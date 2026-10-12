@@ -23,6 +23,7 @@ impl ArrayCatUDF {
             signature: Signature {
                 type_signature: TypeSignature::Any(2),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -58,9 +59,6 @@ impl Default for ArrayCatUDF {
 }
 
 impl ScalarUDFImpl for ArrayCatUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_cat"

@@ -26,11 +26,11 @@ use datafusion_physical_plan::common::collect;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::memory::MemoryStream;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
 use serde_json::Value;
 use snafu::{OptionExt, ResultExt};
-use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -106,9 +106,6 @@ impl FlattenTableProvider {
 
 #[async_trait]
 impl TableProvider for FlattenTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn schema(&self) -> SchemaRef {
         normalize_schema(&self.schema.clone())
@@ -147,7 +144,7 @@ impl TableProvider for FlattenTableProvider {
             projection: projection.cloned(),
             filters: filters.to_vec(),
             limit,
-            properties,
+            properties: Arc::new(properties),
         }))
     }
 }
@@ -156,7 +153,7 @@ pub struct FlattenExec {
     args: FlattenArgs,
     schema: Arc<Schema>,
     session_state: Arc<SessionState>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -179,12 +176,17 @@ impl ExecutionPlan for FlattenExec {
         "FlattenExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
+    fn apply_expressions(
+        &self,
+        _transform: &mut dyn for<'a> FnMut(&'a Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        // FlattenExec carries no physical expressions.
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -379,7 +381,12 @@ async fn evaluate_expr_or_plan(
         None => {
             let parsed_expr = inline_scalar_subqueries_in_expr(expr.clone(), session_state).await?;
             let exec_props = ExecutionProps::new();
-            let phys_expr = create_physical_expr(&parsed_expr, &DFSchema::empty(), &exec_props)?;
+            let phys_expr = create_physical_expr(
+                &parsed_expr,
+                &DFSchema::empty(),
+                &exec_props,
+                &datafusion_expr::physical_planning_context::PhysicalPlanningContext::default(),
+            )?;
             let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
             let result = phys_expr.evaluate(&batch)?;
 

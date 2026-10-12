@@ -6,7 +6,6 @@ use datafusion::logical_expr::TypeSignature::{Coercible, Exact};
 use datafusion::logical_expr::{Coercion, ColumnarValue, TypeSignatureClass};
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `DAYNAME` SQL function
@@ -50,9 +49,6 @@ impl DayNameFunc {
 }
 
 impl ScalarUDFImpl for DayNameFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "dayname"

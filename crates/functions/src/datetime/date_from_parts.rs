@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::datetime::timestamp_from_parts::{make_date, take_function_args, to_primitive_array};
@@ -75,9 +74,6 @@ impl DateFromPartsFunc {
     }
 }
 impl ScalarUDFImpl for DateFromPartsFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "date_from_parts"

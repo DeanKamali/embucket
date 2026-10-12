@@ -31,6 +31,7 @@ fn convert_json_access(expr: ASTExpr) -> ASTExpr {
                         ASTExpr::Value(ASTValue::SingleQuotedString(key).into())
                     }
                     JsonPathElem::Bracket { key } => key,
+                    JsonPathElem::ColonBracket { key } => key,
                 };
 
                 base = ASTExpr::Function(Function {

@@ -1,6 +1,5 @@
 //! Defines the `PERCENTILE_CONT` aggregation function.
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::mem::size_of_val;
 use std::sync::Arc;
@@ -96,9 +95,6 @@ fn validate_input_percentile_expr(expr: &Arc<dyn PhysicalExpr>) -> Result<f64> {
 }
 
 impl AggregateUDFImpl for PercentileCont {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "percentile_cont"
@@ -158,10 +154,6 @@ impl AggregateUDFImpl for PercentileCont {
 
     fn supports_null_handling_clause(&self) -> bool {
         false
-    }
-
-    fn is_ordered_set_aggregate(&self) -> bool {
-        true
     }
 
     fn documentation(&self) -> Option<&Documentation> {

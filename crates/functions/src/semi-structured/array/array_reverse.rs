@@ -23,6 +23,7 @@ impl ArrayReverseUDF {
             signature: Signature {
                 type_signature: TypeSignature::Any(1),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -50,9 +51,6 @@ impl Default for ArrayReverseUDF {
 }
 
 impl ScalarUDFImpl for ArrayReverseUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_reverse"

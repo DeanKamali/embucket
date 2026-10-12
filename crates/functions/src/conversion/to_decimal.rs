@@ -11,7 +11,6 @@ use datafusion_common::arrow::util::display::FormatOptions;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl};
 use snafu::prelude::*;
-use std::any::Any;
 use std::fmt::Debug;
 use std::num::TryFromIntError;
 use std::sync::Arc;
@@ -216,9 +215,6 @@ impl ToDecimalFunc {
 }
 
 impl ScalarUDFImpl for ToDecimalFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         if self.try_mode {

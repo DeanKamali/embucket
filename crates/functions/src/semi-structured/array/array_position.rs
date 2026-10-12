@@ -25,6 +25,7 @@ impl ArrayPositionUDF {
             signature: Signature {
                 type_signature: TypeSignature::Any(2),
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -49,9 +50,6 @@ impl Default for ArrayPositionUDF {
 }
 
 impl ScalarUDFImpl for ArrayPositionUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "array_position"

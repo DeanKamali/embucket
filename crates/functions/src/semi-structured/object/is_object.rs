@@ -6,7 +6,6 @@ use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion_common::ScalarValue;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use serde_json::Value;
-use std::any::Any;
 use std::sync::Arc;
 
 // is_array SQL function
@@ -42,9 +41,6 @@ impl IsObjectFunc {
 }
 
 impl ScalarUDFImpl for IsObjectFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "is_object"

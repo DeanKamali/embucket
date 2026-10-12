@@ -13,7 +13,6 @@ use datafusion_common::cast::{as_float64_array, as_int64_array};
 use datafusion_common::utils::take_function_args;
 use datafusion_expr::{ReturnFieldArgs, ScalarFunctionArgs};
 use rust_decimal::prelude::ToPrimitive;
-use std::any::Any;
 use std::sync::Arc;
 
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -150,9 +149,6 @@ impl DateAddFunc {
 /// Examples
 /// - dateadd(day, 30, CAST('2024-12-26' AS TIMESTAMP))
 impl ScalarUDFImpl for DateAddFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "dateadd"

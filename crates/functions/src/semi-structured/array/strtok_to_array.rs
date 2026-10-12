@@ -8,7 +8,6 @@ use datafusion_common::cast::as_generic_string_array;
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
-use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -46,9 +45,6 @@ impl StrtokToArrayFunc {
 }
 
 impl ScalarUDFImpl for StrtokToArrayFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "strtok_to_array"

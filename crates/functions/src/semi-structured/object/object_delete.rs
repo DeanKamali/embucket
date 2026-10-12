@@ -24,6 +24,7 @@ impl ObjectDeleteUDF {
             signature: Signature {
                 type_signature: TypeSignature::VariadicAny,
                 volatility: Volatility::Immutable,
+                parameter_names: None,
             },
         }
     }
@@ -55,9 +56,6 @@ impl Default for ObjectDeleteUDF {
 }
 
 impl ScalarUDFImpl for ObjectDeleteUDF {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "object_delete"

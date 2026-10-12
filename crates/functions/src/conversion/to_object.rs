@@ -9,7 +9,6 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use serde_json::Value;
 use snafu::OptionExt;
-use std::any::Any;
 use std::sync::Arc;
 
 /// `TO_OBJECT` function implementation
@@ -44,9 +43,6 @@ impl ToObjectFunc {
 }
 
 impl ScalarUDFImpl for ToObjectFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "to_object"

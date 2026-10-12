@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use datafusion::common::error::Result as DFResult;
 use datafusion::logical_expr::sqlparser::ast::Value;
 use datafusion::logical_expr::sqlparser::ast::helpers::key_value_options::{
-    KeyValueOption, KeyValueOptionType,
+    KeyValueOption, KeyValueOptionKind,
 };
 use datafusion_common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion_common::{ParamValues, ScalarValue};
@@ -62,12 +62,17 @@ impl Hash for SessionParams {
 
 impl From<SessionParams> for ParamValues {
     fn from(value: SessionParams) -> Self {
-        let map: HashMap<String, ScalarValue> = value
+        let map: HashMap<String, datafusion_common::metadata::ScalarAndMetadata> = value
             .properties
             .iter()
             .filter_map(|entry| {
                 let (key, prop) = (entry.key().clone(), entry.value().clone());
-                prop.to_scalar_value().map(|scalar| (key, scalar))
+                prop.to_scalar_value().map(|scalar| {
+                    (
+                        key,
+                        datafusion_common::metadata::ScalarAndMetadata::new(scalar, None),
+                    )
+                })
             })
             .collect();
         Self::Map(map)
@@ -93,11 +98,17 @@ impl SessionProperty {
             session_id: Some(session_id),
             created_on: now,
             updated_on: now,
-            value: option.value.clone(),
-            property_type: match option.option_type {
-                KeyValueOptionType::STRING | KeyValueOptionType::ENUM => "text".to_string(),
-                KeyValueOptionType::BOOLEAN => "boolean".to_string(),
-                KeyValueOptionType::NUMBER => "fixed".to_string(),
+            value: match &option.option_value {
+                KeyValueOptionKind::Single(value) => value.value.to_string(),
+                _ => String::new(),
+            },
+            property_type: match &option.option_value {
+                KeyValueOptionKind::Single(value) => match &value.value {
+                    Value::Number(_, _) => "fixed".to_string(),
+                    Value::Boolean(_) => "boolean".to_string(),
+                    _ => "text".to_string(),
+                },
+                _ => "text".to_string(),
             },
             comment: None,
             name: option.option_name.clone(),

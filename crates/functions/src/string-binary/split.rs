@@ -10,7 +10,6 @@ use datafusion::logical_expr::{
 use datafusion_common::types::logical_string;
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `SPLIT` SQL function
@@ -54,9 +53,6 @@ pub struct SplitFunc {
 }
 
 impl ScalarUDFImpl for SplitFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "split"

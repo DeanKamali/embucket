@@ -18,7 +18,6 @@ use datafusion_common::format::DEFAULT_CAST_OPTIONS;
 use datafusion_common::{ScalarValue, internal_err};
 use datafusion_expr::{ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl};
 use snafu::{OptionExt, ResultExt};
-use std::any::Any;
 use std::sync::Arc;
 
 /// `CONVERT_TIMEZONE` SQL function
@@ -102,9 +101,6 @@ impl ConvertTimezoneFunc {
 }
 
 impl ScalarUDFImpl for ConvertTimezoneFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "convert_timezone"

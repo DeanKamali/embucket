@@ -18,7 +18,6 @@ use crate::encryption::errors::{
     UnsupportedEncryptionModeSnafu,
 };
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 
 type Aes192Gcm = AesGcm<Aes192, aes_gcm::aead::consts::U12>;
@@ -61,9 +60,6 @@ impl EncryptRawFunc {
 }
 
 impl ScalarUDFImpl for EncryptRawFunc {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "encrypt_raw"

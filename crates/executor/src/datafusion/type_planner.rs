@@ -11,6 +11,7 @@ use datafusion_common::{DataFusionError, TableReference, not_impl_err, plan_err}
 use datafusion_expr::planner::ContextProvider;
 use datafusion_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
 use sqlparser::ast::ArrayElemTypeDef;
+use sqlparser::ast::ColumnOption;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Tokenizer;
@@ -44,6 +45,31 @@ impl TypePlanner for CustomTypePlanner {
             SQLDataType::Datetime(precision) => {
                 let time_unit = parse_timestamp_precision(*precision)?;
                 Ok(Some(DataType::Timestamp(time_unit, None)))
+            }
+            // sqlparser 0.62 parses Snowflake `OBJECT(...)` structured types
+            // into a dedicated variant (previously token soup in
+            // `DataType::Custom`), so plan it to a struct here.
+            SQLDataType::Object(column_defs) => {
+                let fields = column_defs
+                    .iter()
+                    .map(|column| {
+                        let field_name = column.name.value.to_ascii_lowercase();
+                        let data_type = match self.plan_type(&column.data_type)? {
+                            Some(dt) => dt,
+                            // Fallback to SqlToRel for unsupported types
+                            None => SqlToRel::new(self)
+                                .convert_data_type_to_field(&column.data_type)?
+                                .data_type()
+                                .clone(),
+                        };
+                        let nullable = !column
+                            .options
+                            .iter()
+                            .any(|option| matches!(option.option, ColumnOption::NotNull));
+                        Ok(Field::new(field_name, data_type, nullable))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Some(DataType::Struct(Fields::from(fields))))
             }
             SQLDataType::TimestampNtz(_) => {
                 Ok(Some(DataType::Timestamp(TimeUnit::Microsecond, None)))

@@ -384,7 +384,7 @@ mod tests {
 
         let df_session_id = "fasfsafsfasafsass".to_string();
         let user_session = execution_svc
-            .create_session(&df_session_id)
+            .create_session(&df_session_id, None)
             .await
             .expect("Failed to create a session");
 

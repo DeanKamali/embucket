@@ -142,7 +142,7 @@ impl TokenizedSession {
             .context(session_error::ExecutionSnafu)?
         {
             let _ = execution_svc
-                .create_session(session_id)
+                .create_session(session_id, Some(session.metadata().clone()))
                 .await
                 .context(session_error::ExecutionSnafu)?;
             tracing::Span::current().record("new_session", true);
@@ -220,7 +220,7 @@ mod tests {
 
         let df_session_id = "fasfsafsfasafsass".to_string();
         let user_session = execution_svc
-            .create_session(&df_session_id)
+            .create_session(&df_session_id, None)
             .await
             .expect("Failed to create a session");
 

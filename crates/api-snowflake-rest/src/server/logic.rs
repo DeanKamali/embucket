@@ -78,7 +78,10 @@ pub async fn handle_login_request(
     tracing::info!("Host '{host}' for token creation");
 
     let session_id = jwt_claims.session.session_id();
-    let _session = state.execution_svc.create_session(session_id).await?;
+    let _session = state
+        .execution_svc
+        .create_session(session_id, Some(jwt_claims.session.metadata().clone()))
+        .await?;
 
     let jwt_token = create_jwt(&jwt_claims, jwt_secret).context(CreateJwtSnafu)?;
 

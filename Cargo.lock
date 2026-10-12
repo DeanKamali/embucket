@@ -7507,6 +7507,7 @@ dependencies = [
  "serde_dynamo",
  "serde_json",
  "snafu",
+ "tokio",
  "uuid",
  "xxhash-rust",
 ]

@@ -135,7 +135,7 @@ mod tests {
         let optimizer = RemoveExecAboveEmpty::new();
         let optimized = optimizer.optimize(sort, &ConfigOptions::new())?;
         assert!(
-            optimized.as_any().is::<EmptyExec>(),
+            optimized.downcast_ref::<EmptyExec>().is_some(),
             "Plan was not optimized to EmptyExec"
         );
         Ok(())
@@ -157,7 +157,7 @@ mod tests {
         let rule = RemoveExecAboveEmpty::new();
         let optimized = rule.optimize(filter, &ConfigOptions::default())?;
         assert!(
-            optimized.as_any().is::<EmptyExec>(),
+            optimized.downcast_ref::<EmptyExec>().is_some(),
             "Plan was not optimized to EmptyExec"
         );
         Ok(())
@@ -171,7 +171,7 @@ mod tests {
         let rule = RemoveExecAboveEmpty::new();
         let optimized = rule.optimize(proj, &ConfigOptions::default())?;
         assert!(
-            optimized.as_any().is::<EmptyExec>(),
+            optimized.downcast_ref::<EmptyExec>().is_some(),
             "Plan was not optimized to EmptyExec"
         );
         Ok(())
@@ -206,6 +206,7 @@ mod tests {
             None,
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNull,
+            false,
         )?);
 
         let rule = RemoveExecAboveEmpty::new();

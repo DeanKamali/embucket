@@ -60,7 +60,7 @@ impl SchemaProvider for IcebergSchema {
 
         let tabular = match self.catalog.clone().load_tabular(&identifier).await {
             Ok(tabular) => tabular,
-            Err(IcebergError::CatalogNotFound) => return Ok(None),
+            Err(IcebergError::CatalogNotFound | IcebergError::NotFound(_)) => return Ok(None),
             Err(err) => return Err(DataFusionError::External(Box::new(err))),
         };
 

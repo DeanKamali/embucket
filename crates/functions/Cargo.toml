@@ -33,7 +33,7 @@ geoarrow-geoparquet = { git = "https://github.com/geoarrow/geoarrow-rs.git" , op
 geoarrow-schema = { git = "https://github.com/geoarrow/geoarrow-rs.git" , optional = true, package = "geoarrow-schema", rev = "c241034f98eb1709342fc8da6d2cb87140f10cc5" }
 geoarrow-test = { git = "https://github.com/geoarrow/geoarrow-rs.git" , optional = true, package = "geoarrow-test", rev = "c241034f98eb1709342fc8da6d2cb87140f10cc5" }
 
-arrow-schema = { version = "56", features = ["serde"] }
+arrow-schema = { version = "59", features = ["serde"] }
 chrono = { workspace = true }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
@@ -56,6 +56,7 @@ tokio = { workspace = true }
 datafusion-functions-json = { workspace = true }
 hex = "0.4.3"
 sha2 = "0.10"
+md-5 = "0.10"
 snafu = { workspace = true }
 rust_decimal = "1.37.2"
 futures = { workspace = true }

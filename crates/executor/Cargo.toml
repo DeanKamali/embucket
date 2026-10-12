@@ -28,7 +28,7 @@ catalog-metastore = { path = "../catalog-metastore" }
 state-store = { path = "../state-store" }
 catalog = { path = "../catalog" }
 functions = { path = "../functions" } # features = ["geospatial"] 
-arrow-schema = { version = "56.1.0", features = ["serde"] }
+arrow-schema = { version = "59.2.0", features = ["serde"] }
 async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-credential-types = { workspace = true }
@@ -45,7 +45,7 @@ datafusion-functions-json = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion_iceberg = { workspace = true }
 futures = { workspace = true }
-sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "28012078c09714542c95ddbad8203a282fa37cb2", features = [
+sqlparser = { git = "https://github.com/Embucket/datafusion-sqlparser-rs.git", rev = "c8858eb8417428d01b974f42894c96937b4c80ff", features = [
   "visitor",
 ] }
 iceberg-rust = { workspace = true }

@@ -42,27 +42,27 @@ bytes = { version = "1.8.0" }
 chrono = { version = "0.4.41", default-features = false, features = ["serde",  "clock"] }
 clap = { version = "4.5.27", features = ["env", "derive"] }
 dashmap = "6.1.0"
-datafusion = { version = "50.0.0" }
-datafusion-common = { version = "50.0.0" }
-datafusion-doc = { version = "50.0.0" }
-datafusion-expr = { version = "50.0.0" }
-datafusion-functions-json = { git = "https://github.com/Embucket/datafusion-functions-json.git", rev = "439cbd2282504c3ffaf262f1ffdb530a0fb1a151" }
-datafusion-macros = { version = "50.0.0" }
-datafusion-physical-plan = { version = "50.0.0" }
-datafusion_iceberg = { git = "https://github.com/Embucket/iceberg-rust.git", rev = "8898408938dc31ef4e5e02c470a6b85294b12b4b" }
+datafusion = { version = "55.0.0" }
+datafusion-common = { version = "55.0.0" }
+datafusion-doc = { version = "55.0.0" }
+datafusion-expr = { version = "55.0.0" }
+datafusion-functions-json = { git = "https://github.com/Embucket/datafusion-functions-json.git", branch = "embucket-sync-df55.0.0" }
+datafusion-macros = { version = "55.0.0" }
+datafusion-physical-plan = { version = "55.0.0" }
+datafusion_iceberg = { git = "https://github.com/Embucket/iceberg-rust.git", branch = "embucket-sync-df55.0.0" }
 futures = { version = "0.3" }
 http = "1.2"
 http-body-util = "0.1.0"
 iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev="7a5ad1fcaf00d4638857812bab788105f6c60573"}
-iceberg-rest-catalog = { git = "https://github.com/Embucket/iceberg-rust.git", rev = "8898408938dc31ef4e5e02c470a6b85294b12b4b" }
-iceberg-rust = { git = "https://github.com/Embucket/iceberg-rust.git", rev = "8898408938dc31ef4e5e02c470a6b85294b12b4b" }
-iceberg-rust-spec = { git = "https://github.com/Embucket/iceberg-rust.git", rev = "8898408938dc31ef4e5e02c470a6b85294b12b4b" }
-iceberg-s3tables-catalog = { git = "https://github.com/Embucket/iceberg-rust.git", rev = "8898408938dc31ef4e5e02c470a6b85294b12b4b" }
+iceberg-rest-catalog = { git = "https://github.com/Embucket/iceberg-rust.git", branch = "embucket-sync-df55.0.0" }
+iceberg-rust = { git = "https://github.com/Embucket/iceberg-rust.git", branch = "embucket-sync-df55.0.0" }
+iceberg-rust-spec = { git = "https://github.com/Embucket/iceberg-rust.git", branch = "embucket-sync-df55.0.0" }
+iceberg-s3tables-catalog = { git = "https://github.com/Embucket/iceberg-rust.git", branch = "embucket-sync-df55.0.0" }
 indexmap = "2.7.1"
 jsonwebtoken = "9.3.1"
 lazy_static = { version = "1.5" }
 # Should be updated to 0.12.0 after slate db update
-object_store = { version = "0.12.0", features = ["aws", "gcp", "azure"] }
+object_store = { version = "0.13.0", features = ["aws", "gcp", "azure"] }
 regex = "1.11.1"
 serde = { version = "1.0.228", features = ["derive", "alloc"] }
 serde_json = { version = "1.0.145", features = ["raw_value"]}
@@ -101,12 +101,32 @@ insta = { version = "1.44.1", features = ["json", "filters", "redactions"] }
 cfg-if = { version = "1.0.3" }
 
 [patch.crates-io]
-datafusion = { git = "https://github.com/Embucket/datafusion.git", rev = "832c278922863064571c0a7c5716a3ff87ce5201" }
-datafusion-common = { git = "https://github.com/Embucket/datafusion.git", rev = "832c278922863064571c0a7c5716a3ff87ce5201" }
-datafusion-expr = { git = "https://github.com/Embucket/datafusion.git", rev = "832c278922863064571c0a7c5716a3ff87ce5201" }
-datafusion-physical-plan = { git = "https://github.com/Embucket/datafusion.git", rev = "832c278922863064571c0a7c5716a3ff87ce5201" }
-datafusion-doc = { git = "https://github.com/Embucket/datafusion.git", rev = "832c278922863064571c0a7c5716a3ff87ce5201" }
-datafusion-macros = { git = "https://github.com/Embucket/datafusion.git", rev = "832c278922863064571c0a7c5716a3ff87ce5201" }
+# Unify Arrow on the Embucket fork (required by datafusion fork's df55 branch);
+# without this the registry arrow 59.3 duplicates the git arrow 59.2 types.
+arrow = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-arith = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-array = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-buffer = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-cast = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-csv = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-data = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-ipc = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-json = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-ord = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-row = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-schema = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-select = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+arrow-string = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+parquet = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+parquet-variant = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+parquet-variant-compute = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+parquet-variant-json = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
+datafusion = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-common = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-expr = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-physical-plan = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-doc = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-macros = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

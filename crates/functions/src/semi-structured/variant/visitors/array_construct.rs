@@ -69,7 +69,7 @@ mod tests {
 
         // Test simple array construction
         let sql = "SELECT [1, 2, 3] as arr";
-        let mut stmt = ctx.state().sql_to_statement(sql, "snowflake")?;
+        let mut stmt = ctx.state().sql_to_statement(sql, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut s) = stmt {
             visit(s);
         }
@@ -88,7 +88,7 @@ mod tests {
 
         // Test array with mixed types
         let sql = "SELECT [1, 'test', null] as mixed_arr";
-        let mut stmt = ctx.state().sql_to_statement(sql, "snowflake")?;
+        let mut stmt = ctx.state().sql_to_statement(sql, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut s) = stmt {
             visit(s);
         }
@@ -107,7 +107,7 @@ mod tests {
 
         // Test nested arrays
         let sql = "SELECT [[1, 2], [3, 4]] as nested_arr";
-        let mut stmt = ctx.state().sql_to_statement(sql, "snowflake")?;
+        let mut stmt = ctx.state().sql_to_statement(sql, &datafusion::config::Dialect::Snowflake)?;
         if let DFStatement::Statement(ref mut s) = stmt {
             visit(s);
         }

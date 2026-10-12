@@ -293,6 +293,10 @@ mod tests {
                     Arc::new(Column::new("key", 0)),
                     Arc::new(Column::new("value", 1)),
                 ],
+                expr_fields: &[
+                    Arc::new(arrow_schema::Field::new("key", DataType::Utf8, false)),
+                    Arc::new(arrow_schema::Field::new("value", self.data_type.clone(), true)),
+                ],
             })
         }
 

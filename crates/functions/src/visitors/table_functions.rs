@@ -1,4 +1,6 @@
-use datafusion::logical_expr::sqlparser::ast::{Expr, TableFactor, VisitMut};
+use datafusion::logical_expr::sqlparser::ast::{
+    Expr, ObjectNamePart, TableFactor, VisitMut,
+};
 use datafusion::sql::sqlparser::ast::{
     Function, FunctionArguments, Query, SetExpr, Statement, VisitorMut,
 };
@@ -44,26 +46,44 @@ impl VisitorMut for TableFunctionVisitor {
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
         if let SetExpr::Select(select) = query.body.as_mut() {
             for item in &mut select.from {
-                if let TableFactor::TableFunction {
-                    expr:
-                        Expr::Function(Function {
-                            name,
-                            args: FunctionArguments::List(args),
-                            ..
-                        }),
-                    alias,
-                } = &mut item.relation
-                {
-                    let func_name = name.to_string();
-                    if matches!(func_name.to_lowercase().as_str(), "result_scan" | "flatten") {
-                        item.relation = TableFactor::Function {
-                            name: name.clone(),
-                            args: args.args.clone(),
-                            alias: alias.clone(),
-                            lateral: false,
-                            with_ordinality: false,
-                        };
+                match &mut item.relation {
+                    TableFactor::TableFunction {
+                        expr:
+                            Expr::Function(Function {
+                                name,
+                                args: FunctionArguments::List(args),
+                                ..
+                            }),
+                        alias,
+                        ..
+                    } => {
+                        let func_name = name.to_string();
+                        if matches!(
+                            func_name.to_lowercase().as_str(),
+                            "result_scan" | "flatten"
+                        ) {
+                            item.relation = TableFactor::Function {
+                                name: name.clone(),
+                                args: args.args.clone(),
+                                alias: alias.clone(),
+                                lateral: false,
+                                with_ordinality: false,
+                            };
+                        }
                     }
+                    // Table function names are resolved case-sensitively by
+                    // DataFusion 55 (`SessionState::table_functions` is a plain
+                    // `HashMap` keyed by the registered name), so normalize
+                    // unquoted names to lowercase to keep Snowflake-style
+                    // case-insensitive semantics.
+                    TableFactor::Function { name, .. } => {
+                        if let Some(ObjectNamePart::Identifier(ident)) = name.0.first_mut() {
+                            if ident.quote_style.is_none() {
+                                ident.value = ident.value.to_lowercase();
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

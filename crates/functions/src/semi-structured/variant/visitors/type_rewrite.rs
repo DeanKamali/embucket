@@ -52,7 +52,7 @@ mod tests {
 
         // Test table creation with Array type
         let sql = "CREATE TABLE test_table (id INT, arr ARRAY)";
-        let mut statement = ctx.state().sql_to_statement(sql, "snowflake")?;
+        let mut statement = ctx.state().sql_to_statement(sql, &datafusion::config::Dialect::Snowflake)?;
 
         if let DFStatement::Statement(ref mut stmt) = statement {
             visit(stmt);
@@ -72,7 +72,7 @@ mod tests {
 
         // Test table creation with Array type
         let sql = "CREATE TABLE test_table (id INT, obj OBJECT)";
-        let mut statement = ctx.state().sql_to_statement(sql, "snowflake")?;
+        let mut statement = ctx.state().sql_to_statement(sql, &datafusion::config::Dialect::Snowflake)?;
 
         if let DFStatement::Statement(ref mut stmt) = statement {
             visit(stmt);
@@ -92,7 +92,7 @@ mod tests {
 
         // Test table creation with Array type
         let sql = "CREATE TABLE test_table (id INT, variant VARIANT)";
-        let mut statement = ctx.state().sql_to_statement(sql, "snowflake")?;
+        let mut statement = ctx.state().sql_to_statement(sql, &datafusion::config::Dialect::Snowflake)?;
 
         if let DFStatement::Statement(ref mut stmt) = statement {
             visit(stmt);

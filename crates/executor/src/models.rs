@@ -172,6 +172,16 @@ impl SessionMetadata {
     pub fn attr(&self, attr: SessionMetadataAttr) -> Option<String> {
         self.0.get(&attr.to_string()).cloned()
     }
+
+    #[must_use]
+    pub fn from_map(map: HashMap<String, String>) -> Self {
+        Self(map)
+    }
+
+    #[must_use]
+    pub fn into_map(self) -> HashMap<String, String> {
+        self.0
+    }
 }
 
 // TODO: We should not have serde dependency here

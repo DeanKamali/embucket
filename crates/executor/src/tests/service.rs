@@ -21,7 +21,7 @@ async fn test_execute_always_returns_schema() {
         .expect("Failed to create execution service");
 
     execution_svc
-        .create_session("test_session_id")
+        .create_session("test_session_id", None)
         .await
         .expect("Failed to create session");
 
@@ -95,7 +95,7 @@ async fn test_service_upload_file() {
 
     let session_id = "test_session_id";
     execution_svc
-        .create_session(session_id)
+        .create_session(session_id, None)
         .await
         .expect("Failed to create session");
 
@@ -220,7 +220,7 @@ async fn test_service_create_table_file_volume() {
 
     let session_id = "test_session_id";
     execution_svc
-        .create_session(session_id)
+        .create_session(session_id, None)
         .await
         .expect("Failed to create session");
 
@@ -279,7 +279,7 @@ async fn test_max_concurrency_level() {
     );
 
     let _session = execution_svc
-        .create_session("test_session_id")
+        .create_session("test_session_id", None)
         .await
         .expect("Failed to create session");
 
@@ -333,7 +333,7 @@ async fn test_max_concurrency_level2() {
     );
 
     let _session = execution_svc
-        .create_session("test_session_id")
+        .create_session("test_session_id", None)
         .await
         .expect("Failed to create session");
 
@@ -374,7 +374,7 @@ async fn test_parallel_run() {
     );
 
     let _ = execution_svc
-        .create_session("test_session_id")
+        .create_session("test_session_id", None)
         .await
         .expect("Failed to create session");
 
@@ -419,7 +419,7 @@ async fn test_query_timeout() {
     );
 
     let _session = execution_svc
-        .create_session("test_session_id")
+        .create_session("test_session_id", None)
         .await
         .expect("Failed to create session");
 

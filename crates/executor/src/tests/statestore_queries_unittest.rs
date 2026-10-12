@@ -78,9 +78,6 @@ impl Mocker {
         state_store_mock: &mut MockStateStore,
         f: fn(&str) -> state_store::Result<SessionRecord>,
     ) {
-        state_store_mock
-            .expect_put_new_session()
-            .returning(|_| Ok(()));
         state_store_mock.expect_put_session().returning(|_| Ok(()));
         state_store_mock.expect_get_session().returning(f);
     }
@@ -91,7 +88,7 @@ impl Mocker {
     ) -> Result<Arc<UserSession>> {
         timeout(
             MOCK_RELATED_TIMEOUT_DURATION,
-            executor.create_session(session_id),
+            executor.create_session(session_id, None),
         )
         .await
         .expect("Create session timed out")
@@ -551,7 +548,7 @@ async fn test_query_lifecycle_delete_failed() {
                   "warehouse_type": "DEFAULT",
                   "execution_status": "Fail",
                   "error_code": "010001",
-                  "error_message": "00000000-0000-0000-0000-000000000000: Query execution error: DataFusion error: This feature is not implemented: Unsupported logical plan: Dml(Delete)",
+                  "error_message": "00000000-0000-0000-0000-000000000000: Query execution error: DataFusion error: DELETE operation on table 'embucket.public.table'\ncaused by\nThis feature is not implemented: DELETE not supported for Base table",
                   "start_time": "2026-01-01T01:01:01.000000001Z",
                   "end_time": "2026-01-01T01:01:01.000000001Z",
                   "execution_time": "1",

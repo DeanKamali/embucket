@@ -2,6 +2,7 @@ use crate::session::UserSession;
 use std::collections::HashMap;
 
 use crate::models::QueryContext;
+use crate::models::SessionMetadata;
 use crate::running_queries::RunningQueriesRegistry;
 use crate::service::CoreExecutionService;
 use crate::utils::Config;
@@ -139,6 +140,7 @@ pub async fn create_df_session() -> Arc<UserSession> {
             catalog_list,
             runtime_env,
             "",
+            SessionMetadata::default(),
             #[cfg(feature = "state-store")]
             state_store,
         )

@@ -10,7 +10,7 @@ use crate::datafusion::logical_analyzer::analyzer_rules;
 use crate::datafusion::logical_optimizer::split_ordered_aggregates::SplitOrderedAggregates;
 use crate::datafusion::physical_optimizer::physical_optimizer_rules;
 use crate::datafusion::query_planner::CustomQueryPlanner;
-use crate::models::QueryContext;
+use crate::models::{QueryContext, SessionMetadata};
 use crate::query::UserQuery;
 use crate::query_types::QueryId;
 use crate::running_queries::RunningQueries;
@@ -50,6 +50,14 @@ pub const fn to_unix(t: OffsetDateTime) -> i64 {
     t.unix_timestamp()
 }
 
+/// A user session bound to one in-process DataFusion `SessionContext`.
+///
+/// Durable session state — session parameters, login context, expiry — is
+/// externalized through the state store, so a session is rehydrated on any
+/// process after a restart/failover (Avalanche design §4).
+///
+/// v1 limitation: temp tables live in the in-memory `SessionContext` and are
+/// lost on failover (documented loss-on-failover).
 pub struct UserSession {
     pub metastore: Arc<dyn Metastore>,
     #[cfg(feature = "state-store")]
@@ -66,6 +74,10 @@ pub struct UserSession {
     pub recent_queries: Arc<RwLock<VecDeque<QueryId>>>,
     pub session_id: String,
     pub attrs: DashMap<String, String>,
+    /// Login-time session context (user, account, client app, initial
+    /// database/schema/warehouse). Persisted through the state store so a
+    /// session can be rehydrated on a different process after a failover.
+    pub metadata: SessionMetadata,
 }
 
 impl UserSession {
@@ -77,6 +89,7 @@ impl UserSession {
         catalog_list: Arc<EmbucketCatalogList>,
         runtime_env: Arc<RuntimeEnv>,
         session_id: &str,
+        metadata: SessionMetadata,
         #[cfg(feature = "state-store")] state_store: Arc<dyn StateStore>,
     ) -> Result<Self> {
         let sql_parser_dialect = config
@@ -165,6 +178,7 @@ impl UserSession {
             recent_queries: Arc::new(RwLock::new(VecDeque::new())),
             session_id: session_id.to_string(),
             attrs: DashMap::new(),
+            metadata,
         };
         Ok(session)
     }

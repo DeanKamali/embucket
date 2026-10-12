@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use super::error::{self as ex_error, Result};
 #[cfg(feature = "state-store")]
 use super::models::SessionMetadataAttr;
-use super::models::{QueryContext, QueryResult};
+use super::models::{QueryContext, QueryResult, SessionMetadata};
 use super::running_queries::{RunningQueries, RunningQueriesRegistry, RunningQuery};
 use super::session::UserSession;
 use crate::query_task_result::ExecutionTaskResult;
@@ -51,7 +51,16 @@ pub const TIMEOUT_DISCARD_INTERVAL_SECONDS: u64 = 60;
 
 #[async_trait::async_trait]
 pub trait ExecutionService: Send + Sync {
-    async fn create_session(&self, session_id: &str) -> Result<Arc<UserSession>>;
+    /// Creates (or returns an existing) session.
+    ///
+    /// When the `state-store` feature is enabled, the session record is
+    /// persisted with its login context and inactivity expiry so it can be
+    /// rehydrated by another process after a restart/failover.
+    async fn create_session(
+        &self,
+        session_id: &str,
+        metadata: Option<SessionMetadata>,
+    ) -> Result<Arc<UserSession>>;
     async fn update_session_expiry(&self, session_id: &str) -> Result<bool>;
     async fn delete_expired_sessions(&self) -> Result<()>;
     async fn get_session(&self, session_id: &str) -> Result<Arc<UserSession>>;
@@ -284,6 +293,98 @@ impl CoreExecutionService {
     fn initialize_datafusion_tracer() {
         let _ = set_join_set_tracer(&SpanTracer);
     }
+
+    /// Persists a newly created session so it can be rehydrated on any
+    /// process after a restart/failover (Avalanche design §4).
+    #[cfg(feature = "state-store")]
+    async fn persist_new_session(&self, session: &UserSession) -> state_store::Result<()> {
+        // Preserve views already stored for this session (v1 sessions are
+        // created once per id, but be defensive against recreate).
+        let record = match self.state_store.get_session(&session.session_id).await {
+            Ok(record) => record,
+            Err(state_store::Error::NotFound) => {
+                state_store::SessionRecord::new(&session.session_id)
+            }
+            Err(err) => return Err(err),
+        };
+        let record = state_store::SessionRecord {
+            user_name: session.metadata.attr(SessionMetadataAttr::UserName),
+            metadata: session.metadata.clone().into_map(),
+            expiry: u64::try_from(session.expiry.load(Ordering::Relaxed)).ok(),
+            ..record
+        };
+        self.state_store.put_session(record).await
+    }
+
+    /// Refreshes the persisted inactivity expiry of a session.
+    #[cfg(feature = "state-store")]
+    async fn touch_persisted_session(&self, session_id: &str) -> state_store::Result<()> {
+        if let Ok(mut record) = self.state_store.get_session(session_id).await {
+            record.expiry = u64::try_from(to_unix(
+                OffsetDateTime::now_utc()
+                    + DateTimeDuration::seconds(SESSION_INACTIVITY_EXPIRATION_SECONDS),
+            ))
+            .ok();
+            self.state_store.update_session(record).await?;
+        }
+        Ok(())
+    }
+
+    /// Recreates a `UserSession` from its persisted record, restoring session
+    /// parameters and login context. Returns `Ok(false)` when no live record
+    /// exists; stale (expired) records are cleaned up.
+    #[cfg(feature = "state-store")]
+    async fn rehydrate_session(&self, session_id: &str) -> Result<bool> {
+        let record = match self.state_store.get_session(session_id).await {
+            Ok(record) => record,
+            Err(state_store::Error::NotFound) => return Ok(false),
+            Err(err) => return Err(err).context(ex_error::StateStoreSnafu),
+        };
+
+        // A persisted expiry in the past means the session died elsewhere.
+        let now = to_unix(OffsetDateTime::now_utc());
+        let expiry = record
+            .expiry
+            .map_or(i64::MAX, |expiry| i64::try_from(expiry).unwrap_or(i64::MAX));
+        if expiry <= now {
+            self.state_store
+                .delete_session(session_id)
+                .await
+                .context(ex_error::StateStoreSnafu)?;
+            return Ok(false);
+        }
+
+        tracing::info!(session_id, "Rehydrating session from state store");
+        let metadata = SessionMetadata::from_map(record.metadata.clone());
+        let user_session: Arc<UserSession> = Arc::new(
+            UserSession::new(
+                self.metastore.clone(),
+                self.queries.clone(),
+                self.config.clone(),
+                self.catalog_list.clone(),
+                self.runtime_env.clone(),
+                session_id,
+                metadata,
+                self.state_store.clone(),
+            )
+            .await?,
+        );
+        // Session parameters were loaded from the state store by
+        // `UserSession::new`; refresh the persisted expiry from now.
+        let expiry = to_unix(
+            OffsetDateTime::now_utc()
+                + DateTimeDuration::seconds(SESSION_INACTIVITY_EXPIRATION_SECONDS),
+        );
+        user_session.expiry.store(expiry, Ordering::Relaxed);
+
+        let mut sessions = self.df_sessions.write().await;
+        // Another task may have created the session concurrently; either way
+        // a live session now exists.
+        sessions
+            .entry(session_id.to_string())
+            .or_insert(user_session);
+        Ok(true)
+    }
 }
 
 #[async_trait::async_trait]
@@ -295,13 +396,18 @@ impl ExecutionService for CoreExecutionService {
         fields(new_sessions_count),
         err
     )]
-    async fn create_session(&self, session_id: &str) -> Result<Arc<UserSession>> {
+    async fn create_session(
+        &self,
+        session_id: &str,
+        metadata: Option<SessionMetadata>,
+    ) -> Result<Arc<UserSession>> {
         {
             let sessions = self.df_sessions.read().await;
             if let Some(session) = sessions.get(session_id) {
                 return Ok(session.clone());
             }
         }
+        let metadata = metadata.unwrap_or_default();
         let user_session: Arc<UserSession> = Arc::new(
             UserSession::new(
                 self.metastore.clone(),
@@ -310,6 +416,7 @@ impl ExecutionService for CoreExecutionService {
                 self.catalog_list.clone(),
                 self.runtime_env.clone(),
                 session_id,
+                metadata.clone(),
                 #[cfg(feature = "state-store")]
                 self.state_store.clone(),
             )
@@ -321,9 +428,8 @@ impl ExecutionService for CoreExecutionService {
             tracing::trace!("Acquired write lock for df_sessions");
             sessions.insert(session_id.to_string(), user_session.clone());
 
-            #[cfg(feature = "state-store-persist-session-oncreate")]
-            self.state_store
-                .put_new_session(session_id)
+            #[cfg(feature = "state-store")]
+            self.persist_new_session(&user_session)
                 .await
                 .context(ex_error::StateStoreSnafu)?;
 
@@ -341,21 +447,38 @@ impl ExecutionService for CoreExecutionService {
         err
     )]
     async fn update_session_expiry(&self, session_id: &str) -> Result<bool> {
-        let mut sessions = self.df_sessions.write().await;
+        let found = {
+            let mut sessions = self.df_sessions.write().await;
 
-        let res = if let Some(session) = sessions.get_mut(session_id) {
-            let now = OffsetDateTime::now_utc();
-            let new_expiry =
-                to_unix(now + DateTimeDuration::seconds(SESSION_INACTIVITY_EXPIRATION_SECONDS));
-            session.expiry.store(new_expiry, Ordering::Relaxed);
-
-            // Record the result as part of the current span.
-            tracing::Span::current().record("sessions_count", sessions.len());
-            true
-        } else {
-            false
+            if let Some(session) = sessions.get_mut(session_id) {
+                let now = OffsetDateTime::now_utc();
+                let new_expiry =
+                    to_unix(now + DateTimeDuration::seconds(SESSION_INACTIVITY_EXPIRATION_SECONDS));
+                session.expiry.store(new_expiry, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
         };
-        Ok(res)
+
+        if found {
+            // Keep the persisted record in sync so another process can tell
+            // this session is still alive after a failover.
+            #[cfg(feature = "state-store")]
+            self.touch_persisted_session(session_id)
+                .await
+                .context(ex_error::StateStoreSnafu)?;
+            return Ok(true);
+        }
+
+        // Session not in this process: it may have been created by (or
+        // outlived) a different instance. Rehydrate it from the state store.
+        #[cfg(feature = "state-store")]
+        if self.rehydrate_session(session_id).await? {
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     #[tracing::instrument(
@@ -371,6 +494,7 @@ impl ExecutionService for CoreExecutionService {
 
         let old_sessions_count = sessions.len();
 
+        let mut deleted_session_ids = Vec::new();
         sessions.retain(|session_id, session| {
             let expiry = session.expiry.load(Ordering::Relaxed);
             if expiry <= now {
@@ -385,6 +509,7 @@ impl ExecutionService for CoreExecutionService {
                         now
                     )
                     .entered();
+                    deleted_session_ids.push(session_id.clone());
                     false
                 } else {
                     let _ = tracing::debug_span!(
@@ -407,6 +532,16 @@ impl ExecutionService for CoreExecutionService {
             .record("old_sessions_count", old_sessions_count)
             .record("new_sessions_count", sessions.len())
             .record("now", now);
+
+        // Purge the persisted records so another process does not rehydrate a
+        // session that just expired.
+        #[cfg(feature = "state-store")]
+        for session_id in deleted_session_ids {
+            if let Err(err) = self.state_store.delete_session(&session_id).await {
+                tracing::warn!(session_id, %err, "Failed to delete expired session record");
+            }
+        }
+
         Ok(())
     }
 
@@ -444,6 +579,13 @@ impl ExecutionService for CoreExecutionService {
         // Record the result as part of the current span.
         tracing::Span::current().record("session_id", session_id);
         tracing::Span::current().record("new_sessions_count", session_list.len());
+        drop(session_list);
+
+        // Purge the persisted record so the session cannot be rehydrated.
+        #[cfg(feature = "state-store")]
+        if let Err(err) = self.state_store.delete_session(session_id).await {
+            tracing::warn!(session_id, %err, "Failed to delete persisted session record");
+        }
         Ok(())
     }
     fn get_sessions(&self) -> Arc<RwLock<HashMap<String, Arc<UserSession>>>> {

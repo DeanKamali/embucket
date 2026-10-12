@@ -1,4 +1,5 @@
 use crate::models::QueryContext;
+use crate::models::SessionMetadata;
 use crate::running_queries::RunningQueriesRegistry;
 use crate::service::CoreExecutionService;
 use crate::session::UserSession;
@@ -46,6 +47,7 @@ pub async fn create_s3_tables_df_session() -> Arc<UserSession> {
             catalog_list,
             runtime_env,
             "",
+            SessionMetadata::default(),
             #[cfg(feature = "state-store")]
             state_store,
         )

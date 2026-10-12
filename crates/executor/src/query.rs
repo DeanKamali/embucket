@@ -78,6 +78,7 @@ use functions::visitors::{
     like_ilike_any, rlike_regexp_expr_rewriter, select_expr_aliases, table_functions,
     table_functions_cte_relation, timestamp, top_limit,
     unimplemented::functions_checker::visit as unimplemented_functions_checker,
+    within_group_rewriter,
 };
 use iceberg_rust::catalog::create::CreateTableBuilder;
 use iceberg_rust::catalog::tabular::Tabular;
@@ -240,6 +241,7 @@ impl UserQuery {
             table_functions::visit(value);
             timestamp::visit(value);
             table_functions_cte_relation::visit(value);
+            within_group_rewriter::visit(value);
             visit_all(value);
         }
         Ok(())
@@ -446,7 +448,10 @@ impl UserQuery {
                 | Statement::ShowFunctions { .. }
                 | Statement::ShowObjects { .. }
                 | Statement::ShowVariables { .. }
-                | Statement::ShowVariable { .. } => return Box::pin(self.show_query(*s)).await,
+                | Statement::ShowVariable { .. }
+                | Statement::ShowParameters { .. } => {
+                    return Box::pin(self.show_query(*s)).await;
+                }
                 Statement::Truncate(truncate) => {
                     return Box::pin(self.truncate_table(truncate.table_names)).await;
                 }
@@ -1017,6 +1022,23 @@ impl UserQuery {
                         if field.data_type() == &DataType::Null {
                             let new_field = Field::new(field.name(), DataType::Utf8, true);
                             Arc::new(new_field)
+                        } else if field.data_type().is_unsigned_integer() {
+                            // Iceberg has no unsigned integer types; coerce to
+                            // the closest signed type. DataFusion 55's
+                            // `row_number()` now returns UInt64, which shows up
+                            // in CREATE TABLE AS SELECT plans. The data is cast
+                            // to the target schema on insert.
+                            let signed = match field.data_type() {
+                                DataType::UInt64 => DataType::Int64,
+                                DataType::UInt32 => DataType::Int32,
+                                DataType::UInt16 => DataType::Int16,
+                                DataType::UInt8 => DataType::Int8,
+                                _ => field.data_type().clone(),
+                            };
+                            let new_field =
+                                Field::new(field.name(), signed, field.is_nullable())
+                                    .with_metadata(field.metadata().clone());
+                            Arc::new(new_field)
                         } else {
                             field.clone()
                         }
@@ -1454,7 +1476,7 @@ impl UserQuery {
                     LogicalPlan::SubqueryAlias(
                         SubqueryAlias::try_new(
                             Arc::new(source_plan),
-                            TableReference::parse_str(&alias.to_string()),
+                            TableReference::parse_str(&alias.name.to_string()),
                         )
                         .context(ex_error::DataFusionLogicalPlanMergeSourceSnafu)?,
                     )
@@ -1494,6 +1516,7 @@ impl UserQuery {
                     DataFusionTableConfigBuilder::default()
                         .enable_data_file_path_column(true)
                         .enable_manifest_file_path_column(true)
+                        .enable_data_file_row_position_column(false)
                         .build()
                         .context(ex_error::IcebergSnafu)?,
                 ),
@@ -1959,6 +1982,29 @@ impl UserQuery {
                         variable
                     )
                 }
+            }
+            Statement::ShowParameters { filter, .. } => {
+                // `SHOW PARAMETERS` parsed as `ShowVariable` on DataFusion 50 and
+                // resolved to no rows; keep that behavior (no parameter support
+                // yet) by querying the same settings view for a non-existent
+                // parameter name.
+                let mut filters = Vec::new();
+                if let Some(ShowStatementFilter::Like(pattern)) = filter {
+                    filters.push(format!("name LIKE '{pattern}'"));
+                }
+                apply_show_filters(
+                    format!(
+                        "SELECT
+                        name,
+                        value,
+                        type,
+                        description as comment
+                    FROM {}.information_schema.df_settings
+                    WHERE name = 'parameters'",
+                        self.current_database()
+                    ),
+                    &filters,
+                )
             }
             Statement::ShowVariables { filter, .. } => {
                 let sql = format!(
@@ -2625,23 +2671,62 @@ impl UserQuery {
                     if !column.is_null(row_idx)
                         && let Ok(scalar_value) = ScalarValue::try_from_array(column, row_idx)
                     {
+                        let value = scalar_value.to_string();
                         let expr = if batch.schema().fields()[0].data_type().is_numeric() {
-                            Expr::Value(
-                                Value::Number(scalar_value.to_string(), false).with_empty_span(),
-                            )
+                            Expr::Value(Value::Number(value.clone(), false).with_empty_span())
                         } else {
                             Expr::Value(
-                                Value::SingleQuotedString(scalar_value.to_string())
-                                    .with_empty_span(),
+                                Value::SingleQuotedString(value.clone()).with_empty_span(),
                             )
                         };
 
-                        exprs.push(sqlparser::ast::ExprWithAlias { expr, alias: None });
+                        // Alias the value so the pivot column keeps the plain
+                        // (unquoted) name; DataFusion 55 names pivot columns
+                        // from the alias when present, falling back to the
+                        // literal display (`'2023_Q1'`) otherwise.
+                        let alias = sqlparser::ast::Ident::with_quote_and_span(
+                            '"',
+                            sqlparser::tokenizer::Span::empty(),
+                            value,
+                        );
+                        exprs.push(sqlparser::ast::ExprWithAlias {
+                            expr,
+                            alias: Some(alias),
+                        });
                     }
                 }
             }
         }
         exprs
+    }
+
+    /// Give each static pivot value an explicit alias so the resulting pivot
+    /// column is named after the literal's value (`2023_Q1`) rather than the
+    /// literal's display form (`'2023_Q1'`), matching Snowflake output.
+    fn set_pivot_value_aliases(values: &mut [sqlparser::ast::ExprWithAlias]) {
+        for value in values {
+            if value.alias.is_none()
+                && let Some(name) = Self::pivot_value_name(&value.expr)
+            {
+                value.alias = Some(sqlparser::ast::Ident::with_quote_and_span(
+                    '"',
+                    sqlparser::tokenizer::Span::empty(),
+                    name,
+                ));
+            }
+        }
+    }
+
+    /// Extract the plain column name for a pivot value literal.
+    fn pivot_value_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Value(value) => match &**value {
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.clone()),
+                Value::Number(n, _) => Some(n.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     // This function is used to update the table references in the query
@@ -2652,6 +2737,7 @@ impl UserQuery {
         table: &TableFactor,
         value_column: &[Expr],
         value_source: &mut PivotValueSource,
+        with_clause: Option<&sqlparser::ast::With>,
     ) {
         match value_source {
             PivotValueSource::Any(order_by_expr) => {
@@ -2660,7 +2746,14 @@ impl UserQuery {
                     .map(std::string::ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(".");
-                let mut query = format!("SELECT DISTINCT {col} FROM {table} ");
+                let mut query = String::new();
+                // Carry the enclosing query's CTEs into the resolution query so
+                // pivots over CTE tables can be resolved (the CTEs are not
+                // otherwise visible here).
+                if let Some(with) = with_clause {
+                    let _ = write!(query, "{with} ");
+                }
+                let _ = write!(query, "SELECT DISTINCT {col} FROM {table} ");
 
                 if !order_by_expr.is_empty() {
                     let order_by_clause = order_by_expr
@@ -2702,8 +2795,10 @@ impl UserQuery {
                         PivotValueSource::List(Self::convert_batches_to_exprs(batches.records));
                 }
             }
-            PivotValueSource::List(_) => {
-                // Do nothing
+            PivotValueSource::List(values) => {
+                // Name static pivot values after the literal's value so the
+                // pivot columns match Snowflake-style (unquoted) names.
+                Self::set_pivot_value_aliases(values);
             }
         }
     }
@@ -2717,6 +2812,7 @@ impl UserQuery {
             fn process_set_expr<'a>(
                 this: &'a UserQuery,
                 set_expr: &'a mut sqlparser::ast::SetExpr,
+                with_clause: Option<&'a sqlparser::ast::With>,
             ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
                 Box::pin(async move {
                     match set_expr {
@@ -2733,6 +2829,7 @@ impl UserQuery {
                                         table,
                                         value_column,
                                         value_source,
+                                        with_clause,
                                     )
                                     .await;
                                 }
@@ -2743,15 +2840,15 @@ impl UserQuery {
                             this.traverse_and_update_query(inner_query).await;
                         }
                         sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-                            process_set_expr(this, left).await;
-                            process_set_expr(this, right).await;
+                            process_set_expr(this, left, with_clause).await;
+                            process_set_expr(this, right, with_clause).await;
                         }
                         _ => {}
                     }
                 })
             }
 
-            process_set_expr(self, &mut query.body).await;
+            process_set_expr(self, &mut query.body, query.with.as_ref()).await;
 
             if let Some(with) = &mut query.with {
                 for cte in &mut with.cte_tables {

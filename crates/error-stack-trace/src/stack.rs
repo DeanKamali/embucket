@@ -116,7 +116,7 @@ fn build_debug_impl(enum_name: Ident) -> TokenStream2 {
 }
 
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ErrorVariant {
     name: Ident,
     fields: Vec<Ident>,

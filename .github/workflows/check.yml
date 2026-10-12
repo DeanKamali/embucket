@@ -71,3 +71,57 @@ jobs:
           sudo ldconfig          
       - name: Run clippy
         run: cargo clippy --all-targets --workspace
+  lockstep:
+    runs-on: ubuntu-latest
+    name: stable / datafusion-ballista lockstep
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Assert datafusion and ballista-core major versions match
+        run: |
+          python3 - <<'PYEOF'
+          import re
+          import sys
+
+
+          def parse_lock_versions(path: str) -> dict:
+              lock = open(path).read()
+              versions = {}
+              for m in re.finditer(
+                  r'^name = "([^"]+)"\nversion = "([^"]+)"', lock, re.M
+              ):
+                  # keep the highest version if a crate appears multiple times
+                  name, version = m.group(1), m.group(2)
+                  if name not in versions or version > versions[name]:
+                      versions[name] = version
+              return versions
+
+
+          versions = parse_lock_versions("Cargo.lock")
+          datafusion = versions.get("datafusion")
+          ballista = versions.get("ballista-core")
+
+          if datafusion is None:
+              print("datafusion not found in Cargo.lock")
+              sys.exit(1)
+
+          if ballista is None:
+              print(
+                  "ballista-core is not in the dependency tree yet; "
+                  f"nothing to compare against datafusion {datafusion}"
+              )
+              sys.exit(0)
+
+          df_major = datafusion.split(".")[0]
+          ballista_major = ballista.split(".")[0]
+          print(f"datafusion={datafusion} ballista-core={ballista}")
+          if df_major != ballista_major:
+              print(
+                  f"ERROR: ballista-core major ({ballista_major}) != "
+                  f"datafusion major ({df_major}). Ballista and DataFusion "
+                  "must be bumped in lockstep, every major, in the same release."
+              )
+              sys.exit(1)
+          print("lockstep check passed")
+          PYEOF

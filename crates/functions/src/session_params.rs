@@ -99,7 +99,12 @@ impl SessionProperty {
             created_on: now,
             updated_on: now,
             value: match &option.option_value {
-                KeyValueOptionKind::Single(value) => value.value.to_string(),
+                KeyValueOptionKind::Single(value) => match &value.value {
+                    // sqlparser 0.62 renders string literals with their quotes
+                    // (e.g. `'1'`); store the raw value instead.
+                    Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.clone(),
+                    v => v.to_string(),
+                },
                 _ => String::new(),
             },
             property_type: match &option.option_value {

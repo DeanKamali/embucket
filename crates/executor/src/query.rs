@@ -51,7 +51,8 @@ use datafusion::sql::parser::{CreateExternalTable, Statement as DFStatement};
 use datafusion::sql::planner::SqlToRel;
 use datafusion::sql::resolve::resolve_table_references;
 use datafusion::sql::sqlparser::ast::{
-    DescribeAlias, Expr, Ident, ObjectName, Query, SchemaName, Statement, TableFactor,
+    DescribeAlias, Expr, Ident, ObjectName, ObjectNamePart, Query, SchemaName, Statement,
+    TableFactor, ValueWithSpan,
 };
 use datafusion::sql::statement::object_name_to_string;
 use datafusion_common::config::ConfigOptions;
@@ -92,10 +93,12 @@ use object_store::aws::{AmazonS3Builder, resolve_bucket_region};
 use object_store::{ClientOptions, ObjectStore};
 use snafu::{OptionExt, ResultExt, location};
 use sqlparser::ast::helpers::key_value_options::KeyValueOptions;
+use sqlparser::ast::helpers::key_value_options::KeyValueOptionKind;
 use sqlparser::ast::helpers::stmt_data_loading::StageParamsObject;
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, CloudProviderParams, MergeAction, MergeClause,
-    MergeClauseKind, MergeInsertKind, ObjectNamePart, ObjectType, PivotValueSource, ShowObjects,
+    MergeClauseKind, MergeInsertKind, MergeUpdateKind, ObjectType, PivotValueSource,
+    ShowObjects,
     ShowStatementFilter, ShowStatementIn, ShowStatementInParentType as ShowType,
     ShowStatementInParentType, TruncateTableTarget, Use, Value, visit_relations_mut,
 };
@@ -176,7 +179,6 @@ impl UserQuery {
             .ctx
             .state()
             .catalog_list()
-            .as_any()
             .downcast_ref::<EmbucketCatalogList>()
         {
             catalog_list_impl
@@ -194,7 +196,6 @@ impl UserQuery {
             .ctx
             .state()
             .catalog_list()
-            .as_any()
             .downcast_ref::<EmbucketCatalogList>()
         {
             catalog_list_impl
@@ -421,12 +422,13 @@ impl UserQuery {
                 Statement::CopyIntoSnowflake { .. } => {
                     return Box::pin(self.copy_into_snowflake_query(*s)).await;
                 }
-                Statement::AlterTable {
-                    name,
-                    operations,
-                    if_exists,
-                    ..
-                } => {
+                Statement::AlterTable(alter_table) => {
+                    let sqlparser::ast::AlterTable {
+                        name,
+                        operations,
+                        if_exists,
+                        ..
+                    } = alter_table;
                     return Box::pin(self.alter_table(name, operations, if_exists)).await;
                 }
                 Statement::StartTransaction { .. }
@@ -445,8 +447,8 @@ impl UserQuery {
                 | Statement::ShowObjects { .. }
                 | Statement::ShowVariables { .. }
                 | Statement::ShowVariable { .. } => return Box::pin(self.show_query(*s)).await,
-                Statement::Truncate { table_names, .. } => {
-                    return Box::pin(self.truncate_table(table_names)).await;
+                Statement::Truncate(truncate) => {
+                    return Box::pin(self.truncate_table(truncate.table_names)).await;
                 }
                 Statement::Query(subquery) => {
                     return self.execute_query_statement(subquery).await;
@@ -476,9 +478,9 @@ impl UserQuery {
             if let DFStatement::Statement(inner) = explain.statement.as_ref()
                 && matches!(inner.as_ref(), Statement::Merge { .. })
             {
-                let analyze = explain.analyze;
-                let verbose = explain.verbose;
-                let format = explain.format.clone();
+                let analyze = explain.options.analyze;
+                let verbose = explain.options.verbose;
+                let format = explain.options.format.clone();
                 let merge_stmt = (**inner).clone();
                 let merge_plan = Box::pin(self.merge_to_logical_plan(merge_stmt)).await?;
                 let merge_plan = Arc::new(merge_plan);
@@ -488,15 +490,17 @@ impl UserQuery {
                 let wrapped = if analyze {
                     LogicalPlan::Analyze(datafusion_expr::logical_plan::Analyze {
                         verbose,
+                        format: format.clone().unwrap_or(
+                            datafusion_expr::logical_plan::ExplainFormat::Indent,
+                        ),
                         input: merge_plan,
                         schema,
+                        analyze_level: None,
+                        analyze_categories: None,
                     })
                 } else {
-                    let explain_format = match format.as_deref() {
-                        Some(f) => datafusion_expr::logical_plan::ExplainFormat::from_str(f)
-                            .unwrap_or(datafusion_expr::logical_plan::ExplainFormat::Indent),
-                        None => datafusion_expr::logical_plan::ExplainFormat::Indent,
-                    };
+                    let explain_format =
+                        format.unwrap_or(datafusion_expr::logical_plan::ExplainFormat::Indent);
                     LogicalPlan::Explain(datafusion_expr::logical_plan::Explain {
                         verbose,
                         explain_format,
@@ -504,6 +508,7 @@ impl UserQuery {
                         stringified_plans: vec![],
                         schema,
                         logical_optimization_succeeded: false,
+                        show_statistics: None,
                     })
                 };
                 return self.execute_logical_plan(wrapped).await;
@@ -1002,7 +1007,7 @@ impl UserQuery {
             }
         }
 
-        let fields_with_ids = StructType::try_from(&new_fields_with_ids(
+        let fields_with_ids_inner = new_fields_with_ids(
             &Fields::from(
                 plan.schema()
                     .as_arrow()
@@ -1019,9 +1024,12 @@ impl UserQuery {
                     .collect::<Vec<_>>(),
             ),
             &mut 0,
-        ))
+        )
         .map_err(|err| DataFusionError::External(Box::new(err)))
         .context(ex_error::DataFusionSnafu)?;
+        let fields_with_ids = StructType::try_from(&fields_with_ids_inner)
+            .map_err(|err| DataFusionError::External(Box::new(err)))
+            .context(ex_error::DataFusionSnafu)?;
 
         // Create builder and configure it
         let mut builder = Schema::builder();
@@ -1056,7 +1064,7 @@ impl UserQuery {
         &self,
         statement: CreateExternalTable,
     ) -> Result<QueryResult> {
-        let table_location = statement.location.clone();
+        let table_location = statement.locations.first().cloned();
         let table_format = MetastoreTableFormat::from(statement.file_type);
         let session_context = HashMap::new();
         let session_context_planner = SessionContextProvider {
@@ -1069,7 +1077,11 @@ impl UserQuery {
             .build_schema(statement.columns)
             .context(ex_error::DataFusionSnafu)?;
         let fields_with_ids =
-            StructType::try_from(&new_fields_with_ids(table_schema.fields(), &mut 0))
+            new_fields_with_ids(table_schema.fields(), &mut 0)
+                .map_err(|err| DataFusionError::External(Box::new(err)))
+                .context(ex_error::DataFusionSnafu)?;
+        let fields_with_ids =
+            StructType::try_from(&fields_with_ids)
                 .map_err(|err| DataFusionError::External(Box::new(err)))
                 .context(ex_error::DataFusionSnafu)?;
 
@@ -1096,7 +1108,7 @@ impl UserQuery {
         let table_create_request = MetastoreTableCreateRequest {
             ident: table_ident.clone(),
             schema: table_schema,
-            location: Some(table_location),
+            location: table_location,
             partition_spec: None,
             sort_order: None,
             stage_create: None,
@@ -1151,7 +1163,11 @@ impl UserQuery {
 
         let skip_header = file_format.options.iter().any(|option| {
             option.option_name.eq_ignore_ascii_case("skip_header")
-                && option.value.eq_ignore_ascii_case("1")
+                && matches!(
+                    &option.option_value,
+                    KeyValueOptionKind::Single(v)
+                        if v.value.to_string().eq_ignore_ascii_case("1")
+                )
         });
 
         let field_optionally_enclosed_by = file_format
@@ -1162,7 +1178,12 @@ impl UserQuery {
                     .option_name
                     .eq_ignore_ascii_case("field_optionally_enclosed_by")
                 {
-                    Some(option.value.as_bytes()[0])
+                    match &option.option_value {
+                        KeyValueOptionKind::Single(
+                            v,
+                        ) => v.value.to_string().into_bytes().first().copied(),
+                        _ => None,
+                    }
                 } else {
                     None
                 }
@@ -1344,16 +1365,16 @@ impl UserQuery {
         err
     )]
     pub async fn merge_to_logical_plan(&self, statement: Statement) -> Result<LogicalPlan> {
-        let Statement::Merge {
+        let Statement::Merge(merge) = statement else {
+            return ex_error::OnlyMergeStatementsSnafu.fail();
+        };
+        let sqlparser::ast::Merge {
             table: target,
             source,
             on,
             clauses,
             ..
-        } = statement
-        else {
-            return ex_error::OnlyMergeStatementsSnafu.fail();
-        };
+        } = merge;
         let df_session_state = self.session.ctx.state();
 
         let mut session_context_provider = SessionContextProvider {
@@ -1375,7 +1396,7 @@ impl UserQuery {
                 let source_provider = self.get_caching_table_provider(&source_ident).await?;
 
                 let target_filter = if let Some(table) =
-                    source_provider.as_any().downcast_ref::<DataFusionTable>()
+                    source_provider.downcast_ref::<DataFusionTable>()
                 {
                     target_filter_expression(table).await?
                 } else {
@@ -1412,6 +1433,7 @@ impl UserQuery {
                 lateral: _,
                 subquery,
                 alias,
+                sample: _,
             } => {
                 let query = Statement::Query(subquery.clone());
 
@@ -1532,7 +1554,7 @@ impl UserQuery {
             .any(|c| matches!(c.action, MergeAction::Update { .. }));
         let has_delete = clauses
             .iter()
-            .any(|c| matches!(c.action, MergeAction::Delete));
+            .any(|c| matches!(c.action, MergeAction::Delete { .. }));
 
         let merge_clause_projection = merge_clause_projection(
             &sql_planner,
@@ -2141,7 +2163,8 @@ impl UserQuery {
                     .fail()?;
                 }
                 TableReference::full(database, schema, table)
-            }
+                }
+                _ => TableReference::full(String::new(), String::new(), String::new()),
         };
         Ok(table_ref)
     }
@@ -2158,8 +2181,8 @@ impl UserQuery {
         query: &str,
     ) -> std::result::Result<DFStatement, DataFusionError> {
         let state = self.session.ctx.state();
-        let dialect = state.config().options().sql_parser.dialect.as_str();
-        state.sql_to_statement(query, dialect)
+        let dialect = state.config().options().sql_parser.dialect;
+        state.sql_to_statement(query, &dialect)
     }
 
     #[instrument(
@@ -2452,7 +2475,17 @@ impl UserQuery {
                 prop.to_scalar_value().map(|scalar| (key, scalar))
             })
             .collect();
-        let session_params = ParamValues::Map(session_params_map);
+        let session_params = ParamValues::Map(
+            session_params_map
+                .into_iter()
+                .map(|(key, scalar)| {
+                    (
+                        key,
+                        datafusion_common::metadata::ScalarAndMetadata::new(scalar, None),
+                    )
+                })
+                .collect(),
+        );
 
         plan = self
             .session_context_expr_rewriter()
@@ -2617,7 +2650,7 @@ impl UserQuery {
     async fn replace_pivot_subquery_with_list(
         &self,
         table: &TableFactor,
-        value_column: &[Ident],
+        value_column: &[Expr],
         value_source: &mut PivotValueSource,
     ) {
         match value_source {
@@ -2953,7 +2986,6 @@ impl UserQuery {
         let target_provider = self.get_caching_table_provider(target_ident).await?;
 
         let target_ref = target_provider
-            .as_any()
             .downcast_ref::<DataFusionTable>()
             .ok_or_else(|| ex_error::MergeTargetMustBeIcebergTableSnafu.build())?;
 
@@ -2982,7 +3014,6 @@ impl UserQuery {
             .context(ex_error::DataFusionSnafu)?;
 
         let target_provider = target_cache
-            .as_any()
             .downcast_ref::<CachingTable>()
             .ok_or_else(|| {
                 ex_error::CatalogDownCastSnafu {
@@ -3157,7 +3188,13 @@ pub fn merge_clause_projection<S: ContextProvider>(
             op
         };
         match merge_clause.action {
-            MergeAction::Update { assignments } => {
+            MergeAction::Update(update_expr) => {
+                let assignments = match update_expr.kind {
+                    MergeUpdateKind::Set(assignments) => assignments,
+                    MergeUpdateKind::AllByName => {
+                        return ex_error::MergeUpdateAllByNameNotSupportedSnafu.fail();
+                    }
+                };
                 updated_ops.push(op.clone());
                 for assignment in assignments {
                     match assignment.target {
@@ -3199,9 +3236,14 @@ pub fn merge_clause_projection<S: ContextProvider>(
                         .rows
                         .into_iter()
                         .next()
-                        .ok_or_else(|| ex_error::MergeInsertOnlyOneRowSnafu.build())?,
+                        .ok_or_else(|| ex_error::MergeInsertOnlyOneRowSnafu.build())?
+                        .content
+                        .into_iter(),
                 ) {
-                    let column_name = column.value.clone();
+                    let column_name = match column.0.as_slice() {
+                        [ObjectNamePart::Identifier(ident)] => ident.value.clone(),
+                        _ => object_name_to_string(&column),
+                    };
                     let expr = sql_planner
                         .sql_to_expr(value, source_schema, &mut planner_context)
                         .context(ex_error::DataFusionSnafu)?;
@@ -3215,7 +3257,7 @@ pub fn merge_clause_projection<S: ContextProvider>(
                     inserts.insert(column, vec![(op.clone(), lit(ScalarValue::Null))]);
                 }
             }
-            MergeAction::Delete => (),
+            MergeAction::Delete { .. } => (),
         }
     }
     let exprs = collect_merge_clause_expressions(target_schema, updates, inserts)?;
@@ -3513,8 +3555,11 @@ fn value_to_literal(value: &IcebergValue) -> Result<datafusion_expr::Expr> {
     }
 }
 
-fn build_starts_with_filter(starts_with: Option<Value>, column_name: &str) -> Option<String> {
-    if let Some(Value::SingleQuotedString(prefix)) = starts_with {
+fn build_starts_with_filter(
+    starts_with: Option<ValueWithSpan>,
+    column_name: &str,
+) -> Option<String> {
+    if let Some(ValueWithSpan { value: Value::SingleQuotedString(prefix), .. }) = starts_with {
         let escaped = prefix.replace('\'', "''");
         Some(format!("{column_name} LIKE '{escaped}%'"))
     } else {
@@ -3642,7 +3687,12 @@ pub fn get_volume_kv_option(
         .options
         .iter()
         .find(|opt| opt.option_name.eq_ignore_ascii_case(key))
-        .map(|opt| opt.value.clone())
+        .map(|opt| match &opt.option_value {
+            KeyValueOptionKind::Single(v) => {
+                v.value.to_string()
+            }
+            _ => String::new(),
+        })
         .unwrap_or_default();
 
     if value.is_empty() {
@@ -3657,12 +3707,15 @@ pub fn get_volume_kv_option(
 }
 
 #[must_use]
-pub fn get_kv_option<'a>(options: &'a KeyValueOptions, key: &str) -> Option<&'a str> {
+pub fn get_kv_option(options: &KeyValueOptions, key: &str) -> Option<String> {
     options
         .options
         .iter()
         .find(|opt| opt.option_name.eq_ignore_ascii_case(key))
-        .map(|opt| opt.value.as_str())
+        .and_then(|opt| match &opt.option_value {
+            KeyValueOptionKind::Single(v) => Some(v.value.to_string()),
+            _ => None,
+        })
 }
 
 fn create_file_format(
@@ -3681,7 +3734,7 @@ fn create_file_format(
 
             if let Some(compression) = get_kv_option(file_format, "compression") {
                 csv_format = csv_format.with_file_compression_type(
-                    FileCompressionType::from_str(compression)
+                    FileCompressionType::from_str(compression.as_str())
                         .context(ex_error::DataFusionSnafu)?,
                 );
             }

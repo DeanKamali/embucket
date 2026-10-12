@@ -61,7 +61,7 @@ impl PhysicalOptimizerRule for ListFieldMetadataRule {
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|plan| {
-            if let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec>() {
+            if let Some(proj) = plan.downcast_ref::<ProjectionExec>() {
                 let proj_schema = proj.schema();
 
                 if proj_schema.fields() != self.target_schema.fields() {
@@ -78,7 +78,7 @@ impl PhysicalOptimizerRule for ListFieldMetadataRule {
                             // If the expression is a literal containing a ListArray,
                             // attempt to rebuild the literal so that its internal ListArray
                             // matches the target field's data type (including metadata for Parquet compatibility).
-                            if let Some(lit) = expr.as_any().downcast_ref::<Literal>()
+                            if let Some(lit) = expr.downcast_ref::<Literal>()
                                 && let Some(new_lit) = rebuild_list_literal(lit, target_field)
                             {
                                 return Ok(ProjectionExpr::new(

@@ -100,7 +100,9 @@ impl UserSession {
 
         // Only set minimum_parallel_output_files if environment variable wasn't set
         if std::env::var_os("DATAFUSION_EXECUTION_MINIMUM_PARALLEL_OUTPUT_FILES").is_none() {
-            config_options.execution.minimum_parallel_output_files = MINIMUM_PARALLEL_OUTPUT_FILES;
+            config_options.execution.minimum_parallel_output_files =
+                datafusion_common::config::ConfigNonZeroUsize::try_new(MINIMUM_PARALLEL_OUTPUT_FILES)
+                    .context(ex_error::DataFusionSnafu)?;
         }
 
         let state = SessionStateBuilder::new()

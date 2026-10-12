@@ -481,6 +481,11 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("MERGE UPDATE ALL BY NAME is not supported"))]
+    MergeUpdateAllByNameNotSupported {
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display("MERGE statement target must be an Iceberg table"))]
     MergeTargetMustBeIcebergTable {
         #[snafu(implicit)]

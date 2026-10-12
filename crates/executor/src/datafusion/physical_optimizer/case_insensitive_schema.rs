@@ -34,15 +34,14 @@ impl PhysicalOptimizerRule for CaseInsensitiveSchemaDataSourceExec {
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|plan| {
-            if let Some(source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+            if let Some(source_exec) = plan.downcast_ref::<DataSourceExec>()
                 && let Some(config) = source_exec
                     .data_source()
-                    .as_any()
                     .downcast_ref::<FileScanConfig>()
                 && let Some(parquet_source) =
-                    config.file_source.as_any().downcast_ref::<ParquetSource>()
+                    config.file_source.downcast_ref::<ParquetSource>()
                 && !config
-                    .file_schema
+                    .file_schema()
                     .fields()
                     .iter()
                     .any(|field| field.name().eq(&field.name().to_ascii_uppercase()))
@@ -148,19 +147,16 @@ mod tests {
         let optimized = rule.optimize(data_source_exec, &ConfigOptions::default())?;
 
         let data_source_exec = optimized
-            .as_any()
             .downcast_ref::<DataSourceExec>()
             .expect("expected DataSourceExec");
 
         let file_scan_config = data_source_exec
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
             .expect("expected FileScanConfig");
 
         let parquet_source = file_scan_config
             .file_source
-            .as_any()
             .downcast_ref::<ParquetSource>()
             .expect("expected ParquetSource");
 

@@ -21,11 +21,11 @@ impl QueryPlanner for CustomQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &datafusion_expr::LogicalPlan,
-        session_state: &datafusion::execution::SessionState,
+        session: &dyn datafusion::catalog::Session,
     ) -> datafusion_common::Result<std::sync::Arc<dyn datafusion_physical_plan::ExecutionPlan>>
     {
         self.0
-            .create_physical_plan(logical_plan, session_state)
+            .create_physical_plan(logical_plan, session)
             .await
     }
 }

@@ -52,7 +52,7 @@ pub struct MergeIntoCOWSinkExec {
     schema: DFSchemaRef,
     input: Arc<dyn ExecutionPlan>,
     target: DataFusionTable,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Per-node metrics surfaced via `EXPLAIN ANALYZE`. Populated with
     /// `updated_rows` / `inserted_rows` / `deleted_rows` counters after the
     /// write transaction commits, so `EXPLAIN ANALYZE MERGE INTO …` reports
@@ -72,8 +72,12 @@ impl MergeIntoCOWSinkExec {
         let emission_type = EmissionType::Final; // Final emission after all processing is complete
         let boundedness = Boundedness::Bounded; // Bounded operation that completes
 
-        let properties =
-            PlanProperties::new(eq_properties, partitioning, emission_type, boundedness);
+        let properties = Arc::new(PlanProperties::new(
+            eq_properties,
+            partitioning,
+            emission_type,
+            boundedness,
+        ));
         Self {
             schema,
             input,
@@ -104,12 +108,17 @@ impl ExecutionPlan for MergeIntoCOWSinkExec {
         "MergeIntoCOWSinkExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn for<'a> std::ops::FnMut(
+            &'a std::sync::Arc<dyn datafusion_physical_plan::PhysicalExpr>,
+        ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion>,
+    ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -428,7 +437,7 @@ fn usize_to_i64_saturating(v: usize) -> i64 {
 #[derive(Debug)]
 struct MergeCOWFilterExec {
     input: Arc<dyn ExecutionPlan>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     matching_files: Arc<Mutex<Option<ManifestAndDataFiles>>>,
 }
 
@@ -437,7 +446,7 @@ impl MergeCOWFilterExec {
         input: Arc<dyn ExecutionPlan>,
         matching_files: Arc<Mutex<Option<ManifestAndDataFiles>>>,
     ) -> Self {
-        let properties = input.properties().clone();
+        let properties = Arc::clone(input.properties());
         Self {
             input,
             properties,
@@ -463,12 +472,17 @@ impl ExecutionPlan for MergeCOWFilterExec {
         "MergeCOWFilterExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn for<'a> std::ops::FnMut(
+            &'a std::sync::Arc<dyn datafusion_physical_plan::PhysicalExpr>,
+        ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion>,
+    ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

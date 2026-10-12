@@ -1,6 +1,7 @@
 use datafusion::arrow::datatypes::{DECIMAL128_MAX_PRECISION, DataType, Field, Fields, TimeUnit};
 use datafusion::common::Result;
 use datafusion::logical_expr::planner::TypePlanner;
+use datafusion::logical_expr::HigherOrderUDF;
 use datafusion::logical_expr::sqlparser::ast;
 use datafusion::sql::planner::SqlToRel;
 use datafusion::sql::sqlparser::ast::DataType as SQLDataType;
@@ -44,7 +45,9 @@ impl TypePlanner for CustomTypePlanner {
                 let time_unit = parse_timestamp_precision(*precision)?;
                 Ok(Some(DataType::Timestamp(time_unit, None)))
             }
-            SQLDataType::TimestampNtz => Ok(Some(DataType::Timestamp(TimeUnit::Microsecond, None))),
+            SQLDataType::TimestampNtz(_) => {
+                Ok(Some(DataType::Timestamp(TimeUnit::Microsecond, None)))
+            }
             SQLDataType::Custom(a, b) => match a.to_string().to_ascii_uppercase().as_str() {
                 "VARIANT" => Ok(Some(DataType::Utf8)),
                 "TIMESTAMP_LTZ" | "TIMESTAMP_TZ" => {
@@ -76,7 +79,10 @@ impl TypePlanner for CustomTypePlanner {
                         let data_type = match self.plan_type(&sql_type)? {
                             Some(dt) => dt,
                             // Fallback to SqlToRel for unsupported types
-                            None => SqlToRel::new(self).convert_data_type(&sql_type)?,
+                            None => SqlToRel::new(self)
+                                .convert_data_type_to_field(&sql_type)?
+                                .data_type()
+                                .clone(),
                         };
                         fields.push(Field::new(field_name, data_type, nullable));
                     }
@@ -155,6 +161,12 @@ impl ContextProvider for CustomTypePlanner {
     }
     fn options(&self) -> &ConfigOptions {
         &self.options
+    }
+    fn get_higher_order_meta(&self, _name: &str) -> Option<Arc<HigherOrderUDF>> {
+        None
+    }
+    fn higher_order_function_names(&self) -> Vec<String> {
+        vec![]
     }
     fn udf_names(&self) -> Vec<String> {
         vec![]

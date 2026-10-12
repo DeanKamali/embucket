@@ -55,7 +55,7 @@ impl PhysicalOptimizerRule for EliminateEmptyDataSourceExec {
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         plan.transform_up(|plan| {
-            if let Some(source_exec) = plan.as_any().downcast_ref::<DataSourceExec>()
+            if let Some(source_exec) = plan.downcast_ref::<DataSourceExec>()
                 && matches!(
                     source_exec.properties().output_partitioning(),
                     Partitioning::UnknownPartitioning(0)
@@ -112,7 +112,7 @@ mod tests {
         let rule = EliminateEmptyDataSourceExec::new();
         let optimized = rule.optimize(data_source_exec, &ConfigOptions::default())?;
         assert!(
-            optimized.as_any().downcast_ref::<EmptyExec>().is_some(),
+            optimized.downcast_ref::<EmptyExec>().is_some(),
             "DataSourceExec with UnknownPartitioning(0) should be transformed to EmptyExec"
         );
         Ok(())
@@ -134,7 +134,6 @@ mod tests {
         // The rule should not transform the DataSourceExec since it's not empty
         assert!(
             optimized
-                .as_any()
                 .downcast_ref::<DataSourceExec>()
                 .is_some(),
             "DataSourceExec with non-empty partitioning should not be transformed to EmptyExec"
@@ -162,13 +161,12 @@ mod tests {
         let rule = EliminateEmptyDataSourceExec::new();
         let optimized = rule.optimize(sort_exec, &ConfigOptions::default())?;
         let sort = optimized
-            .as_any()
             .downcast_ref::<SortExec>()
             .expect("Expected SortExec");
 
         let inner = sort.input();
         assert!(
-            inner.as_any().downcast_ref::<EmptyExec>().is_some(),
+            inner.downcast_ref::<EmptyExec>().is_some(),
             "Inner DataSourceExec should be replaced with EmptyExec"
         );
 

@@ -56,9 +56,9 @@ impl CastAnalyzer {
             let original_name = name_preserver.save(&expr);
 
             let transformed_expr = expr.transform_up(|e| match &e {
-                Expr::Cast(cast) => self.rewrite_cast_to(&cast.data_type, &cast.expr, &e, false),
+                Expr::Cast(cast) => self.rewrite_cast_to(cast.field.data_type(), &cast.expr, &e, false),
                 Expr::TryCast(try_cast) => {
-                    self.rewrite_cast_to(&try_cast.data_type, &try_cast.expr, &e, true)
+                    self.rewrite_cast_to(try_cast.field.data_type(), &try_cast.expr, &e, true)
                 }
                 _ => Ok(Transformed::no(e)),
             })?;
@@ -128,15 +128,9 @@ impl CastAnalyzer {
                 args: vec![expr.clone()],
             });
             if try_mode {
-                Expr::TryCast(TryCast {
-                    expr: Box::new(internal),
-                    data_type,
-                })
+                Expr::TryCast(TryCast::new(Box::new(internal), data_type))
             } else {
-                Expr::Cast(Cast {
-                    expr: Box::new(internal),
-                    data_type,
-                })
+                Expr::Cast(Cast::new(Box::new(internal), data_type))
             }
         };
         Ok(Transformed::yes(new_expr))
@@ -171,10 +165,7 @@ impl CastAnalyzer {
                     DataType::Timestamp(TimeUnit::Microsecond, _) => func_return_type,
                     _ => data_type.clone(),
                 };
-                expr = Expr::Cast(Cast {
-                    expr: Box::new(expr),
-                    data_type: final_type,
-                });
+                expr = Expr::Cast(Cast::new(Box::new(expr), final_type));
             }
             return Ok(Some(Transformed::yes(expr)));
         }

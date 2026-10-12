@@ -57,10 +57,10 @@ fn analyze_internal(plan: LogicalPlan) -> DFResult<Transformed<LogicalPlan>> {
                 && let Ok(field) = schema.field_with_unqualified_name(&col.name)
                 && field.data_type() == &DataType::UInt64
             {
-                let casted = Expr::Cast(Cast {
-                    expr: Box::new(Expr::Column(col.clone())),
-                    data_type: DataType::Int64,
-                })
+                let casted = Expr::Cast(Cast::new(
+                    Box::new(Expr::Column(col.clone())),
+                    DataType::Int64,
+                ))
                 .alias(col.name.clone());
 
                 return Ok(Transformed::yes(casted));

@@ -262,7 +262,7 @@ impl InformationSchemaConfig {
                 }
                 .build()
             })?;
-            if let Some(caching_catalog) = catalog.as_any().downcast_ref::<CachingCatalog>() {
+            if let Some(caching_catalog) = catalog.downcast_ref::<CachingCatalog>() {
                 let (created_at, updated_at) =
                     if let Some(props) = caching_catalog.properties.clone() {
                         (

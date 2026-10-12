@@ -38,7 +38,6 @@ use object_store::local::LocalFileSystem;
 use secrecy::SecretString;
 use snafu::OptionExt;
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 use url::Url;
 
@@ -441,10 +440,6 @@ impl ObjectStoreRegistry for EmbucketCatalogList {
 }
 
 impl CatalogProviderList for EmbucketCatalogList {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     #[tracing::instrument(
         name = "EmbucketCatalogList::register_catalog",
         level = "debug",

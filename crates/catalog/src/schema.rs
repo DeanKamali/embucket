@@ -13,7 +13,6 @@ use iceberg_rust::catalog::tabular::Tabular as IcebergTabular;
 use iceberg_rust_spec::identifier::Identifier;
 use iceberg_rust_spec::namespace::Namespace;
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 use tracing::error;
 
@@ -38,10 +37,6 @@ impl std::fmt::Debug for CachingSchema {
 
 #[async_trait]
 impl SchemaProvider for CachingSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         match &self.iceberg_catalog {
             Some(catalog) => {
@@ -109,7 +104,7 @@ impl SchemaProvider for CachingSchema {
         table: Arc<dyn TableProvider>,
     ) -> datafusion_common::Result<Option<Arc<dyn TableProvider>>> {
         let table_provider: Arc<dyn TableProvider> = if let Some(catalog) = &self.iceberg_catalog
-            && let Some(iceberg_builder) = table.as_any().downcast_ref::<IcebergTableBuilder>()
+            && let Some(iceberg_builder) = table.downcast_ref::<IcebergTableBuilder>()
         {
             let catalog = Arc::clone(catalog);
             let mut builder = iceberg_builder.builder.clone();

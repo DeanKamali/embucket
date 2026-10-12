@@ -1,5 +1,5 @@
 use crate::error::{self as metastore_error, Result};
-use object_store::{
+use object_store::{ObjectStoreExt, 
     ClientOptions, ObjectStore,
     aws::{AmazonS3Builder, resolve_bucket_region},
     local::LocalFileSystem,

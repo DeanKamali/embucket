@@ -20,7 +20,7 @@ use datafusion_common::Result;
 use datafusion_common::{DataFusionError, TableReference};
 use datafusion_physical_plan::streaming::PartitionStream;
 use std::fmt::Debug;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 pub const INFORMATION_SCHEMA: &str = "information_schema";
 pub const TABLES: &str = "tables";
@@ -86,10 +86,6 @@ impl InformationSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for InformationSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         self.config
             .views_schemas

@@ -14,7 +14,6 @@ use iceberg_rust::{
     },
     error::Error,
     materialized_view::MaterializedView,
-    spec::identifier::FullIdentifier,
     table::Table,
     view::View,
 };
@@ -131,7 +130,7 @@ impl Catalog for RestCatalog {
             self.name.as_deref(),
             &identifier.namespace().to_string(),
             identifier.name(),
-            None,
+            HashMap::new(),
             None,
         )
         .await
@@ -209,7 +208,7 @@ impl Catalog for RestCatalog {
 
     async fn update_materialized_view(
         self: Arc<Self>,
-        commit: CommitView<FullIdentifier>,
+        commit: CommitView<Identifier>,
     ) -> Result<MaterializedView, Error> {
         self.inner.clone().update_materialized_view(commit).await
     }

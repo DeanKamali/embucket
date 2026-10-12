@@ -8,6 +8,7 @@ use aws_credential_types::Credentials;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sdk_s3tables::Client as S3TablesClient;
 use iceberg_rust::spec::table_metadata::TableMetadata;
+use object_store::ObjectStoreExt;
 use iceberg_rust::spec::util::strip_prefix;
 use serde::Deserialize;
 use serde_json::Value;

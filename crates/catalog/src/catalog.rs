@@ -1,4 +1,5 @@
 use crate::catalog_list::CatalogListConfig;
+use crate::iceberg_schema::IcebergSchema;
 use crate::catalogs::embucket::schema::EmbucketSchema;
 use crate::schema::CachingSchema;
 use crate::{block_on_with_timeout, df_error, error};
@@ -7,14 +8,12 @@ use chrono::NaiveDateTime;
 use dashmap::DashMap;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion_common::DataFusionError;
-use datafusion_iceberg::catalog::catalog::IcebergCatalog;
-use datafusion_iceberg::catalog::schema::IcebergSchema;
 use iceberg_rust::catalog::Catalog;
 use iceberg_rust_spec::namespace::Namespace;
 use snafu::{OptionExt, ResultExt};
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 use tracing::error;
 
 #[derive(Clone)]
@@ -181,10 +180,12 @@ impl CachingCatalog {
         if !schema_exists {
             return None;
         }
-        let iceberg_catalog = self.catalog.as_any().downcast_ref::<IcebergCatalog>()?;
         Some(
-            Arc::new(IcebergSchema::new(namespace, iceberg_catalog.mirror()))
-                as Arc<dyn SchemaProvider>,
+            Arc::new(IcebergSchema::new(
+                namespace,
+                iceberg_catalog.clone(),
+                self.config.catalog_timeout(),
+            )) as Arc<dyn SchemaProvider>,
         )
     }
 
@@ -207,10 +208,6 @@ impl std::fmt::Debug for CachingCatalog {
 }
 
 impl CatalogProvider for CachingCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     #[tracing::instrument(
         name = "CachingCatalog::schema_names",
         level = "debug",
@@ -305,20 +302,11 @@ impl CatalogProvider for CachingCatalog {
                         config: self.config.clone(),
                     })
                 }
-                CatalogType::S3tables => {
-                    let Some(iceberg_catalog) =
-                        self.catalog.as_any().downcast_ref::<IcebergCatalog>()
-                    else {
-                        return Err(DataFusionError::Plan(format!(
-                            "Catalog {} is not an Iceberg catalog.",
-                            self.name
-                        )));
-                    };
-                    Arc::new(IcebergSchema::new(
-                        namespace.clone(),
-                        iceberg_catalog.mirror(),
-                    ))
-                }
+                CatalogType::S3tables => Arc::new(IcebergSchema::new(
+                    namespace.clone(),
+                    catalog.clone(),
+                    self.config.catalog_timeout(),
+                )),
             };
             let catalog = catalog.clone();
             #[allow(clippy::expect_used)]

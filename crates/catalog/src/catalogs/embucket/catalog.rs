@@ -5,7 +5,7 @@ use catalog_metastore::{Metastore, SchemaIdent};
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use iceberg_rust::catalog::Catalog as IcebergCatalog;
 use snafu::ResultExt;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 use tracing::error;
 
 pub struct EmbucketCatalog {
@@ -47,10 +47,6 @@ impl std::fmt::Debug for EmbucketCatalog {
 }
 
 impl CatalogProvider for EmbucketCatalog {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     #[tracing::instrument(name = "EmbucketCatalog::schema_names", level = "debug", skip(self))]
     fn schema_names(&self) -> Vec<String> {
         let metastore = self.metastore.clone();

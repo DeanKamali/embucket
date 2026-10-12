@@ -24,7 +24,7 @@ use iceberg_rust::{
     view::View as IcebergView,
 };
 use iceberg_rust_spec::{
-    identifier::FullIdentifier as IcebergFullIdentifier, namespace::Namespace as IcebergNamespace,
+    namespace::Namespace as IcebergNamespace,
 };
 use object_store::ObjectStore;
 use snafu::ResultExt;
@@ -566,7 +566,7 @@ impl IcebergCatalog for EmbucketIcebergCatalog {
     /// perform commit view operation
     async fn update_materialized_view(
         self: Arc<Self>,
-        _commit: IcebergCommitView<IcebergFullIdentifier>,
+        _commit: IcebergCommitView<IcebergIdentifier>,
     ) -> Result<IcebergMaterializedView, IcebergError> {
         Err(IcebergError::NotSupported(
             "Materialized views are not supported".to_string(),

@@ -16,7 +16,6 @@ use datafusion_physical_plan::projection::ProjectionExec;
 use iceberg_rust::catalog::create::CreateTableBuilder;
 use once_cell::sync::OnceCell;
 use snafu::OptionExt;
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -117,10 +116,6 @@ impl Debug for CachingTable {
 
 #[async_trait]
 impl TableProvider for CachingTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.normalized_schema()
     }
@@ -142,7 +137,7 @@ impl TableProvider for CachingTable {
         // to reference stale data. Here we reconstruct the logical plan with updated TableScan nodes
         // so that any query on the view sees the latest snapshots of the source tables.
         if self.table.table_type() == TableType::View
-            && let Some(view) = self.table.as_any().downcast_ref::<ViewTable>()
+            && let Some(view) = self.table.downcast_ref::<ViewTable>()
         {
             let new_view_plan = rewrite_view_source(state, view.logical_plan().clone()).await?;
             let updated_view = ViewTable::new(new_view_plan, view.definition().cloned());
@@ -276,10 +271,6 @@ impl Debug for IcebergTableBuilder {
 
 #[async_trait]
 impl TableProvider for IcebergTableBuilder {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         SchemaRef::from(Schema::empty())
     }

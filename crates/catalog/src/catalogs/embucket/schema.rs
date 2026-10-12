@@ -9,7 +9,6 @@ use datafusion_iceberg::DataFusionTable as IcebergDataFusionTable;
 use iceberg_rust::catalog::Catalog as IcebergCatalog;
 use iceberg_rust::{catalog::tabular::Tabular as IcebergTabular, table::Table as IcebergTable};
 use snafu::ResultExt;
-use std::any::Any;
 use std::sync::Arc;
 use tracing::error;
 
@@ -35,10 +34,6 @@ impl std::fmt::Debug for EmbucketSchema {
 
 #[async_trait]
 impl SchemaProvider for EmbucketSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     #[tracing::instrument(
         name = "EmbucketSchema::table_names",
         level = "debug",

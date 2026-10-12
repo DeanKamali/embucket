@@ -11,6 +11,7 @@ pub mod catalog_list;
 pub mod catalogs;
 pub mod df_error;
 pub mod error;
+pub mod iceberg_schema;
 pub mod information_schema;
 pub mod schema;
 pub mod table;

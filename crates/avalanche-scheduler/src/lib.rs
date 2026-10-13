@@ -4,6 +4,8 @@
 //! Embucket-specific codecs and session configuration so that distributed
 //! plans containing Embucket UDFs can be scheduled and decoded.
 
+pub mod tls;
+
 use std::sync::Arc;
 
 use avalanche_executor_common::{logical_codec, physical_codec};

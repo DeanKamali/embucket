@@ -91,6 +91,31 @@ async fn inner() -> BallistaResult<()> {
         let state = ballista_core::utils::default_session_builder(session_config)?;
         avalanche_executor_common::register_storage_in_session(state)
     }));
+
+    // Mutual TLS (M7.2, design §13.2): when `AVALANCHE_TLS_DIR` is set, the
+    // gRPC/REST listener serves TLS with *required* client certificates and
+    // the Flight proxy's connections to executors present the client
+    // identity. Without the env the process stays fully plaintext.
+    if let Some(dir) = avalanche_executor_common::TlsMaterial::dir_from_env() {
+        let tls = avalanche_executor_common::TlsMaterial::load(&dir)
+            .map_err(|e| BallistaError::Configuration(e.to_string()))?;
+        tracing::info!("mTLS enabled from {}", dir.display());
+        config.use_tls = true;
+        let client_tls = tls
+            .tonic_client_config()
+            .map_err(|e| BallistaError::Configuration(e.to_string()))?;
+        config.override_create_grpc_client_endpoint = Some(Arc::new(move |endpoint| {
+            endpoint
+                .tls_config(client_tls.clone())
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }));
+
+        let config = Arc::new(config);
+        let cluster = BallistaCluster::new_from_config(&config).await?;
+        avalanche_scheduler::tls::start_server_tls(cluster, addr, config, &tls).await?;
+        return Ok(());
+    }
+
     let config = Arc::new(config);
 
     let cluster = BallistaCluster::new_from_config(&config).await?;

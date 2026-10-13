@@ -12,8 +12,16 @@ clap = { version = "4", features = ["derive"] }
 datafusion = { workspace = true }
 datafusion-proto = "55.0.0"
 tokio = { workspace = true }
+tracing = { workspace = true }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# mTLS (M7.2): TLS gRPC/REST listener + Flight proxy client identity.
+arrow-flight = "59.2.0"
+axum = { workspace = true }
+rustls = { version = "0.23", features = ["aws-lc-rs", "logging", "std", "tls12"] }
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
+tokio-rustls = "0.26"
+tower-http = { version = "0.7", features = ["set-header"] }
 
 [lints]
 workspace = true

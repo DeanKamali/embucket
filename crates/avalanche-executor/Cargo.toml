@@ -1,0 +1,20 @@
+[package]
+name = "avalanche-executor"
+version = "0.1.0"
+edition = "2024"
+license-file = { workspace = true }
+
+[dependencies]
+avalanche-executor-common = { path = "../avalanche-executor-common" }
+ballista-core = "55.0.0"
+ballista-executor = "55.0.0"
+clap = { version = "4", features = ["derive"] }
+datafusion = { workspace = true }
+datafusion-proto = "55.0.0"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

@@ -14,7 +14,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::connect_info::Connected;
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};

@@ -20,9 +20,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
+use tonic::transport::{
+    Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig,
+};
 
 /// Environment variable holding the TLS material directory. When set, every
 /// listener serves TLS and every dial presents a client certificate.
@@ -47,7 +50,12 @@ pub struct TlsMaterial {
     ca_certs: Vec<CertificateDer<'static>>,
     server_certs: Vec<CertificateDer<'static>>,
     server_key: PrivateKeyDer<'static>,
+    /// Parsed client identity, kept in DER form so a rustls-based client
+    /// config can be built without re-reading disk (currently unused; the
+    /// tonic path consumes the PEM bytes above).
+    #[allow(dead_code)]
     client_certs: Vec<CertificateDer<'static>>,
+    #[allow(dead_code)]
     client_key: PrivateKeyDer<'static>,
 }
 
@@ -198,6 +206,55 @@ impl TlsMaterial {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(config)
     }
+}
+
+/// Attach client TLS to a gRPC endpoint, rewriting `http://` to `https://`.
+///
+/// tonic's connector only applies a `ClientTlsConfig` when the endpoint URI
+/// scheme is `https` (`transport/channel/service/connector.rs`: `is_https`
+/// gates the TLS upgrade) — for `http://` endpoints the TLS config is
+/// *silently ignored* and the dial goes out in plaintext. Ballista builds
+/// several of its peer URLs with a hardcoded `http://` scheme (executor
+/// registration in `executor_process.rs`, scheduler→executor task
+/// assignment in `executor_manager.rs`), so every TLS endpoint override
+/// must run through this helper, which rebuilds such endpoints with the
+/// `https` scheme (re-applying ballista's default gRPC settings, matching
+/// what `create_grpc_client_endpoint` would have applied) before
+/// attaching the TLS identity. Endpoints that already carry `https` keep
+/// their settings and only gain the TLS config.
+///
+/// # Errors
+///
+/// Errors if the endpoint URI lacks an authority or cannot be rebuilt.
+pub fn https_tls_endpoint(
+    endpoint: Endpoint,
+    tls: &ClientTlsConfig,
+) -> Result<Endpoint, TlsError> {
+    let tls_err = |what: &str, e: tonic::transport::Error| {
+        TlsError(format!("{what}: {e}"))
+    };
+    if endpoint.uri().scheme_str() == Some("https") {
+        return endpoint
+            .tls_config(tls.clone())
+            .map_err(|e| tls_err("tls config", e));
+    }
+    let uri = endpoint.uri();
+    let authority = uri
+        .authority()
+        .map(|a| a.as_str().to_owned())
+        .ok_or_else(|| TlsError("endpoint URI has no authority".to_string()))?;
+    let path = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let rebuilt = create_grpc_client_endpoint(
+        format!("https://{authority}{path}"),
+        Some(&GrpcClientConfig::default()),
+    )
+    .map_err(|e| TlsError(format!("https endpoint rebuild: {e}")))?;
+    rebuilt
+        .tls_config(tls.clone())
+        .map_err(|e| tls_err("tls config", e))
 }
 
 /// Byte offset of the end of the current PEM section (the END marker line).

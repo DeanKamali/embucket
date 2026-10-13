@@ -161,7 +161,6 @@ fn endpoint_with_tls(
     endpoint: tonic::transport::Endpoint,
     tls: &tonic::transport::ClientTlsConfig,
 ) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    endpoint
-        .tls_config(tls.clone())
+    avalanche_executor_common::tls::https_tls_endpoint(endpoint, tls)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
 }

@@ -105,8 +105,7 @@ async fn inner() -> BallistaResult<()> {
             .tonic_client_config()
             .map_err(|e| BallistaError::Configuration(e.to_string()))?;
         config.override_create_grpc_client_endpoint = Some(Arc::new(move |endpoint| {
-            endpoint
-                .tls_config(client_tls.clone())
+            avalanche_executor_common::tls::https_tls_endpoint(endpoint, &client_tls)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         }));
 

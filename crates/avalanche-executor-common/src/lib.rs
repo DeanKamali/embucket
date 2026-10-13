@@ -78,8 +78,7 @@ pub fn upgrade_session_for_warehouse(
         })?;
         let endpoint_override: ballista_core::extension::EndpointOverrideFn =
             Arc::new(move |endpoint| {
-                endpoint
-                    .tls_config(client_tls.clone())
+                tls::https_tls_endpoint(endpoint, &client_tls)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             });
         config = config

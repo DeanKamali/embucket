@@ -873,6 +873,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "serde",
+ "serde_json",
  "snafu",
  "state-store",
  "tokio",

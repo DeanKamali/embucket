@@ -68,6 +68,10 @@ pub struct WarehouseRecord {
     /// use the router global; 0 = no timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statement_timeout_secs: Option<u64>,
+    /// Per-warehouse storage credentials (M7.1). `None` = warehouse has no
+    /// scoped storage access (v1 `file://` behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_credentials: Option<StorageCredentials>,
 }
 
 impl WarehouseRecord {
@@ -86,7 +90,78 @@ impl WarehouseRecord {
             scheduler_host_port: None,
             updated_at: None,
             statement_timeout_secs: None,
+            storage_credentials: None,
         }
+    }
+}
+
+/// Per-warehouse storage credentials (M7.1, design §13.1).
+///
+/// Injected into warehouse executor containers as environment variables at
+/// container start — never inside serialized query plans. S3-compatible
+/// (includes MinIO); `InstanceProfile` (no static keys) is a future shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCredentials {
+    /// Credential kind; v1 is always `"s3"`.
+    pub kind: String,
+    /// Object-store endpoint URL, e.g. `http://minio:9000` or
+    /// `https://s3.us-east-1.amazonaws.com`.
+    pub endpoint: String,
+    /// Bucket the warehouse is scoped to.
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+    /// Region hint used for request signing (e.g. `us-east-1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+}
+
+impl StorageCredentials {
+    /// The kind string accepted by DDL (`STORAGE_CREDENTIALS = (TYPE = S3 ...)`).
+    pub const KIND_S3: &'static str = "s3";
+
+    /// Environment variables injected into warehouse containers. Keys use
+    /// the standard AWS names so `object_store`'s `AmazonS3Builder::from_env`
+    /// picks them up; `AVALANCHE_S3_*` names the Avalanche-specific knobs.
+    /// Returns in a stable order suitable for tests.
+    #[must_use]
+    pub fn env_vars(&self) -> Vec<(String, String)> {
+        // HTTP endpoints (local MinIO) need the allow-http escape hatch.
+        let allow_http = self.endpoint.starts_with("http://");
+        let mut env = vec![
+            (
+                "AVALANCHE_S3_ENDPOINT".to_string(),
+                self.endpoint.clone(),
+            ),
+            ("AVALANCHE_S3_BUCKET".to_string(), self.bucket.clone()),
+            ("AWS_ENDPOINT".to_string(), self.endpoint.clone()),
+            (
+                "AWS_ACCESS_KEY_ID".to_string(),
+                self.access_key_id.clone(),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                self.secret_key.clone(),
+            ),
+        ];
+        if allow_http {
+            env.push(("AWS_ALLOW_HTTP".to_string(), "true".to_string()));
+        }
+        if let Some(token) = &self.session_token {
+            env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
+        }
+        if let Some(region) = &self.region {
+            env.push(("AWS_REGION".to_string(), region.clone()));
+        }
+        env
+    }
+
+    /// Display-safe summary for `SHOW/DESCRIBE WAREHOUSE` — no secret values.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!("S3 endpoint={} bucket={}", self.endpoint, self.bucket)
     }
 }
 

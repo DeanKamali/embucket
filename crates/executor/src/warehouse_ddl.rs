@@ -18,6 +18,7 @@ use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use snafu::Location;
 use snafu::ResultExt;
+use state_store::StorageCredentials;
 use std::sync::Arc;
 
 /// A parsed warehouse statement (v0 grammar, Snowflake subset).
@@ -30,6 +31,7 @@ pub enum WarehouseStatement {
         auto_resume: Option<bool>,
         initially_suspended: bool,
         statement_timeout_secs: Option<u64>,
+        storage_credentials: Option<StorageCredentials>,
         if_not_exists: bool,
     },
     AlterSet {
@@ -38,6 +40,7 @@ pub enum WarehouseStatement {
         auto_suspend_secs: Option<u64>,
         auto_resume: Option<bool>,
         statement_timeout_secs: Option<u64>,
+        storage: Option<StorageOp>,
     },
     Suspend {
         name: String,
@@ -55,8 +58,15 @@ pub enum WarehouseStatement {
     },
 }
 
-/// Tokenize raw SQL: whitespace/`,`/`;` separated, single-quoted strings kept
-/// as one token (quotes preserved for later stripping).
+/// Storage-credential mutation on `ALTER WAREHOUSE ... SET/UNSET` (M7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageOp {
+    Set(StorageCredentials),
+    Unset,
+}
+
+/// Tokenize raw SQL: whitespace/`,`/`;`/`(`/`)` separated, single-quoted
+/// strings kept as one token (quotes preserved for later stripping).
 fn tokenize(sql: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -76,6 +86,12 @@ fn tokenize(sql: &str) -> Vec<String> {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
                 }
+            }
+            '(' | ')' if !in_quote => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(ch.to_string());
             }
             c => current.push(c),
         }
@@ -180,6 +196,7 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
         auto_resume: None,
         initially_suspended: false,
         statement_timeout_secs: None,
+        storage_credentials: None,
         if_not_exists,
     };
     // option list: `WITH` keyword, then `KEY [=] VALUE` pairs
@@ -192,6 +209,23 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
                 };
                 *size = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_size(v));
                 i = next_index(upper, i + 1);
+            }
+            "STORAGE_CREDENTIALS" => {
+                // `STORAGE_CREDENTIALS = ( KEY = VALUE ... )`
+                let open_idx = if upper.get(i + 1).map(String::as_str) == Some("=") {
+                    i + 2
+                } else {
+                    i + 1
+                };
+                let (creds, next) = parse_storage_block(tokens, upper, open_idx)?;
+                if let WarehouseStatement::Create {
+                    storage_credentials,
+                    ..
+                } = &mut stmt
+                {
+                    *storage_credentials = creds;
+                }
+                i = next;
             }
             "AUTO_SUSPEND" => {
                 let secs = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_u64(v));
@@ -267,6 +301,73 @@ fn next_index(upper: &[String], index: usize) -> usize {
     }
 }
 
+/// Strip surrounding quotes without case-folding — for option *values*
+/// (bucket names, endpoints and keys are case-sensitive, unlike identifiers).
+fn strip_quotes(token: &str) -> String {
+    if (token.starts_with('\'') && token.ends_with('\'') && token.len() >= 2)
+        || (token.starts_with('"') && token.ends_with('"') && token.len() >= 2)
+    {
+        token[1..token.len() - 1].to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+/// Parse a `STORAGE_CREDENTIALS = ( KEY [=] VALUE ... )` block (M7.1).
+/// Returns the credentials (or `None` for an empty block) and the index just
+/// past the closing paren. Unknown keys or a missing required key fail the
+/// whole parse loudly (`None`) so bad DDL never half-applies.
+fn parse_storage_block(
+    tokens: &[String],
+    upper: &[String],
+    mut i: usize,
+) -> Option<(Option<StorageCredentials>, usize)> {
+    if upper.get(i).map(String::as_str) != Some("(") {
+        return None;
+    }
+    i += 1;
+    let mut endpoint = None;
+    let mut bucket = None;
+    let mut access_key_id = None;
+    let mut secret_key = None;
+    let mut session_token = None;
+    let mut region = None;
+    while i < upper.len() && upper[i] != ")" {
+        let key = upper[i].as_str();
+        let (val, next) = value_at(tokens, upper, i + 1)?;
+        let val = strip_quotes(val);
+        match key {
+            "ENDPOINT" => endpoint = Some(val),
+            "BUCKET" => bucket = Some(val),
+            "AWS_ACCESS_KEY_ID" | "ACCESS_KEY_ID" => access_key_id = Some(val),
+            "AWS_SECRET_ACCESS_KEY" | "SECRET_ACCESS_KEY" => secret_key = Some(val),
+            "AWS_SESSION_TOKEN" | "SESSION_TOKEN" => session_token = Some(val),
+            "REGION" => region = Some(val),
+            // `TYPE` is accepted and must be S3 (the only v1 kind)
+            "TYPE" => {
+                if !val.eq_ignore_ascii_case(StorageCredentials::KIND_S3) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        i = next;
+    }
+    if upper.get(i).map(String::as_str) != Some(")") {
+        return None;
+    }
+    let creds = StorageCredentials {
+        kind: StorageCredentials::KIND_S3.to_string(),
+        endpoint: endpoint?,
+        bucket: bucket?,
+        access_key_id: access_key_id?,
+        secret_key: secret_key?,
+        session_token,
+        region,
+    };
+    Some((Some(creds), i + 1))
+}
+
 fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement> {
     // ALTER WAREHOUSE [IF EXISTS] name (SET opt = value ... | SUSPEND | RESUME)
     if upper.get(1).map(String::as_str) != Some("WAREHOUSE") {
@@ -283,17 +384,56 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
     match upper.get(i).map(String::as_str) {
         Some("SUSPEND") => Some(WarehouseStatement::Suspend { name }),
         Some("RESUME") => Some(WarehouseStatement::Resume { name }),
+        Some("UNSET") => {
+            // `ALTER WAREHOUSE wh UNSET STORAGE_CREDENTIALS`
+            if upper.get(i + 1).map(String::as_str) == Some("STORAGE_CREDENTIALS") {
+                Some(WarehouseStatement::AlterSet {
+                    name,
+                    size: None,
+                    auto_suspend_secs: None,
+                    auto_resume: None,
+                    statement_timeout_secs: None,
+                    storage: Some(StorageOp::Unset),
+                })
+            } else {
+                None
+            }
+        }
         Some("SET") => {
             i += 1;
             let mut size = None;
             let mut auto_suspend_secs = None;
             let mut auto_resume = None;
             let mut statement_timeout_secs = None;
+            let mut storage = None;
             while i < upper.len() {
                 match upper[i].as_str() {
                     "SIZE" | "WAREHOUSE_SIZE" => {
                         size = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_size(v));
                         i = next_index(upper, i + 1);
+                    }
+                    "STORAGE_CREDENTIALS" => {
+                        // `SET STORAGE_CREDENTIALS = ( ... )`
+                        let open_idx = if upper.get(i + 1).map(String::as_str) == Some("=") {
+                            i + 2
+                        } else {
+                            i + 1
+                        };
+                        let (creds, next) = parse_storage_block(tokens, upper, open_idx)?;
+                        storage = creds.map(StorageOp::Set);
+                        i = next;
+                    }
+                    "UNSET" => {
+                        // `SET UNSET STORAGE_CREDENTIALS` (and bare
+                        // `ALTER WAREHOUSE wh UNSET STORAGE_CREDENTIALS`)
+                        if upper.get(i + 1).map(String::as_str)
+                            == Some("STORAGE_CREDENTIALS")
+                        {
+                            storage = Some(StorageOp::Unset);
+                            i += 2;
+                        } else {
+                            return None;
+                        }
                     }
                     "AUTO_SUSPEND" => {
                         auto_suspend_secs =
@@ -319,6 +459,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                 auto_suspend_secs,
                 auto_resume,
                 statement_timeout_secs,
+                storage,
             })
         }
         _ => None,
@@ -354,6 +495,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             auto_resume,
             initially_suspended,
             statement_timeout_secs,
+            storage_credentials,
             if_not_exists,
         } => {
             if manager.get(name).await.is_ok() {
@@ -369,6 +511,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
                 auto_resume: auto_resume.unwrap_or(true),
                 initially_suspended: *initially_suspended,
                 statement_timeout_secs: *statement_timeout_secs,
+                storage_credentials: storage_credentials.clone(),
             };
             manager.create(req).await.map_err(warehouse_error)?;
             status_row()
@@ -379,6 +522,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             auto_suspend_secs,
             auto_resume,
             statement_timeout_secs,
+            storage,
         } => {
             manager
                 .alter(
@@ -390,6 +534,23 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
                 )
                 .await
                 .map_err(warehouse_error)?;
+            // Storage-credential changes restart a running warehouse's
+            // compute so containers pick up the new env (M7.1).
+            match storage {
+                Some(StorageOp::Set(creds)) => {
+                    manager
+                        .set_storage_credentials(name, Some(creds.clone()))
+                        .await
+                        .map_err(warehouse_error)?;
+                }
+                Some(StorageOp::Unset) => {
+                    manager
+                        .set_storage_credentials(name, None)
+                        .await
+                        .map_err(warehouse_error)?;
+                }
+                None => {}
+            }
             status_row()
         }
         WarehouseStatement::Suspend { name } => {
@@ -476,6 +637,8 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         Field::new("SIZE", DataType::Utf8, false),
         Field::new("AUTO_SUSPEND", DataType::Utf8, true),
         Field::new("AUTO_RESUME", DataType::Utf8, false),
+        // M7.1: display-safe credential summary — never secret values.
+        Field::new("STORAGE", DataType::Utf8, true),
     ]));
 
     let created_on: Vec<Option<String>> = warehouses
@@ -507,6 +670,10 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         .iter()
         .map(|wh| Some(wh.auto_resume.to_string()))
         .collect();
+    let storage: Vec<Option<String>> = warehouses
+        .iter()
+        .map(|wh| wh.storage_summary.clone())
+        .collect();
 
     let record = RecordBatch::try_new(
         schema.clone(),
@@ -518,6 +685,7 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
             Arc::new(StringArray::from(sizes)),
             Arc::new(StringArray::from(auto_suspend)),
             Arc::new(StringArray::from(auto_resume)),
+            Arc::new(StringArray::from(storage)),
         ],
     )
     .context(ex_error::ArrowSnafu)?;
@@ -550,8 +718,85 @@ mod tests {
                 auto_resume: Some(true),
                 initially_suspended: false,
                 statement_timeout_secs: None,
+                storage_credentials: None,
                 if_not_exists: false,
             }
+        );
+    }
+
+    #[test]
+    fn parses_storage_credentials_on_create() {
+        let stmt = parse(
+            "CREATE WAREHOUSE etl WITH SIZE = 'SMALL' STORAGE_CREDENTIALS = ( \
+             TYPE = S3 ENDPOINT = 'http://minio:9000' BUCKET = 'lake' \
+             AWS_ACCESS_KEY_ID = 'minio' AWS_SECRET_ACCESS_KEY = 'minio123' \
+             REGION = 'us-east-1' );",
+        )
+        .expect("should parse");
+        let WarehouseStatement::Create {
+            storage_credentials, ..
+        } = stmt
+        else {
+            panic!("expected Create");
+        };
+        let creds = storage_credentials.expect("credentials parsed");
+        assert_eq!(creds.kind, "s3");
+        assert_eq!(creds.endpoint, "http://minio:9000");
+        assert_eq!(creds.bucket, "lake"); // case preserved (quoted value)
+        assert_eq!(creds.access_key_id, "minio");
+        assert_eq!(creds.secret_key, "minio123");
+        assert_eq!(creds.region.as_deref(), Some("us-east-1"));
+        assert_eq!(creds.session_token, None);
+        // redacted summary never leaks secrets
+        assert!(!creds.summary().contains("minio123"));
+    }
+
+    #[test]
+    fn storage_block_requires_required_keys() {
+        // missing AWS_SECRET_ACCESS_KEY → whole statement fails loudly
+        assert!(parse(
+            "CREATE WAREHOUSE wh WITH STORAGE_CREDENTIALS = ( ENDPOINT = 'http://x:1' BUCKET = 'b' AWS_ACCESS_KEY_ID = 'a' );"
+        )
+        .is_none());
+        // unsupported TYPE → rejected
+        assert!(parse(
+            "CREATE WAREHOUSE wh WITH STORAGE_CREDENTIALS = ( TYPE = AZURE ENDPOINT = 'http://x:1' BUCKET = 'b' AWS_ACCESS_KEY_ID = 'a' AWS_SECRET_ACCESS_KEY = 's' );"
+        )
+        .is_none());
+        // unknown key → rejected
+        assert!(parse(
+            "CREATE WAREHOUSE wh WITH STORAGE_CREDENTIALS = ( FOO = 1 ENDPOINT = 'http://x:1' BUCKET = 'b' AWS_ACCESS_KEY_ID = 'a' AWS_SECRET_ACCESS_KEY = 's' );"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parses_alter_storage_set_and_unset() {
+        let stmt = parse(
+            "ALTER WAREHOUSE etl SET STORAGE_CREDENTIALS = ( \
+             ENDPOINT = 'http://minio:9000' BUCKET = 'lake2' \
+             AWS_ACCESS_KEY_ID = 'k' AWS_SECRET_ACCESS_KEY = 's' );",
+        )
+        .expect("should parse");
+        let WarehouseStatement::AlterSet { storage, .. } = stmt else {
+            panic!("expected AlterSet");
+        };
+        assert!(matches!(storage, Some(StorageOp::Set(_))));
+
+        assert_eq!(
+            parse("ALTER WAREHOUSE etl UNSET STORAGE_CREDENTIALS;"),
+            Some(WarehouseStatement::AlterSet {
+                name: "ETL".to_string(),
+                size: None,
+                auto_suspend_secs: None,
+                auto_resume: None,
+                statement_timeout_secs: None,
+                storage: Some(StorageOp::Unset),
+            })
+        );
+        assert_eq!(
+            parse("ALTER WAREHOUSE etl SET UNSET STORAGE_CREDENTIALS;"),
+            parse("ALTER WAREHOUSE etl UNSET STORAGE_CREDENTIALS;")
         );
     }
 
@@ -578,15 +823,15 @@ mod tests {
                 auto_suspend_secs: None,
                 auto_resume: None,
                 statement_timeout_secs: Some(0),
+                storage: None,
             })
         );
     }
 
     #[test]
     fn parses_create_minimal() {
-        let stmt = parse("create warehouse my_wh").expect("should parse");
         assert_eq!(
-            stmt,
+            parse("create warehouse my_wh").expect("should parse"),
             WarehouseStatement::Create {
                 name: "MY_WH".to_string(),
                 size: None,
@@ -594,6 +839,7 @@ mod tests {
                 auto_resume: None,
                 initially_suspended: false,
                 statement_timeout_secs: None,
+                storage_credentials: None,
                 if_not_exists: false,
             }
         );
@@ -609,6 +855,7 @@ mod tests {
                 auto_suspend_secs: Some(300),
                 auto_resume: None,
                 statement_timeout_secs: None,
+                storage: None,
             })
         );
         assert_eq!(

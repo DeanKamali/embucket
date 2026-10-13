@@ -151,6 +151,9 @@ pub struct Warehouse {
     pub auto_suspend_secs: Option<u64>,
     pub auto_resume: bool,
     pub created_at: u64,
+    /// Display-safe storage-credential summary (M7.1): never contains secret
+    /// values; `None` = no scoped storage credentials.
+    pub storage_summary: Option<String>,
 }
 
 impl Warehouse {

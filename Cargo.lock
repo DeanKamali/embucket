@@ -848,7 +848,9 @@ dependencies = [
  "datafusion-expr",
  "datafusion-proto",
  "functions",
+ "object_store",
  "tokio",
+ "url",
 ]
 
 [[package]]

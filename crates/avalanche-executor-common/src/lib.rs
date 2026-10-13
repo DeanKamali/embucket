@@ -11,9 +11,11 @@
 //!   submitted to a warehouse's Ballista scheduler.
 
 pub mod codecs;
+pub mod storage;
 pub mod udf_registry;
 
 pub use codecs::{EmbucketLogicalExtensionCodec, EmbucketPhysicalExtensionCodec};
+pub use storage::{register_storage_in_session, runtime_env_from_env, s3_store_from_env};
 pub use udf_registry::FunctionMaps;
 
 use std::sync::Arc;

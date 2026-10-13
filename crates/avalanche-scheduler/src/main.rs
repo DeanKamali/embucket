@@ -83,11 +83,18 @@ async fn inner() -> BallistaResult<()> {
     let mut config: SchedulerConfig = opt.try_into()?;
     config.override_logical_codec = Some(logical_codec);
     config.override_physical_codec = Some(physical_codec);
-    let config =
-        config.with_override_config_producer(Arc::new(avalanche_scheduler::plain_session_config));
+    config.override_config_producer =
+        Some(Arc::new(avalanche_scheduler::plain_session_config));
+    // Per-warehouse storage credentials (M7.1): sessions the scheduler builds
+    // must resolve the warehouse's scoped object store from container env.
+    config.override_session_builder = Some(Arc::new(|session_config| {
+        let state = ballista_core::utils::default_session_builder(session_config)?;
+        avalanche_executor_common::register_storage_in_session(state)
+    }));
+    let config = Arc::new(config);
 
     let cluster = BallistaCluster::new_from_config(&config).await?;
-    start_server(cluster, addr, Arc::new(config)).await?;
+    start_server(cluster, addr, config).await?;
 
     Ok(())
 }

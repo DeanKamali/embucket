@@ -15,6 +15,7 @@ use ballista_executor::config::Config;
 use ballista_executor::executor_process::{ExecutorProcessConfig, start_executor_process};
 use ballista_executor::health::spawn_health_server;
 use clap::Parser;
+use datafusion::prelude::SessionConfig;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -29,6 +30,13 @@ async fn main() -> BallistaResult<()> {
     config.override_logical_codec = Some(logical_codec);
     config.override_physical_codec = Some(physical_codec);
     config.override_config_producer = Some(Arc::new(avalanche_executor::plain_session_config));
+    // Per-warehouse storage credentials (M7.1): register the warehouse's
+    // scoped object store from container env in every task runtime env.
+    let storage_work_dir = config.work_dir.clone().unwrap_or_else(|| "/tmp".into());
+    config.override_runtime_producer = Some(Arc::new(move |_config: &SessionConfig| {
+        let env = avalanche_executor_common::runtime_env_from_env(&storage_work_dir)?;
+        Ok(Arc::new(env))
+    }));
 
     let rust_log = env::var(EnvFilter::DEFAULT_ENV);
     let log_filter =

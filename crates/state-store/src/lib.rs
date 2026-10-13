@@ -7,8 +7,8 @@ pub mod state_store_pg;
 pub use config::PgConfig;
 pub use error::{Error, Result};
 pub use models::{
-    ExecutionStatus, Query, QueryMetric, SessionRecord, Variable, ViewRecord, WarehouseMeteringRecord,
-    WarehouseRecord,
+    ExecutionStatus, Query, QueryMetric, SessionRecord, StorageCredentials, Variable, ViewRecord,
+    WarehouseMeteringRecord, WarehouseRecord,
 };
 pub use state_store_memory::InMemoryStateStore;
 pub use state_store_pg::PostgresStateStore;

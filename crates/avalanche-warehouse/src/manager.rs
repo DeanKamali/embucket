@@ -13,6 +13,7 @@ use crate::metering::MeteringLedger;
 use crate::model::{Warehouse, WarehouseSize, WarehouseState};
 use snafu::ResultExt;
 use state_store::StateStore;
+use state_store::StorageCredentials;
 use state_store::WarehouseRecord;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,6 +68,9 @@ pub struct CreateWarehouseRequest {
     /// Per-warehouse statement timeout override (seconds); `None` = global,
     /// 0 = no timeout (M6).
     pub statement_timeout_secs: Option<u64>,
+    /// Per-warehouse storage credentials (M7.1): injected into compute
+    /// containers as env, never into plans.
+    pub storage_credentials: Option<StorageCredentials>,
 }
 
 pub struct WarehouseManager {
@@ -151,6 +155,7 @@ impl WarehouseManager {
             req.auto_resume,
         );
         record.statement_timeout_secs = req.statement_timeout_secs;
+        record.storage_credentials = req.storage_credentials.clone();
         // Reserve a host port for the scheduler so host-side clients can dial
         // its gRPC endpoint. Best-effort: creation must not fail on it.
         record.scheduler_host_port = allocate_free_host_port();
@@ -220,6 +225,41 @@ impl WarehouseManager {
                 .await;
             self.start_compute(name, size, WarehouseState::Running)
                 .await?;
+        }
+        self.get(name).await
+    }
+
+    /// Set (or clear) per-warehouse storage credentials (M7.1). A running
+    /// warehouse's compute is restarted so containers pick up the new env.
+    pub async fn set_storage_credentials(
+        &self,
+        name: &str,
+        credentials: Option<StorageCredentials>,
+    ) -> Result<Warehouse> {
+        let record = self.record(name).await?;
+        let was_running = self.state(name).await? == WarehouseState::Running;
+        let mut record = record;
+        record.storage_credentials = credentials;
+        record.updated_at = Some(now_secs());
+        self.state_store
+            .put_warehouse(record)
+            .await
+            .context(StateStoreSnafu)?;
+        if was_running {
+            // Recreate containers so the new env takes effect (docker/k8s
+            // only read env at container start).
+            if let Some(size) = WarehouseSize::parse(
+                &self.record(name).await?.size,
+            ) {
+                for i in 0..size.executor_count() {
+                    self.driver
+                        .stop(&executor_container_name(name, i))
+                        .await?;
+                }
+                self.driver.stop(&scheduler_container_name(name)).await?;
+                self.start_compute(name, size, WarehouseState::Running)
+                    .await?;
+            }
         }
         self.get(name).await
     }
@@ -318,6 +358,10 @@ impl WarehouseManager {
             auto_suspend_secs: Some(record.auto_suspend_secs),
             auto_resume: record.auto_resume,
             created_at: record.created_at,
+            storage_summary: record
+                .storage_credentials
+                .as_ref()
+                .map(StorageCredentials::summary),
         })
     }
 
@@ -441,11 +485,16 @@ impl WarehouseManager {
         let sched_name = scheduler_container_name(name);
         // The scheduler's host port is fixed at creation and persisted on the
         // record, so suspend/resume cycles keep the same mapping.
-        let scheduler_host_port = self
-            .record(name)
-            .await
-            .ok()
-            .and_then(|record| record.scheduler_host_port);
+        let record = self.record(name).await.ok();
+        let scheduler_host_port = record.as_ref().and_then(|r| r.scheduler_host_port);
+        // Per-warehouse storage credentials (M7.1): injected as container env
+        // at start — never serialized into plans. Both scheduler and
+        // executors get them (the scheduler decodes/re-plans scans).
+        let storage_env: Vec<(String, String)> = record
+            .as_ref()
+            .and_then(|r| r.storage_credentials.as_ref())
+            .map(StorageCredentials::env_vars)
+            .unwrap_or_default();
         self.driver
             .start(&ContainerSpec {
                 name: sched_name.clone(),
@@ -460,7 +509,7 @@ impl WarehouseManager {
                     "--external-host".to_string(),
                     sched_name.clone(),
                 ],
-                env: vec![],
+                env: storage_env.clone(),
                 ports: scheduler_host_port
                     .map_or_else(Vec::new, |host_port| {
                         vec![(host_port, INTERNAL_SCHEDULER_PORT)]
@@ -487,7 +536,7 @@ impl WarehouseManager {
                         "--scheduler-port".to_string(),
                         INTERNAL_SCHEDULER_PORT.to_string(),
                     ],
-                    env: vec![],
+                    env: storage_env.clone(),
                     ports: vec![],
                     network: self.network.clone(),
                 })

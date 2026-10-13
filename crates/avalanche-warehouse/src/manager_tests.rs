@@ -44,6 +44,7 @@ fn create_req(name: &str, size: WarehouseSize) -> CreateWarehouseRequest {
         auto_resume: true,
         initially_suspended: false,
         statement_timeout_secs: None,
+        storage_credentials: None,
     }
 }
 

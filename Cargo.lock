@@ -3432,6 +3432,7 @@ dependencies = [
  "arrow-schema 59.2.0",
  "async-stream",
  "async-trait",
+ "avalanche-warehouse",
  "aws-config",
  "aws-sdk-s3tables",
  "bytes",

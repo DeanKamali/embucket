@@ -15,6 +15,7 @@ use crate::query::UserQuery;
 use crate::query_types::QueryId;
 use crate::running_queries::RunningQueries;
 use crate::utils::Config;
+use avalanche_warehouse::WarehouseManager;
 use catalog::catalog_list::{DEFAULT_CATALOG, EmbucketCatalogList};
 use catalog_metastore::Metastore;
 #[cfg(feature = "state-store")]
@@ -78,6 +79,8 @@ pub struct UserSession {
     /// database/schema/warehouse). Persisted through the state store so a
     /// session can be rehydrated on a different process after a failover.
     pub metadata: SessionMetadata,
+    /// Shared warehouse manager (design §5): DDL target + resume-on-query.
+    pub warehouse: Arc<WarehouseManager>,
 }
 
 impl UserSession {
@@ -91,6 +94,7 @@ impl UserSession {
         session_id: &str,
         metadata: SessionMetadata,
         #[cfg(feature = "state-store")] state_store: Arc<dyn StateStore>,
+        warehouse: Arc<WarehouseManager>,
     ) -> Result<Self> {
         let sql_parser_dialect = config
             .sql_parser_dialect
@@ -179,6 +183,7 @@ impl UserSession {
             session_id: session_id.to_string(),
             attrs: DashMap::new(),
             metadata,
+            warehouse,
         };
         Ok(session)
     }

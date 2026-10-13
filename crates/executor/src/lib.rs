@@ -12,6 +12,7 @@ pub mod running_queries;
 pub mod service;
 pub mod session;
 pub mod snowflake_error;
+pub mod warehouse_ddl;
 pub mod tracing;
 pub mod utils;
 

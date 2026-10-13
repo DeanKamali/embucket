@@ -340,6 +340,17 @@ impl UserQuery {
         err
     )]
     pub async fn execute(&mut self) -> Result<QueryResult> {
+        // Avalanche (design §5): warehouse DDL is intercepted pre-parse —
+        // the sqlparser fork has no WAREHOUSE statements.
+        if let Some(result) =
+            crate::warehouse_ddl::try_execute(&self.raw_query, &self.session).await
+        {
+            return result;
+        }
+        // Resume-on-query + activity tracking for the session's warehouse.
+        if let Some(warehouse) = self.session.get_session_variable("warehouse") {
+            self.session.warehouse.ensure_running(&warehouse).await;
+        }
         let statement = self.parse_query().context(ex_error::DataFusionSnafu)?;
         self.query = statement.to_string();
         self.raw_statement = Some(statement.clone());

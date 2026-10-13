@@ -8,7 +8,7 @@ pub mod manager;
 mod manager_tests;
 pub mod model;
 
-pub use driver::{ContainerDriver, ContainerSpec, DockerCliDriver};
+pub use driver::{ContainerDriver, ContainerSpec, DockerCliDriver, FakeDriver};
 pub use error::{Error, Result};
 pub use manager::{
     BallistaImages, CreateWarehouseRequest, WarehouseManager, executor_container_name,

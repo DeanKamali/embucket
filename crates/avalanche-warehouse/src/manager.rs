@@ -238,15 +238,23 @@ impl WarehouseManager {
     /// resume-on-query). Never fails the query: unknown warehouses (dummy
     /// client profiles) and driver errors are logged and ignored.
     pub async fn ensure_running(&self, name: &str) {
-        // not a managed warehouse — nothing to do
-        let Ok(record) = self.record(name).await else { return };
-        self.touch(name).await;
-        let state = self.state(name).await.unwrap_or(WarehouseState::Stopped);
+        // resolve the record's exact key: session variables may differ in
+        // case (`USE WAREHOUSE etl` vs stored `ETL`)
+        let record = match self.record(name).await {
+            Ok(record) => record,
+            Err(_) => match self.record(&name.to_ascii_uppercase()).await {
+                Ok(record) => record,
+                // not a managed warehouse — nothing to do
+                Err(_) => return,
+            },
+        };
+        self.touch(&record.name).await;
+        let state = WarehouseState::parse(&record.state).unwrap_or(WarehouseState::Stopped);
         if state != WarehouseState::Running
             && record.auto_resume
-            && let Err(err) = self.resume(name).await
+            && let Err(err) = self.resume(&record.name).await
         {
-            tracing::warn!(warehouse = name, %err, "auto-resume failed");
+            tracing::warn!(warehouse = record.name, %err, "auto-resume failed");
         }
     }
 

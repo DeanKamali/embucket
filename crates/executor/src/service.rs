@@ -30,6 +30,7 @@ use super::models::SessionMetadataAttr;
 use super::models::{QueryContext, QueryResult, SessionMetadata};
 use super::running_queries::{RunningQueries, RunningQueriesRegistry, RunningQuery};
 use super::session::UserSession;
+use avalanche_warehouse::{BallistaImages, DockerCliDriver, FakeDriver, WarehouseManager};
 use crate::query_task_result::ExecutionTaskResult;
 use crate::query_types::QueryId;
 use crate::running_queries::RunningQueryId;
@@ -39,7 +40,8 @@ use crate::utils::{Config, MemPoolType};
 use catalog::catalog_list::EmbucketCatalogList;
 use catalog_metastore::{InMemoryMetastore, Metastore, TableIdent as MetastoreTableIdent};
 #[cfg(feature = "state-store")]
-use state_store::{PostgresStateStore, StateStore, models::Query};
+use state_store::{PostgresStateStore, models::Query};
+use state_store::StateStore;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 use tracing::Instrument;
@@ -164,6 +166,30 @@ pub struct CoreExecutionService {
     queries: Arc<RunningQueriesRegistry>,
     #[cfg(feature = "state-store")]
     state_store: Arc<dyn StateStore>,
+    /// Shared warehouse manager (design §5); one per process.
+    warehouse: Arc<WarehouseManager>,
+}
+
+/// Manager with the real Docker driver (production).
+fn build_warehouse_manager(state_store: Arc<dyn StateStore>) -> Arc<WarehouseManager> {
+    Arc::new(WarehouseManager::new(
+        state_store,
+        Arc::new(DockerCliDriver::default()),
+        BallistaImages::default(),
+        None,
+    ))
+}
+
+/// Manager with the in-memory driver (tests): no Docker required.
+pub fn build_test_warehouse_manager(
+    state_store: Arc<dyn StateStore>,
+) -> Arc<WarehouseManager> {
+    Arc::new(WarehouseManager::new(
+        state_store,
+        Arc::new(FakeDriver::new()),
+        BallistaImages::default(),
+        None,
+    ))
 }
 
 impl CoreExecutionService {
@@ -184,6 +210,7 @@ impl CoreExecutionService {
             catalog_list,
             runtime_env,
             queries: Arc::new(RunningQueriesRegistry::new()),
+            warehouse: build_test_warehouse_manager(state_store.clone()),
             state_store,
         })
     }
@@ -200,9 +227,13 @@ impl CoreExecutionService {
         let catalog_list = Self::catalog_list(metastore.clone(), &config).await?;
         let runtime_env = Self::runtime_env(&config, catalog_list.clone())?;
         #[cfg(feature = "state-store")]
-        let state_store = PostgresStateStore::new_from_env()
-            .await
-            .context(ex_error::StateStoreSnafu)?;
+        let state_store = Arc::new(PostgresStateStore::new_from_env().await.context(
+            ex_error::StateStoreSnafu,
+        )?) as Arc<dyn StateStore>;
+        #[cfg(feature = "state-store")]
+        let warehouse = build_warehouse_manager(state_store.clone());
+        #[cfg(not(feature = "state-store"))]
+        let warehouse = build_warehouse_manager(Arc::new(state_store::InMemoryStateStore::new()));
         Ok(Self {
             metastore,
             df_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -210,8 +241,9 @@ impl CoreExecutionService {
             catalog_list,
             runtime_env,
             queries: Arc::new(RunningQueriesRegistry::new()),
+            warehouse,
             #[cfg(feature = "state-store")]
-            state_store: Arc::new(state_store),
+            state_store,
         })
     }
 
@@ -366,6 +398,7 @@ impl CoreExecutionService {
                 session_id,
                 metadata,
                 self.state_store.clone(),
+                self.warehouse.clone(),
             )
             .await?,
         );
@@ -419,6 +452,7 @@ impl ExecutionService for CoreExecutionService {
                 metadata.clone(),
                 #[cfg(feature = "state-store")]
                 self.state_store.clone(),
+                self.warehouse.clone(),
             )
             .await?,
         );

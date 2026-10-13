@@ -1115,6 +1115,7 @@ impl UserQuery {
         statement: CreateExternalTable,
     ) -> Result<QueryResult> {
         let table_location = statement.locations.first().cloned();
+        let table_location_for_registry = table_location.clone();
         let table_format = MetastoreTableFormat::from(statement.file_type);
         let session_context = HashMap::new();
         let session_context_planner = SessionContextProvider {
@@ -1170,6 +1171,22 @@ impl UserQuery {
             .create_table(&table_ident, table_create_request)
             .await
             .context(ex_error::MetastoreSnafu)?;
+
+        // Register the table's volume-backed object store into this
+        // session's registry. Parquet external tables resolve their object
+        // store at scan time via the session registry, and nothing else
+        // populates it for non-`file://` schemes (the Iceberg branch carries
+        // the store directly). M7.1 note: this is the ROUTER-side store, built
+        // from the volume config; warehouse executors receive their scoped
+        // credentials separately via warehouse STORAGE_CREDENTIALS env.
+        if let Ok(Some(store)) = self.metastore.table_object_store(&table_ident).await {
+            if let Some(location) = table_location_for_registry
+                .as_ref()
+                .and_then(|l| Url::parse(l).ok())
+            {
+                self.session.ctx.register_object_store(&location, store);
+            }
+        }
 
         self.created_entity_response()
     }

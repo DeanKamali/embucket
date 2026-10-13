@@ -207,6 +207,20 @@ impl KubectlDriver {
             },
         })
     }
+
+    /// Pod phase (`Some("Running")`/`Some("Terminating")`/...) or `None`
+    /// when the pod object does not exist.
+    async fn pod_phase(&self, name: &str) -> Result<Option<String>> {
+        let name = Self::k8s_name(name);
+        let out = self
+            .run(&["get", "pod", &name, "-o", "jsonpath={.status.phase}"])
+            .await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let phase = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok((!phase.is_empty()).then_some(phase))
+    }
 }
 
 #[async_trait]
@@ -214,6 +228,17 @@ impl ContainerDriver for KubectlDriver {
     async fn start(&self, spec: &ContainerSpec) -> Result<()> {
         let name = Self::k8s_name(&spec.name);
         // Idempotent like DockerCliDriver: an existing pod is left as-is.
+        // A Terminating pod still owns the object name — wait for it to be
+        // reclaimed before reusing the name.
+        for _ in 0..30 {
+            match self.pod_phase(&spec.name).await? {
+                Some(phase) if phase == "Terminating" => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Some(_) => return Ok(()),
+                None => break,
+            }
+        }
         if self.exists(&spec.name).await? {
             return Ok(());
         }
@@ -266,9 +291,10 @@ impl ContainerDriver for KubectlDriver {
     }
 
     async fn exists(&self, name: &str) -> Result<bool> {
-        let name = Self::k8s_name(name);
-        let out = self.run(&["get", "pod", &name]).await?;
-        Ok(out.status.success())
+        match self.pod_phase(name).await? {
+            Some(phase) => Ok(phase != "Terminating"),
+            None => Ok(false),
+        }
     }
 
     async fn scheduler_url(&self, warehouse: &str, _host_port: Option<u16>) -> Result<String> {

@@ -315,9 +315,68 @@ impl UserSession {
         Ok(())
     }
 
+    /// Sets an ad-hoc session attribute and writes it through to the state
+    /// store (when the `state-store` feature is enabled) so it survives
+    /// rehydration on another process after a failover. Persistence happens
+    /// on a spawned task and never blocks the caller.
+    pub fn set_attr(&self, key: &str, value: &str) {
+        self.attrs.insert(key.to_string(), value.to_string());
+        #[cfg(feature = "state-store")]
+        self.persist_attrs_async();
+    }
+
+    /// Snapshot of the ad-hoc session attributes for the persisted
+    /// `SessionRecord`.
+    #[cfg(feature = "state-store")]
     #[must_use]
-    pub fn get_session_variable(&self, variable: &str) -> Option<String> {
-        let state = self.ctx.state();
+    pub fn attrs_snapshot(&self) -> HashMap<String, String> {
+        self.attrs
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Spawns a task that merges the current attrs snapshot into the
+    /// persisted session record. Best-effort: failures are logged, not
+    /// surfaced to the caller.
+    #[cfg(feature = "state-store")]
+    fn persist_attrs_async(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "no tokio runtime: session attrs not persisted"
+            );
+            return;
+        };
+        let state_store = self.state_store.clone();
+        let session_id = self.session_id.clone();
+        let attrs = self.attrs_snapshot();
+        handle.spawn(async move {
+            let mut record = match state_store.get_session(&session_id).await {
+                Ok(record) => record,
+                Err(state_store::Error::NotFound) => SessionRecord::new(&session_id),
+                Err(err) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        ?err,
+                        "failed to read session record for attrs write-through"
+                    );
+                    return;
+                }
+            };
+            record.attrs = attrs;
+            if let Err(err) = state_store.update_session(record).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    ?err,
+                    "failed to persist session attrs"
+                );
+            }
+        });
+    }
+
+    #[must_use]
+    pub fn get_session_variable(&self, variable: &str) -> Option<String> {        let state = self.ctx.state();
         let config = state.config().options().extensions.get::<SessionParams>();
         if let Some(cfg) = config {
             return cfg.properties.get(variable).map(|v| v.value.clone());

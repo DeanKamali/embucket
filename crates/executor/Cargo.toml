@@ -20,6 +20,7 @@ state-store-query-test = ["state-store-query"]
 state-store-query = ["state-store"]
 
 [dependencies]
+avalanche-executor-common = { path = "../avalanche-executor-common" }
 avalanche-warehouse = { path = "../avalanche-warehouse" }
 catalog-metastore = { path = "../catalog-metastore" }
 state-store = { path = "../state-store" }

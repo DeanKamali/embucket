@@ -325,6 +325,20 @@ impl UserSession {
         None
     }
 
+    /// Ballista scheduler URL for the session's current warehouse, when the
+    /// warehouse exposes a host-reachable scheduler port (design §6.3).
+    /// `None` means the query runs locally.
+    pub async fn warehouse_scheduler_url(&self) -> Option<String> {
+        let warehouse = self.get_session_variable("warehouse")?;
+        self.warehouse
+            .scheduler_url(&warehouse)
+            .await
+            .map_err(|err| {
+                tracing::debug!(%err, warehouse, "no scheduler url for warehouse; running locally");
+            })
+            .ok()
+    }
+
     #[must_use]
     pub fn get_session_variable_bool(&self, variable: &str) -> bool {
         let state = self.ctx.state();

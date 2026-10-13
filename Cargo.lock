@@ -3559,6 +3559,7 @@ dependencies = [
  "arrow-schema 59.2.0",
  "async-stream",
  "async-trait",
+ "avalanche-executor-common",
  "avalanche-warehouse",
  "aws-config",
  "aws-sdk-s3tables",

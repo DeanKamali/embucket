@@ -41,6 +41,7 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
+use datafusion::execution::context::SessionContext;
 use datafusion::execution::session_state::{SessionContextProvider, SessionState};
 use datafusion::logical_expr::{self, col};
 use datafusion::logical_expr::{LogicalPlan, TableSource};
@@ -548,6 +549,14 @@ impl UserQuery {
         mut subquery: Box<Query>,
     ) -> Result<QueryResult> {
         self.traverse_and_update_query(subquery.as_mut()).await;
+        // Avalanche (design §6.3, v1 heuristic): a top-level SELECT with a
+        // warehouse in scope runs on that warehouse's Ballista cluster.
+        // Everything else (internal lookups, metadata, writes) stays local.
+        if let Some(scheduler_url) = self.session.warehouse_scheduler_url().await {
+            return self
+                .execute_with_custom_plan_target(&subquery.to_string(), Some(scheduler_url))
+                .await;
+        }
         Box::pin(self.execute_with_custom_plan(&subquery.to_string())).await
     }
 
@@ -2423,6 +2432,51 @@ impl UserQuery {
         ))
     }
 
+    /// Distributed path (design §6.3): upgrade the Embucket session state for
+    /// Ballista (Embucket codecs attached, BallistaQueryPlanner installed) and
+    /// run the plan through it. The planner's `create_physical_plan` returns a
+    /// `DistributedQueryExec`, whose `execute` submits the job to the
+    /// warehouse scheduler and streams partitions back from the cluster.
+    async fn _execute_logical_plan_distributed(
+        session: Arc<UserSession>,
+        plan: LogicalPlan,
+        scheduler_url: String,
+        span: tracing::Span,
+    ) -> Result<QueryResult> {
+        let fallback_schema = plan.schema().as_arrow().clone();
+        let state = avalanche_executor_common::upgrade_session_for_warehouse(
+            session.ctx.state().clone(),
+            scheduler_url,
+        )
+        .context(ex_error::DataFusionSnafu)?;
+        let ctx = SessionContext::new_with_state(state);
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .context(ex_error::DataFusionSnafu)?;
+        let physical_plan = df
+            .create_physical_plan()
+            .await
+            .context(ex_error::DataFusionSnafu)?;
+        let metrics_plan = Arc::clone(&physical_plan);
+        let task_ctx = ctx.task_ctx();
+        let records = collect(physical_plan, task_ctx)
+            .instrument(span)
+            .await
+            .context(ex_error::DataFusionSnafu)?;
+        let schema = if records.is_empty() {
+            fallback_schema
+        } else {
+            records[0].schema().as_ref().clone()
+        };
+        let metrics = build_plan_metrics(&metrics_plan);
+        Ok::<QueryResult, Error>(QueryResult::new_with_metrics(
+            records,
+            Arc::new(schema),
+            metrics,
+        ))
+    }
+
     async fn execute_logical_plan(&self, plan: LogicalPlan) -> Result<QueryResult> {
         let session = self.session.clone();
         let span = tracing::debug_span!("UserQuery::execute_logical_plan");
@@ -2440,6 +2494,35 @@ impl UserQuery {
                 Ok(stream)
             } else {
                 Self::_execute_logical_plan(session, plan, span).await
+            }
+        }
+    }
+
+    /// Distributed execution (design §6.3): submit the logical plan to the
+    /// warehouse's Ballista scheduler. Same spawn shape as
+    /// [`Self::execute_logical_plan`].
+    async fn execute_logical_plan_on_warehouse(
+        &self,
+        plan: LogicalPlan,
+        scheduler_url: String,
+    ) -> Result<QueryResult> {
+        let session = self.session.clone();
+        let span = tracing::debug_span!("UserQuery::execute_logical_plan_distributed");
+
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "dedicated-executor")] {
+                let stream = self
+                    .session
+                    .executor
+                    .spawn(async move {
+                        Self::_execute_logical_plan_distributed(session, plan, scheduler_url, span)
+                            .await
+                    })
+                    .await
+                    .context(ex_error::JobSnafu)??;
+                Ok(stream)
+            } else {
+                Self::_execute_logical_plan_distributed(session, plan, scheduler_url, span).await
             }
         }
     }
@@ -2517,6 +2600,23 @@ impl UserQuery {
         err
     )]
     pub async fn execute_with_custom_plan(&self, query: &str) -> Result<QueryResult> {
+        self.execute_with_custom_plan_target(query, None).await
+    }
+
+    /// Like [`Self::execute_with_custom_plan`], but runs the final plan on the
+    /// warehouse's Ballista cluster when `scheduler_url` is `Some` (design
+    /// §6.3), or locally when `None`.
+    #[instrument(
+        name = "UserQuery::execute_with_custom_plan_target",
+        level = "trace",
+        skip(self),
+        err
+    )]
+    pub async fn execute_with_custom_plan_target(
+        &self,
+        query: &str,
+        scheduler_url: Option<String>,
+    ) -> Result<QueryResult> {
         let statement = self
             .sql_to_df_statement(query)
             .context(ex_error::DataFusionSnafu)?;
@@ -2560,7 +2660,10 @@ impl UserQuery {
             // The call to `with_param_values` replaces the parameter references with actual values.
             .with_param_values(session_params)
             .context(ex_error::DataFusionSnafu)?;
-        self.execute_logical_plan(plan).await
+        match scheduler_url {
+            Some(url) => self.execute_logical_plan_on_warehouse(plan, url).await,
+            None => self.execute_logical_plan(plan).await,
+        }
     }
 
     async fn execute_scalar_query(&self, query_str: &str) -> Result<ScalarValue> {

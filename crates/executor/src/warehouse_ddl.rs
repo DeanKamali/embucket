@@ -15,7 +15,7 @@ use crate::models::QueryResult;
 use crate::session::UserSession;
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use avalanche_warehouse::{
-    CreateWarehouseRequest, WarehouseManager, WarehouseSize, WarehouseState,
+    CreateWarehouseRequest, WarehouseManager, WarehouseSize,
 };
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use snafu::ResultExt;

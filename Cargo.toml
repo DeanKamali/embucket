@@ -15,6 +15,8 @@ members = [
   "crates/state-store",
   "crates/avalanche-warehouse",
   "crates/avalanche-executor-common",
+  "crates/avalanche-scheduler",
+  "crates/avalanche-executor",
   "crates/build-info",
 ]
 resolver = "2"

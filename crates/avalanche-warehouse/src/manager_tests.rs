@@ -4,7 +4,7 @@ use crate::manager::{
     scheduler_container_name,
 };
 use crate::model::{WarehouseSize, WarehouseState};
-use state_store::InMemoryStateStore;
+use state_store::{InMemoryStateStore, StateStore as _};
 use std::sync::Arc;
 
 fn test_manager() -> (Arc<WarehouseManager>, Arc<FakeDriver>) {
@@ -16,6 +16,24 @@ fn test_manager() -> (Arc<WarehouseManager>, Arc<FakeDriver>) {
         Some("avalanche-test".to_string()),
     ));
     (manager, driver)
+}
+
+/// Like [`test_manager`], but also hands back the state store so tests can
+/// inspect the persisted warehouse records.
+fn test_manager_with_store() -> (
+    Arc<WarehouseManager>,
+    Arc<FakeDriver>,
+    Arc<InMemoryStateStore>,
+) {
+    let driver = Arc::new(FakeDriver::new());
+    let store = Arc::new(InMemoryStateStore::new());
+    let manager = Arc::new(WarehouseManager::new(
+        store.clone(),
+        driver.clone(),
+        BallistaImages::default(),
+        Some("avalanche-test".to_string()),
+    ));
+    (manager, driver, store)
 }
 
 fn create_req(name: &str, size: WarehouseSize) -> CreateWarehouseRequest {
@@ -180,4 +198,96 @@ async fn list_returns_all_warehouses_sorted() {
 async fn docker_cli_driver_exists_false_for_missing() {
     let driver = DockerCliDriver::new();
     assert!(!driver.exists("avalanche-does-not-exist-xyz").await.expect("exists"));
+}
+
+// Ballista scheduler gRPC port, as bound by start_compute.
+const SCHEDULER_INTERNAL_PORT: u16 = 50050;
+
+#[tokio::test]
+async fn create_allocates_and_persists_scheduler_host_port() {
+    let (manager, driver, store) = test_manager_with_store();
+    manager
+        .create(create_req("portwh", WarehouseSize::Xsmall))
+        .await
+        .expect("create");
+
+    let record = store.get_warehouse("portwh").await.expect("record");
+    let port = record
+        .scheduler_host_port
+        .expect("scheduler_host_port persisted");
+    assert!(port > 0);
+
+    // the scheduler container maps the persisted host port; executors do not
+    let sched_spec = driver
+        .started_spec(&scheduler_container_name("portwh"))
+        .expect("scheduler spec");
+    assert_eq!(sched_spec.ports, vec![(port, SCHEDULER_INTERNAL_PORT)]);
+    let exec_spec = driver
+        .started_spec(&executor_container_name("portwh", 0))
+        .expect("executor spec");
+    assert!(exec_spec.ports.is_empty());
+}
+
+#[tokio::test]
+async fn scheduler_url_contains_loopback_host_and_port() {
+    let (manager, _driver, store) = test_manager_with_store();
+    manager
+        .create(create_req("urlwh", WarehouseSize::Xsmall))
+        .await
+        .expect("create");
+
+    let record = store.get_warehouse("urlwh").await.expect("record");
+    let port = record.scheduler_host_port.expect("port");
+
+    let url = manager.scheduler_url("urlwh").await.expect("scheduler_url");
+    assert_eq!(url, format!("http://127.0.0.1:{port}"));
+    assert!(url.contains("127.0.0.1"));
+    assert!(url.contains(&port.to_string()));
+}
+
+#[tokio::test]
+async fn scheduler_url_errors_for_record_without_port() {
+    // simulate a record persisted before scheduler_host_port existed
+    let (manager, _driver, store) = test_manager_with_store();
+    manager
+        .create(create_req("legacy", WarehouseSize::Xsmall))
+        .await
+        .expect("create");
+    let mut record = store.get_warehouse("legacy").await.expect("record");
+    record.scheduler_host_port = None;
+    store.put_warehouse(record).await.expect("put");
+
+    assert!(manager.scheduler_url("legacy").await.is_err());
+}
+
+#[tokio::test]
+async fn suspend_resume_keeps_same_scheduler_port() {
+    let (manager, driver, store) = test_manager_with_store();
+    manager
+        .create(create_req("stable", WarehouseSize::Small))
+        .await
+        .expect("create");
+    let before = store
+        .get_warehouse("stable")
+        .await
+        .expect("record")
+        .scheduler_host_port
+        .expect("port");
+
+    manager.suspend("stable").await.expect("suspend");
+    manager.resume("stable").await.expect("resume");
+
+    let after = store
+        .get_warehouse("stable")
+        .await
+        .expect("record")
+        .scheduler_host_port
+        .expect("port");
+    assert_eq!(before, after);
+
+    // resume re-applies the same mapping on the scheduler container
+    let sched_spec = driver
+        .started_spec(&scheduler_container_name("stable"))
+        .expect("scheduler spec");
+    assert_eq!(sched_spec.ports, vec![(before, SCHEDULER_INTERNAL_PORT)]);
 }

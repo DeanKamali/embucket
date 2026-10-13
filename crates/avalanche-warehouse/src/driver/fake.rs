@@ -19,6 +19,8 @@ struct FakeState {
     /// container names currently "existing" (running or stopped)
     containers: HashSet<String>,
     ops: Vec<(String, String)>, // ("start"/"stop", name)
+    /// specs of every `start` call, in order
+    specs: Vec<ContainerSpec>,
 }
 
 impl FakeDriver {
@@ -52,6 +54,19 @@ impl FakeDriver {
             .filter(|(op, name)| op == "stop" && name.starts_with(prefix))
             .count()
     }
+
+    /// Most recent `start` spec for `name`, if any.
+    #[must_use]
+    pub fn started_spec(&self, name: &str) -> Option<ContainerSpec> {
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .specs
+            .iter()
+            .rev()
+            .find(|spec| spec.name == name)
+            .cloned()
+    }
 }
 
 #[async_trait::async_trait]
@@ -60,6 +75,7 @@ impl ContainerDriver for FakeDriver {
         let mut state = self.inner.lock().expect("poisoned");
         state.containers.insert(spec.name.clone());
         state.ops.push(("start".to_string(), spec.name.clone()));
+        state.specs.push(spec.clone());
         Ok(())
     }
 

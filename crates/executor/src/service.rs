@@ -349,6 +349,7 @@ impl CoreExecutionService {
         let record = state_store::SessionRecord {
             user_name: session.metadata.attr(SessionMetadataAttr::UserName),
             metadata: session.metadata.clone().into_map(),
+            attrs: session.attrs_snapshot(),
             expiry: u64::try_from(session.expiry.load(Ordering::Relaxed)).ok(),
             ..record
         };
@@ -416,6 +417,10 @@ impl CoreExecutionService {
                 + DateTimeDuration::seconds(SESSION_INACTIVITY_EXPIRATION_SECONDS),
         );
         user_session.expiry.store(expiry, Ordering::Relaxed);
+        // Restore ad-hoc session attributes persisted before the failover.
+        for (key, value) in record.attrs {
+            user_session.attrs.insert(key, value);
+        }
 
         let mut sessions = self.df_sessions.write().await;
         // Another task may have created the session concurrently; either way

@@ -146,3 +146,71 @@ async fn test_create_session_persists_metadata() {
     expected.insert("ClientAppId".to_string(), "my-client".to_string());
     assert_eq!(record.metadata, expected);
 }
+
+// `set_attr` writes through to the persisted session record.
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn test_set_attr_persists_to_state_store() {
+    let state_store = Arc::new(InMemoryStateStore::new());
+    let svc = make_service(state_store.clone()).await;
+
+    let session = svc
+        .create_session("s4", Some(test_metadata()))
+        .await
+        .expect("Failed to create session");
+    session.set_attr("req_id", "abc-123");
+
+    // The write-through is spawned on the runtime; poll until it lands.
+    let record = wait_for_attr(&state_store, "s4", "req_id").await;
+    assert_eq!(record.attrs.get("req_id").map(String::as_str), Some("abc-123"));
+}
+
+// Ad-hoc session attributes must survive rehydration on a fresh instance
+// sharing the same state store (process restart / failover).
+#[tokio::test]
+#[allow(clippy::expect_used)]
+async fn test_attrs_round_trip_on_rehydration() {
+    let state_store = Arc::new(InMemoryStateStore::new());
+    let svc_a = make_service(state_store.clone()).await;
+
+    let session = svc_a
+        .create_session("s5", Some(test_metadata()))
+        .await
+        .expect("Failed to create session");
+    session.set_attr("req_id", "abc-123");
+    session.set_attr("trace", "xyz");
+
+    // Wait for the async write-through to land before "failing over".
+    let record = wait_for_attr(&state_store, "s5", "req_id").await;
+    assert_eq!(record.attrs.get("trace").map(String::as_str), Some("xyz"));
+
+    // Simulate a restart on a different process.
+    let svc_b = make_service(state_store.clone()).await;
+    assert!(
+        svc_b.update_session_expiry("s5").await.expect("update_session_expiry"),
+        "session must be rehydrated from the state store"
+    );
+
+    let rehydrated = svc_b.get_session("s5").await.expect("get_session");
+    assert_eq!(rehydrated.attrs.get("req_id").as_deref().map(String::as_str), Some("abc-123"));
+    assert_eq!(rehydrated.attrs.get("trace").as_deref().map(String::as_str), Some("xyz"));
+}
+
+// Polls the store until the spawned attrs write-through has persisted the
+// given key (bounded, so a bug fails the test instead of hanging it).
+#[allow(clippy::expect_used)]
+async fn wait_for_attr(
+    state_store: &InMemoryStateStore,
+    session_id: &str,
+    key: &str,
+) -> state_store::SessionRecord {
+    for _ in 0..200 {
+        if let Ok(record) = state_store.get_session(session_id).await {
+            if record.attrs.contains_key(key) {
+                return record;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("attrs write-through did not land in the state store");
+}

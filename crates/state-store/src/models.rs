@@ -100,6 +100,10 @@ pub struct SessionRecord {
     /// Login-time context (account, client app, initial database/schema/warehouse).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+    /// Ad-hoc session attributes (`UserSession::attrs`), write-through
+    /// persisted so they survive rehydration on another process.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub attrs: HashMap<String, String>,
     /// Unix-seconds inactivity expiry; sessions past this point are dead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry: Option<u64>,
@@ -125,6 +129,7 @@ impl SessionRecord {
             ttl_seconds: None,
             user_name: None,
             metadata: HashMap::new(),
+            attrs: HashMap::new(),
             expiry: None,
             variables: HashMap::new(),
             views: HashMap::new(),

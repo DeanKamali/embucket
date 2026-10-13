@@ -29,6 +29,7 @@ use catalog_metastore::{
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::arrow::datatypes::{Fields, SchemaBuilder};
+use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::catalog::TableProvider;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::DefaultTableSource;
@@ -59,7 +60,7 @@ use datafusion::sql::statement::object_name_to_string;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
     Column, DFSchema, DataFusionError, ParamValues, ResolvedTableReference, SchemaReference,
-    TableReference, ToDFSchema, plan_datafusion_err,
+    TableReference, ToDFSchema, plan_datafusion_err, tree_node::TreeNode, tree_node::Transformed,
 };
 use datafusion_expr::conditional_expressions::CaseBuilder;
 use datafusion_expr::logical_plan::dml::{DmlStatement, InsertOp, WriteOp};
@@ -2439,6 +2440,27 @@ impl UserQuery {
         span: tracing::Span,
     ) -> Result<QueryResult> {
         let fallback_schema = plan.schema().as_arrow().clone();
+        // Unwrap catalog caching providers: the Ballista plan serializer must
+        // downcast scan sources to concrete providers (ListingTable, ...),
+        // but the metastore schema hands out `CachingTable` wrappers.
+        let plan = plan
+            .transform(|node| {
+                let LogicalPlan::TableScan(scan) = node else {
+                    return Ok(Transformed::no(node));
+                };
+                let Ok(provider) = source_as_provider(&scan.source) else {
+                    return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+                };
+                let Some(caching) = provider.downcast_ref::<CachingTable>() else {
+                    return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+                };
+                let mut unwrapped = scan;
+                unwrapped.source =
+                    Arc::new(DefaultTableSource::new(Arc::clone(&caching.table)));
+                Ok(Transformed::yes(LogicalPlan::TableScan(unwrapped)))
+            })
+            .context(ex_error::DataFusionSnafu)?
+            .data;
         let state = avalanche_executor_common::upgrade_session_for_warehouse(
             session.ctx.state().clone(),
             scheduler_url,

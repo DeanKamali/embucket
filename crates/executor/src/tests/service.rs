@@ -310,9 +310,11 @@ async fn test_max_concurrency_level() {
             QueryContext::default(),
         )
         .await;
+    // M6 queueing: the third query is no longer rejected at the limit —
+    // it waits in the queue and succeeds once a slot frees up.
     assert!(
-        res.is_err(),
-        "Expected concurrency limit error but got {res:?}"
+        res.is_ok(),
+        "Expected queued query to succeed after a slot freed up but got {res:?}"
     );
 
     // Pass the barrier to allow the first two queries to finish
@@ -352,9 +354,10 @@ async fn test_max_concurrency_level2() {
     let res = execution_svc
         .query("test_session_id", "SELECT 1", QueryContext::default())
         .await;
+    // M6 queueing: waits for a slot instead of instant reject, then succeeds.
     assert!(
-        res.is_err(),
-        "Expected concurrency limit error but got {res:?}"
+        res.is_ok(),
+        "Expected queued query to succeed after a slot freed up but got {res:?}"
     );
 }
 
@@ -434,4 +437,46 @@ async fn test_query_timeout() {
         res.is_err(),
         "Expected query execution exceeded timeout error but got {res:?}"
     );
+}
+
+/// M6 queueing: with one concurrency slot, a second concurrent query waits
+/// in the queue and fails with the limit-exceeded error once the queue
+/// timeout elapses (instead of the old instant reject).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used)]
+async fn test_queue_timeout() {
+    let metastore = Arc::new(InMemoryMetastore::new());
+    let execution_svc = Arc::new(
+        CoreExecutionService::new(
+            metastore.clone(),
+            Arc::new(Config::default().with_max_concurrency_level(1).with_queue_timeout(1)),
+        )
+        .await
+        .expect("Failed to create execution service"),
+    );
+
+    let _session = execution_svc
+        .create_session("test_session_id", None)
+        .await
+        .expect("Failed to create session");
+
+    let svc_a = execution_svc.clone();
+    let first = tokio::spawn(async move {
+        svc_a.query("test_session_id", "SELECT sleep(2)", QueryContext::default())
+            .await
+    });
+    // give the first query time to grab the only slot
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let second = execution_svc
+        .query(
+            "test_session_id",
+            "SELECT sleep(2)",
+            QueryContext::default(),
+        )
+        .await;
+    assert!(
+        second.is_err(),
+        "Expected queue-timeout limit-exceeded error but got {second:?}"
+    );
+    first.await.expect("first query task panicked").expect("first query should succeed");
 }

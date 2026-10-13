@@ -166,6 +166,9 @@ pub struct CoreExecutionService {
     catalog_list: Arc<EmbucketCatalogList>,
     runtime_env: Arc<RuntimeEnv>,
     queries: Arc<RunningQueriesRegistry>,
+    /// Concurrency queue (M6): queries above `max_concurrency_level` wait
+    /// here up to `queue_timeout_secs` instead of being rejected.
+    queue: Arc<tokio::sync::Semaphore>,
     #[cfg(feature = "state-store")]
     state_store: Arc<dyn StateStore>,
     /// Shared warehouse manager (design §5); one per process.
@@ -203,6 +206,11 @@ pub fn build_test_warehouse_manager(state_store: Arc<dyn StateStore>) -> Arc<War
     ))
 }
 
+/// Concurrency queue sized to `max_concurrency_level` permits (M6).
+fn queue_semaphore(config: &Config) -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(config.max_concurrency_level.max(1)))
+}
+
 impl CoreExecutionService {
     #[cfg(feature = "state-store")]
     pub async fn new_test_executor(
@@ -215,6 +223,7 @@ impl CoreExecutionService {
         let catalog_list = Self::catalog_list(metastore.clone(), &config).await?;
         let runtime_env = Self::runtime_env(&config, catalog_list.clone())?;
         Ok(Self {
+            queue: queue_semaphore(&config),
             metastore,
             df_sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
@@ -254,6 +263,7 @@ impl CoreExecutionService {
         // metering history from prior runs (M5); logs and continues on failure
         warehouse.load_metering().await;
         Ok(Self {
+            queue: queue_semaphore(&config),
             metastore,
             df_sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
@@ -755,20 +765,9 @@ impl ExecutionService for CoreExecutionService {
             }
         }
 
-        if self.queries.count() >= self.config.max_concurrency_level {
-            let limit_exceeded = ExecutionTaskResult::from_query_limit_exceeded(query_id);
-            #[cfg(feature = "state-store-query")]
-            {
-                // query created with failed status already
-                limit_exceeded.assign_query_attributes(&mut query);
-                self.state_store
-                    .put_query(&query)
-                    .await
-                    .context(ex_error::StateStoreSnafu)?;
-            }
-            // here we always return error, but Ok should fit Result type too
-            return limit_exceeded.result.map(|_| query_id);
-        }
+        // M6 queueing: queries above `max_concurrency_level` no longer fail
+        // here — they wait in the queue (see `queue` semaphore in the spawned
+        // task) up to `queue_timeout_secs` before failing like before.
 
         #[cfg(feature = "state-store-query")]
         self.state_store
@@ -797,11 +796,28 @@ impl ExecutionService for CoreExecutionService {
             let state_store = self.state_store.clone();
             let query_text = query_text.to_string();
             let query_timeout = Duration::from_secs(self.config.query_timeout_secs);
+            let queue_wait = Duration::from_secs(self.config.queue_timeout_secs);
+            let queue_sem = self.queue.clone();
             let queries_registry = self.queries.clone();
             let query_token = query_token.clone();
             async move {
                 let sub_task_span = tracing::info_span!("spawn_query_sub_task");
                 let mut query_obj = user_session.query(query_text, query_context);
+                // M6: per-warehouse STATEMENT_TIMEOUT overrides the global
+                // query timeout (0 = no timeout).
+                let query_timeout = if let Some(warehouse_name) =
+                    query_obj.session.current_warehouse_name()
+                    && let Some(record) = query_obj
+                        .session
+                        .warehouse
+                        .find_record(&warehouse_name)
+                        .await
+                    && let Some(secs) = record.statement_timeout_secs
+                {
+                    Duration::from_secs(if secs == 0 { u64::MAX } else { secs })
+                } else {
+                    query_timeout
+                };
                 #[cfg(feature = "state-store-query")]
                 {
                     // effective database/schema at planning/execution time
@@ -820,36 +836,63 @@ impl ExecutionService for CoreExecutionService {
                     }
                 }
 
-                // Create nested task so in case of abort/timeout it can be aborted
-                // and result is handled properly (status / query result saved)
-                let task_future =
-                    task::spawn(async move { query_obj.execute().instrument(sub_task_span).await });
-
-                let subtask_abort_handle = task_future.abort_handle();
-                // wait for any future to be resolved
-                let execution_result = tokio::select! {
-                    finished = task_future => {
-                        match finished {
-                            Ok(inner_result) => ExecutionTaskResult::from_query_result(query_id, inner_result),
-                            Err(task_error) => {
-                                tracing::error!("Query {query_id} sub task join error: {task_error:?}");
-                                ExecutionTaskResult::from_failed_query_task(query_id, task_error)
-                            },
+                // M6: warm queue — wait for one of `max_concurrency_level`
+                // slots (cancellable) before executing; on queue-timeout the
+                // query fails exactly like the old hard reject did.
+                let wait_for_slot = async {
+                    match tokio::time::timeout(queue_wait, queue_sem.acquire_owned()).await {
+                        Ok(permit) => Ok(permit),
+                        Err(_) => {
+                            tracing::info_span!("queue_timeout");
+                            Err(())
                         }
-                    },
+                    }
+                };
+                let execution_result = tokio::select! {
                     () = query_token.cancelled() => {
-                        tracing::info_span!("abort_cancelled_query");
-                        subtask_abort_handle.abort();
                         ExecutionTaskResult::from_cancelled_query_task(query_id)
                     },
-                    // Execute the query with a timeout to prevent long-running or stuck queries
-                    // from blocking system resources indefinitely. If the timeout is exceeded,
-                    // convert the timeout into a standard QueryTimeout error so it can be handled
-                    // and recorded like any other execution failure
-                    () = tokio::time::sleep(query_timeout) => {
-                        tracing::info_span!("query_timeout_received_do_abort");
-                        subtask_abort_handle.abort();
-                        ExecutionTaskResult::from_timeout_query_task(query_id)
+                    slot = wait_for_slot => {
+                        match slot {
+                            Ok(permit) => {
+                                let _permit = permit;
+                                // Create nested task so in case of abort/timeout it can
+                                // be aborted and result is handled properly (status /
+                                // query result saved)
+                                let task_future = task::spawn(async move {
+                                    query_obj.execute().instrument(sub_task_span).await
+                                });
+
+                                let subtask_abort_handle = task_future.abort_handle();
+                                // wait for any future to be resolved
+                                tokio::select! {
+                                    finished = task_future => {
+                                        match finished {
+                                            Ok(inner_result) => ExecutionTaskResult::from_query_result(query_id, inner_result),
+                                            Err(task_error) => {
+                                                tracing::error!("Query {query_id} sub task join error: {task_error:?}");
+                                                ExecutionTaskResult::from_failed_query_task(query_id, task_error)
+                                            },
+                                        }
+                                    },
+                                    () = query_token.cancelled() => {
+                                        tracing::info_span!("abort_cancelled_query");
+                                        subtask_abort_handle.abort();
+                                        ExecutionTaskResult::from_cancelled_query_task(query_id)
+                                    },
+                                    // Execute the query with a timeout to prevent long-running or stuck queries
+                                    // from blocking system resources indefinitely. If the timeout is exceeded,
+                                    // convert the timeout into a standard QueryTimeout error so it can be handled
+                                    // and recorded like any other execution failure
+                                    () = tokio::time::sleep(query_timeout) => {
+                                        tracing::info_span!("query_timeout_received_do_abort");
+                                        subtask_abort_handle.abort();
+                                        ExecutionTaskResult::from_timeout_query_task(query_id)
+                                    }
+                                }
+                            },
+                            Err(()) => ExecutionTaskResult::from_query_limit_exceeded(query_id),
+                        }
                     }
                 };
 

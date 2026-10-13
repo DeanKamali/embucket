@@ -29,6 +29,7 @@ pub enum WarehouseStatement {
         auto_suspend_secs: Option<u64>,
         auto_resume: Option<bool>,
         initially_suspended: bool,
+        statement_timeout_secs: Option<u64>,
         if_not_exists: bool,
     },
     AlterSet {
@@ -36,6 +37,7 @@ pub enum WarehouseStatement {
         size: Option<WarehouseSize>,
         auto_suspend_secs: Option<u64>,
         auto_resume: Option<bool>,
+        statement_timeout_secs: Option<u64>,
     },
     Suspend {
         name: String,
@@ -177,6 +179,7 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
         auto_suspend_secs: None,
         auto_resume: None,
         initially_suspended: false,
+        statement_timeout_secs: None,
         if_not_exists,
     };
     // option list: `WITH` keyword, then `KEY [=] VALUE` pairs
@@ -215,6 +218,17 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
                 } = &mut stmt
                 {
                     *initially_suspended = val.unwrap_or(true);
+                }
+                i = next_index(upper, i + 1);
+            }
+            "STATEMENT_TIMEOUT" => {
+                let secs = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_u64(v));
+                if let WarehouseStatement::Create {
+                    statement_timeout_secs,
+                    ..
+                } = &mut stmt
+                {
+                    *statement_timeout_secs = secs;
                 }
                 i = next_index(upper, i + 1);
             }
@@ -274,6 +288,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
             let mut size = None;
             let mut auto_suspend_secs = None;
             let mut auto_resume = None;
+            let mut statement_timeout_secs = None;
             while i < upper.len() {
                 match upper[i].as_str() {
                     "SIZE" | "WAREHOUSE_SIZE" => {
@@ -290,6 +305,11 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                             value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_bool(v));
                         i = next_index(upper, i + 1);
                     }
+                    "STATEMENT_TIMEOUT" => {
+                        statement_timeout_secs =
+                            value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_u64(v));
+                        i = next_index(upper, i + 1);
+                    }
                     _ => return None,
                 }
             }
@@ -298,6 +318,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                 size,
                 auto_suspend_secs,
                 auto_resume,
+                statement_timeout_secs,
             })
         }
         _ => None,
@@ -332,6 +353,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             auto_suspend_secs,
             auto_resume,
             initially_suspended,
+            statement_timeout_secs,
             if_not_exists,
         } => {
             if manager.get(name).await.is_ok() {
@@ -346,6 +368,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
                 auto_suspend_secs: auto_suspend_secs.unwrap_or(0),
                 auto_resume: auto_resume.unwrap_or(true),
                 initially_suspended: *initially_suspended,
+                statement_timeout_secs: *statement_timeout_secs,
             };
             manager.create(req).await.map_err(warehouse_error)?;
             status_row()
@@ -355,9 +378,16 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             size,
             auto_suspend_secs,
             auto_resume,
+            statement_timeout_secs,
         } => {
             manager
-                .alter(name, *size, *auto_suspend_secs, *auto_resume)
+                .alter(
+                    name,
+                    *size,
+                    *auto_suspend_secs,
+                    *auto_resume,
+                    *statement_timeout_secs,
+                )
                 .await
                 .map_err(warehouse_error)?;
             status_row()
@@ -519,8 +549,36 @@ mod tests {
                 auto_suspend_secs: Some(60),
                 auto_resume: Some(true),
                 initially_suspended: false,
+                statement_timeout_secs: None,
                 if_not_exists: false,
             }
+        );
+    }
+
+    #[test]
+    fn parses_statement_timeout() {
+        let stmt = parse(
+            "CREATE WAREHOUSE analytics WITH SIZE = 'MEDIUM' STATEMENT_TIMEOUT = 90;",
+        )
+        .expect("should parse");
+        let WarehouseStatement::Create {
+            statement_timeout_secs,
+            ..
+        } = stmt
+        else {
+            panic!("expected Create");
+        };
+        assert_eq!(statement_timeout_secs, Some(90));
+
+        assert_eq!(
+            parse("ALTER WAREHOUSE wh SET STATEMENT_TIMEOUT = 0;"),
+            Some(WarehouseStatement::AlterSet {
+                name: "WH".to_string(),
+                size: None,
+                auto_suspend_secs: None,
+                auto_resume: None,
+                statement_timeout_secs: Some(0),
+            })
         );
     }
 
@@ -535,6 +593,7 @@ mod tests {
                 auto_suspend_secs: None,
                 auto_resume: None,
                 initially_suspended: false,
+                statement_timeout_secs: None,
                 if_not_exists: false,
             }
         );
@@ -549,6 +608,7 @@ mod tests {
                 size: Some(WarehouseSize::Large),
                 auto_suspend_secs: Some(300),
                 auto_resume: None,
+                statement_timeout_secs: None,
             })
         );
         assert_eq!(

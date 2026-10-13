@@ -127,6 +127,7 @@ async fn async_main(
         warehouse_type: "EMBUCKET".to_string(),
         sql_parser_dialect: opts.sql_parser_dialect.clone(),
         query_timeout_secs: opts.query_timeout_secs,
+        queue_timeout_secs: opts.queue_timeout_secs,
         max_concurrency_level: opts.max_concurrency_level,
         mem_pool_type: opts.mem_pool_type,
         mem_pool_size_mb: opts.mem_pool_size_mb,

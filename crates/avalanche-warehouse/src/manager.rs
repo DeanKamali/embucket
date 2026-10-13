@@ -64,6 +64,9 @@ pub struct CreateWarehouseRequest {
     pub auto_resume: bool,
     /// Snowflake `INITIALLY_SUSPENDED` — create without starting compute.
     pub initially_suspended: bool,
+    /// Per-warehouse statement timeout override (seconds); `None` = global,
+    /// 0 = no timeout (M6).
+    pub statement_timeout_secs: Option<u64>,
 }
 
 pub struct WarehouseManager {
@@ -147,6 +150,7 @@ impl WarehouseManager {
             req.auto_suspend_secs,
             req.auto_resume,
         );
+        record.statement_timeout_secs = req.statement_timeout_secs;
         // Reserve a host port for the scheduler so host-side clients can dial
         // its gRPC endpoint. Best-effort: creation must not fail on it.
         record.scheduler_host_port = allocate_free_host_port();
@@ -180,6 +184,7 @@ impl WarehouseManager {
         size: Option<WarehouseSize>,
         auto_suspend_secs: Option<u64>,
         auto_resume: Option<bool>,
+        statement_timeout_secs: Option<u64>,
     ) -> Result<Warehouse> {
         let mut record = self.record(name).await?;
         if let Some(size) = size {
@@ -193,6 +198,10 @@ impl WarehouseManager {
         }
         if let Some(auto_resume) = auto_resume {
             record.auto_resume = auto_resume;
+        }
+        // 0 clears the override (fall back to the global timeout)
+        if let Some(secs) = statement_timeout_secs {
+            record.statement_timeout_secs = (secs > 0).then_some(secs);
         }
         record.updated_at = Some(now_secs());
         self.state_store

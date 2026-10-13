@@ -43,7 +43,27 @@ fn create_req(name: &str, size: WarehouseSize) -> CreateWarehouseRequest {
         auto_suspend_secs: 0,
         auto_resume: true,
         initially_suspended: false,
+        statement_timeout_secs: None,
     }
+}
+
+#[tokio::test]
+async fn statement_timeout_round_trips() {
+    let (manager, _driver, store) = test_manager_with_store();
+
+    let mut req = create_req("TIMEOUT", WarehouseSize::Xsmall);
+    req.statement_timeout_secs = Some(45);
+    manager.create(req).await.expect("create");
+    let record = store.get_warehouse("TIMEOUT").await.expect("record");
+    assert_eq!(record.statement_timeout_secs, Some(45));
+
+    // ALTER clears on 0 (falls back to the global timeout)
+    manager
+        .alter("TIMEOUT", None, None, None, Some(0))
+        .await
+        .expect("alter");
+    let record = store.get_warehouse("TIMEOUT").await.expect("record");
+    assert_eq!(record.statement_timeout_secs, None);
 }
 
 #[tokio::test]
@@ -150,7 +170,7 @@ async fn alter_resizes_running_pool() {
         .await
         .expect("create");
     let wh = manager
-        .alter("wh4", Some(WarehouseSize::Medium), None, None)
+        .alter("wh4", Some(WarehouseSize::Medium), None, None, None)
         .await
         .expect("alter");
     assert_eq!(wh.size, WarehouseSize::Medium);

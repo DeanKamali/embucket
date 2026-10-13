@@ -38,6 +38,9 @@ pub struct Config {
     pub warehouse_type: String,
     pub sql_parser_dialect: Option<String>,
     pub query_timeout_secs: u64,
+    /// Seconds a query may wait in the concurrency queue before failing
+    /// (M6 queueing; Snowflake queue timeout).
+    pub queue_timeout_secs: u64,
     pub max_concurrency_level: usize,
     pub mem_pool_type: MemPoolType,
     pub mem_pool_size_mb: Option<usize>,
@@ -86,6 +89,7 @@ impl Default for Config {
             warehouse_type: "DEFAULT".to_string(),
             sql_parser_dialect: None,
             query_timeout_secs: 1200, // 20 minutes
+            queue_timeout_secs: 300,  // 5 minutes in the concurrency queue
             max_concurrency_level: 100,
             mem_pool_type: MemPoolType::default(),
             mem_pool_size_mb: None,
@@ -115,6 +119,12 @@ impl Config {
     #[must_use]
     pub const fn with_query_timeout(mut self, timeout_secs: u64) -> Self {
         self.query_timeout_secs = timeout_secs;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_queue_timeout(mut self, timeout_secs: u64) -> Self {
+        self.queue_timeout_secs = timeout_secs;
         self
     }
 }

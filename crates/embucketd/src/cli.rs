@@ -72,6 +72,14 @@ pub struct CliOpts {
 
     #[arg(
         long,
+        env = "QUERY_QUEUE_TIMEOUT_SECS",
+        default_value = "300",
+        help = "Maximum seconds a query may wait in the concurrency queue"
+    )]
+    pub queue_timeout_secs: u64,
+
+    #[arg(
+        long,
         value_enum,
         env = "MEM_POOL_TYPE",
         default_value = "greedy",

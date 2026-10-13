@@ -64,6 +64,10 @@ pub struct WarehouseRecord {
     pub scheduler_host_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<u64>,
+    /// Per-warehouse statement timeout override in seconds (M6). `None` =
+    /// use the router global; 0 = no timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement_timeout_secs: Option<u64>,
 }
 
 impl WarehouseRecord {
@@ -81,6 +85,7 @@ impl WarehouseRecord {
             created_at,
             scheduler_host_port: None,
             updated_at: None,
+            statement_timeout_secs: None,
         }
     }
 }

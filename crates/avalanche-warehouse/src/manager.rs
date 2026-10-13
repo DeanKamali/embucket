@@ -6,7 +6,8 @@
 
 use crate::driver::{ContainerDriver, ContainerSpec};
 use crate::error::{
-    AlreadyExistsSnafu, InvalidAutoSuspendSnafu, InvalidSizeSnafu, Result, StateStoreSnafu,
+    AlreadyExistsSnafu, InvalidAutoSuspendSnafu, InvalidSizeSnafu, NotFoundSnafu, Result,
+    StateStoreSnafu,
 };
 use crate::model::{Warehouse, WarehouseSize, WarehouseState};
 use snafu::ResultExt;
@@ -89,12 +90,22 @@ impl WarehouseManager {
             }
             .build());
         }
-        let record = WarehouseRecord::new(
+        let mut record = WarehouseRecord::new(
             &req.name,
             req.size.as_str(),
             req.auto_suspend_secs,
             req.auto_resume,
         );
+        // Reserve a host port for the scheduler so host-side clients can dial
+        // its gRPC endpoint. Best-effort: creation must not fail on it.
+        record.scheduler_host_port = allocate_free_host_port();
+        if record.scheduler_host_port.is_none() {
+            tracing::warn!(
+                warehouse = %req.name,
+                "failed to allocate a free host port for the scheduler; \
+                 host-side scheduler access will be unavailable"
+            );
+        }
         self.state_store
             .put_warehouse(record)
             .await
@@ -180,6 +191,23 @@ impl WarehouseManager {
         self.start_compute(name, size, WarehouseState::Running).await?;
         self.touch(name).await;
         self.get(name).await
+    }
+
+    /// Ballista scheduler URL for a host-side client (embucketd runs on the
+    /// docker host, so it dials the mapped host port on `127.0.0.1`).
+    ///
+    /// ballista-core 55 accepts `http://host:port` scheduler URLs
+    /// (`BallistaQueryPlanner::new(scheduler_url: String)`, which is handed to
+    /// `tonic::transport::Endpoint::new` and parsed as a `Url`).
+    pub async fn scheduler_url(&self, name: &str) -> Result<String> {
+        let record = self.record(name).await?;
+        let port = record.scheduler_host_port.ok_or_else(|| {
+            NotFoundSnafu {
+                name: name.to_string(),
+            }
+            .build()
+        })?;
+        Ok(format!("http://127.0.0.1:{port}"))
     }
 
     pub async fn drop_warehouse(&self, name: &str) -> Result<()> {
@@ -327,6 +355,13 @@ impl WarehouseManager {
         state: WarehouseState,
     ) -> Result<()> {
         let sched_name = scheduler_container_name(name);
+        // The scheduler's host port is fixed at creation and persisted on the
+        // record, so suspend/resume cycles keep the same mapping.
+        let scheduler_host_port = self
+            .record(name)
+            .await
+            .ok()
+            .and_then(|record| record.scheduler_host_port);
         self.driver
             .start(&ContainerSpec {
                 name: sched_name.clone(),
@@ -342,7 +377,10 @@ impl WarehouseManager {
                     sched_name.clone(),
                 ],
                 env: vec![],
-                ports: vec![],
+                ports: scheduler_host_port
+                    .map_or_else(Vec::new, |host_port| {
+                        vec![(host_port, INTERNAL_SCHEDULER_PORT)]
+                    }),
                 network: self.network.clone(),
             })
             .await?;
@@ -408,6 +446,15 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Grab a free TCP port on the host by binding an ephemeral listener and
+/// immediately releasing it (best-effort; the port can still be raced by
+/// other processes between release and container start).
+fn allocate_free_host_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
 }
 
 #[must_use]

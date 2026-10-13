@@ -57,6 +57,11 @@ pub struct WarehouseRecord {
     pub auto_suspend_secs: u64,
     pub auto_resume: bool,
     pub created_at: u64,
+    /// Host port on the docker host mapped to the scheduler's gRPC port, so
+    /// host-side clients (embucketd) can dial the scheduler. `None` for
+    /// records persisted before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_host_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<u64>,
 }
@@ -74,6 +79,7 @@ impl WarehouseRecord {
             auto_suspend_secs,
             auto_resume,
             created_at,
+            scheduler_host_port: None,
             updated_at: None,
         }
     }

@@ -20,3 +20,4 @@ metastore.yaml
 
 metastore.yaml
 docs/superpowers/
+*.pending-snap

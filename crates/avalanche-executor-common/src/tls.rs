@@ -189,10 +189,14 @@ impl TlsMaterial {
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
             .build()
             .map_err(|e| TlsError(format!("client verifier: {e}")))?;
-        rustls::ServerConfig::builder()
+        let mut config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(verifier)
             .with_single_cert(self.server_certs.clone(), self.server_key.clone_key())
-            .map_err(|e| TlsError(format!("server identity: {e}")))
+            .map_err(|e| TlsError(format!("server identity: {e}")))?;
+        // tonic clients require ALPN h2 (they fail with `H2NotNegotiated`
+        // otherwise); advertise h2 + http/1.1 so REST probes work too.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(config)
     }
 }
 

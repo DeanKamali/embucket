@@ -107,6 +107,7 @@ impl ContainerDriver for DockerCliDriver {
         args.extend(spec.args.iter().cloned());
 
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        tracing::info!(container = %spec.name, args = %arg_refs.join(" "), "docker run");
         let out = Self::run(&arg_refs).await?;
         if out.status.success() {
             return Ok(());

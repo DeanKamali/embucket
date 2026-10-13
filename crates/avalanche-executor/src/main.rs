@@ -51,10 +51,11 @@ async fn main() -> BallistaResult<()> {
     // executor→scheduler connections (registration, poll loop, heartbeats)
     // and task-level shuffle fetches present the client identity. Without
     // the env the process stays fully plaintext.
+    let mut tls_dir_display_opt: Option<String> = None;
     if let Some(dir) = avalanche_executor_common::TlsMaterial::dir_from_env() {
         let tls = avalanche_executor_common::TlsMaterial::load(&dir)
             .map_err(|e| BallistaError::Configuration(e.to_string()))?;
-        tracing::info!("mTLS enabled from {}", dir.display());
+        tls_dir_display_opt = Some(dir.display().to_string());
 
         let max_message_size = TLS_FLIGHT_MAX_MESSAGE_SIZE;
         let server_tls = tls
@@ -130,6 +131,11 @@ async fn main() -> BallistaResult<()> {
         tracing.with_writer(log_file).init();
     } else {
         tracing.init();
+    }
+
+    // Logged after tracing init so acceptance tests can assert the mode.
+    if let Some(tls_dir_display) = tls_dir_display_opt {
+        tracing::info!("mTLS enabled from {}", tls_dir_display);
     }
 
     // Kubernetes-style health probes are a concern of the standalone binary,

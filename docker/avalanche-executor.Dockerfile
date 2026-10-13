@@ -7,8 +7,9 @@
 #   docker build -f docker/avalanche-executor.Dockerfile \
 #     -t avalanche-executor:<tag> .
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
+FROM ubuntu:24.04
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true \
+    && apt-get install -y --no-install-recommends --allow-unauthenticated \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY target/release/avalanche-executor /usr/local/bin/avalanche-executor

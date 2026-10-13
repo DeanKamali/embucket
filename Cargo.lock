@@ -842,6 +842,7 @@ name = "avalanche-executor-common"
 version = "0.1.0"
 dependencies = [
  "ballista-core",
+ "catalog",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",

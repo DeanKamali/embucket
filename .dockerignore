@@ -1,0 +1,5 @@
+# Everything except what the warehouse image Dockerfiles need (they only
+# COPY the prebuilt release binaries).
+*
+!target/release/avalanche-scheduler
+!target/release/avalanche-executor

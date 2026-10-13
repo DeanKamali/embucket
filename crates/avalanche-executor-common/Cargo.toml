@@ -6,6 +6,7 @@ license-file = { workspace = true }
 
 [dependencies]
 ballista-core = "55.0.0"
+catalog = { path = "../catalog" }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }

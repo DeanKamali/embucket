@@ -20,6 +20,7 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_common::TableReference;
 
 use crate::udf_registry::FunctionMaps;
+use catalog::table::CachingTable;
 
 /// Logical codec: Ballista behavior + Embucket UDF decode.
 #[derive(Debug)]
@@ -86,7 +87,17 @@ impl LogicalExtensionCodec for EmbucketLogicalExtensionCodec {
         node: Arc<dyn datafusion::datasource::TableProvider>,
         buf: &mut Vec<u8>,
     ) -> datafusion_common::Result<()> {
-        self.inner.try_encode_table_provider(table_ref, node, buf)
+        // Unwrap Embucket's provider wrappers (CachingTable over the real
+        // provider) down to the inner DataFusion-native table that the
+        // Ballista/default codecs know how to serialize.
+        let mut provider = node;
+        for _ in 0..4 {
+            let Some(caching) = provider.downcast_ref::<CachingTable>() else {
+                break;
+            };
+            provider = caching.table.clone();
+        }
+        self.inner.try_encode_table_provider(table_ref, provider, buf)
     }
 
     fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> datafusion_common::Result<Arc<ScalarUDF>> {

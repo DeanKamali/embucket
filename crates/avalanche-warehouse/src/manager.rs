@@ -219,10 +219,15 @@ impl WarehouseManager {
     /// (`BallistaQueryPlanner::new(scheduler_url: String)`, which is handed to
     /// `tonic::transport::Endpoint::new` and parsed as a `Url`).
     pub async fn scheduler_url(&self, name: &str) -> Result<String> {
-        let record = self.record(name).await?;
+        // resolve the record's exact key: session variables may differ in
+        // case (`USE WAREHOUSE etl` vs stored `ETL`)
+        let record = match self.record(name).await {
+            Ok(record) => record,
+            Err(_) => self.record(&name.to_ascii_uppercase()).await?,
+        };
         let port = record.scheduler_host_port.ok_or_else(|| {
             NotFoundSnafu {
-                name: name.to_string(),
+                name: record.name.clone(),
             }
             .build()
         })?;

@@ -7,8 +7,9 @@
 #   docker build -f docker/avalanche-scheduler.Dockerfile \
 #     -t avalanche-scheduler:<tag> .
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
+FROM ubuntu:24.04
+RUN apt-get update -o Acquire::AllowInsecureRepositories=true \
+    && apt-get install -y --no-install-recommends --allow-unauthenticated \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY target/release/avalanche-scheduler /usr/local/bin/avalanche-scheduler

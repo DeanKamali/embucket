@@ -67,6 +67,78 @@ pub struct DockerCliDriver {
     pub network: Option<String>,
 }
 
+/// Marker appended to `/etc/hosts` entries maintained by the docker driver.
+const HOST_DNS_MARKER: &str = "# avalanche-dns";
+
+/// Path of the hosts file maintained for container-name resolution.
+const HOST_DNS_FILE: &str = "/etc/hosts";
+
+/// Upsert a `<bridge-ip> <container-name>` entry in the host's hosts file.
+///
+/// The host-side Ballista client (embucketd) dials warehouse containers by
+/// their container DNS name (TLS server certs carry name SANs), but docker's
+/// embedded DNS answers only *inside* the network — not on the host. Bridge
+/// IPs are host-routable, so we pin the mapping on the host ourselves.
+/// Entries carry `# avalanche-dns` so only our own lines are ever rewritten.
+fn upsert_host_dns(name: &str, ip: &str) {
+    let Ok(existing) = std::fs::read_to_string(HOST_DNS_FILE) else {
+        tracing::warn!("could not read {HOST_DNS_FILE}: container names may not resolve from the host");
+        return;
+    };
+    let kept: Vec<&str> = existing
+        .lines()
+        .filter(|l| !(l.contains(name) && l.contains(HOST_DNS_MARKER)))
+        .collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("{ip} {name} {HOST_DNS_MARKER}\n"));
+    if let Err(err) = std::fs::write(HOST_DNS_FILE, out) {
+        tracing::warn!("could not update {HOST_DNS_FILE} for {name}: {err}");
+    }
+}
+
+/// Remove our hosts-file entry for a stopped container (best-effort).
+fn remove_host_dns(name: &str) {
+    let Ok(existing) = std::fs::read_to_string(HOST_DNS_FILE) else {
+        return;
+    };
+    let kept: Vec<&str> = existing
+        .lines()
+        .filter(|l| !(l.contains(name) && l.contains(HOST_DNS_MARKER)))
+        .collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    if out != existing {
+        let _ = std::fs::write(HOST_DNS_FILE, out);
+    }
+}
+
+/// Query a container's bridge-network IP (`docker inspect`).
+async fn container_ip(name: &str) -> Option<String> {
+    let out = tokio::process::Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+            name,
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .filter(|ip| !ip.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 impl DockerCliDriver {
     #[must_use]
     pub fn new() -> Self {
@@ -96,6 +168,11 @@ impl ContainerDriver for DockerCliDriver {
         if exists {
             let out = Self::run(&["start", &spec.name]).await?;
             if out.status.success() {
+                // The container may have re-attached with a different bridge
+                // IP than the pinned hosts-file entry — refresh it.
+                if let Some(ip) = container_ip(&spec.name).await {
+                    upsert_host_dns(&spec.name, &ip);
+                }
                 return Ok(());
             }
             return Err(ContainerDriverSnafu {
@@ -135,6 +212,12 @@ impl ContainerDriver for DockerCliDriver {
         tracing::info!(container = %spec.name, args = %arg_refs.join(" "), "docker run");
         let out = Self::run(&arg_refs).await?;
         if out.status.success() {
+            // Pin the container's bridge IP in the host hosts-file so
+            // host-side dials (e.g. the router's partition fetches) resolve
+            // the container DNS name that TLS certificates carry.
+            if let Some(ip) = container_ip(&spec.name).await {
+                upsert_host_dns(&spec.name, &ip);
+            }
             return Ok(());
         }
         Err(ContainerDriverSnafu {
@@ -152,6 +235,7 @@ impl ContainerDriver for DockerCliDriver {
         // `docker rm -f` stops a running container and removes a stopped one.
         let out = Self::run(&["rm", "-f", name]).await?;
         if out.status.success() {
+            remove_host_dns(name);
             return Ok(());
         }
         Err(ContainerDriverSnafu {

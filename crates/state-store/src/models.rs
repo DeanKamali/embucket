@@ -152,9 +152,14 @@ impl StorageCredentials {
         if let Some(token) = &self.session_token {
             env.push(("AWS_SESSION_TOKEN".to_string(), token.clone()));
         }
-        if let Some(region) = &self.region {
-            env.push(("AWS_REGION".to_string(), region.clone()));
-        }
+        // S3 request signing needs a region; MinIO/default endpoints use
+        // us-east-1. Emitted unconditionally so executors never sign without
+        // one.
+        let region = self
+            .region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string());
+        env.push(("AWS_REGION".to_string(), region));
         env
     }
 

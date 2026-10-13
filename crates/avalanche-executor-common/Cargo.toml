@@ -13,6 +13,10 @@ datafusion-expr = { workspace = true }
 datafusion-proto = "55.0.0"
 functions = { path = "../functions" }
 object_store = { workspace = true }
+# mTLS (M7.2): shared material loading for scheduler/executor/router.
+rustls = { version = "0.23", features = ["aws-lc-rs", "logging", "std", "tls12"] }
+rustls-pki-types = "1"
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
 url = { workspace = true }
 
 [dev-dependencies]

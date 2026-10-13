@@ -825,6 +825,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "avalanche-executor"
 version = "0.1.0"
 dependencies = [
+ "arrow-flight",
  "avalanche-executor-common",
  "ballista-core",
  "ballista-executor",
@@ -832,6 +833,7 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "tokio",
+ "tonic 0.14.6",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -849,7 +851,10 @@ dependencies = [
  "datafusion-proto",
  "functions",
  "object_store",
+ "rustls 0.23.45",
+ "rustls-pki-types",
  "tokio",
+ "tonic 0.14.6",
  "url",
 ]
 
@@ -857,13 +862,20 @@ dependencies = [
 name = "avalanche-scheduler"
 version = "0.1.0"
 dependencies = [
+ "arrow-flight",
  "avalanche-executor-common",
+ "axum 0.8.9",
  "ballista-core",
  "ballista-scheduler",
  "clap",
  "datafusion",
  "datafusion-proto",
+ "rustls 0.23.45",
  "tokio",
+ "tokio-rustls 0.26.6",
+ "tonic 0.14.6",
+ "tower-http 0.7.1",
+ "tracing",
  "tracing-appender",
  "tracing-subscriber",
 ]
@@ -873,6 +885,7 @@ name = "avalanche-warehouse"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "avalanche-executor-common",
  "datafusion",
  "serde",
  "serde_json",
@@ -7300,6 +7313,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -8455,6 +8469,7 @@ dependencies = [
  "socket2 0.6.5",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls 0.26.6",
  "tokio-stream",
  "tower 0.5.3",
  "tower-layer",

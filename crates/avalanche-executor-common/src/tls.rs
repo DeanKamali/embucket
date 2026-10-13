@@ -213,15 +213,22 @@ impl TlsMaterial {
 /// tonic's connector only applies a `ClientTlsConfig` when the endpoint URI
 /// scheme is `https` (`transport/channel/service/connector.rs`: `is_https`
 /// gates the TLS upgrade) — for `http://` endpoints the TLS config is
-/// *silently ignored* and the dial goes out in plaintext. Ballista builds
-/// several of its peer URLs with a hardcoded `http://` scheme (executor
-/// registration in `executor_process.rs`, scheduler→executor task
-/// assignment in `executor_manager.rs`), so every TLS endpoint override
-/// must run through this helper, which rebuilds such endpoints with the
-/// `https` scheme (re-applying ballista's default gRPC settings, matching
-/// what `create_grpc_client_endpoint` would have applied) before
-/// attaching the TLS identity. Endpoints that already carry `https` keep
-/// their settings and only gain the TLS config.
+/// *silently ignored* and the dial goes out in plaintext.
+///
+/// This helper is for the executor→scheduler direction: ballista hardcodes
+/// `http://{scheduler_host}:{scheduler_port}` for executor registration,
+/// task-status reporting and heartbeating (`executor_process.rs`), and the
+/// scheduler serves that gRPC over TLS — so those endpoints must be
+/// rebuilt with the `https` scheme (re-applying ballista's default gRPC
+/// settings, matching what `create_grpc_client_endpoint` would have
+/// applied) before attaching the TLS identity. Endpoints that already
+/// carry `https` keep their settings and only gain the TLS config.
+///
+/// Do NOT use this for scheduler→executor dials: the executor's internal
+/// task gRPC (port 50052) is served plaintext by ballista (no TLS hook),
+/// and `executor_manager.rs` hardcodes `http://` for it *on purpose* —
+/// rewriting it would break task assignment. There, attach the TLS config
+/// as-is and let tonic's scheme gate decide.
 ///
 /// # Errors
 ///

@@ -105,7 +105,14 @@ async fn inner() -> BallistaResult<()> {
             .tonic_client_config()
             .map_err(|e| BallistaError::Configuration(e.to_string()))?;
         config.override_create_grpc_client_endpoint = Some(Arc::new(move |endpoint| {
-            avalanche_executor_common::tls::https_tls_endpoint(endpoint, &client_tls)
+            // Attach TLS config as-is: tonic applies it only to `https://`
+            // endpoints. That is exactly the split ballista intends — the
+            // scheduler's outbound dials are `https://` for executor Flight
+            // fetches (TLS) and `http://` for the executor's internal task
+            // gRPC (port 50052, which ballista serves plaintext and does not
+            // let us TLS-serve — see `executor_server.rs`).
+            endpoint
+                .tls_config(client_tls.clone())
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
         }));
 

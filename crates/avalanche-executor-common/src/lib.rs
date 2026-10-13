@@ -78,7 +78,12 @@ pub fn upgrade_session_for_warehouse(
         })?;
         let endpoint_override: ballista_core::extension::EndpointOverrideFn =
             Arc::new(move |endpoint| {
-                tls::https_tls_endpoint(endpoint, &client_tls)
+                // TLS config attaches only to `https://` endpoints (tonic's
+                // connector gates on scheme); every dial from a TLS session
+                // is already `https://` (submit URL and Flight partition
+                // fetches both), so this is purely additive.
+                endpoint
+                    .tls_config(client_tls.clone())
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             });
         config = config

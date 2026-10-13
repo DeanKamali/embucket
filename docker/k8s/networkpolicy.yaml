@@ -1,0 +1,32 @@
+# Avalanche design §7 (v1): auth terminates at the router; inter-compute
+# security is network isolation (mTLS between router and warehouse compute is
+# a v2 item — Ballista gRPC has no TLS wiring yet).
+#
+# Default-deny ingress for warehouse pods in the `avalanche` namespace, then
+# allow:
+#   1. same-namespace traffic (scheduler <-> executors, by label);
+#   2. the router host (embucketd on the k8s node) via the node/pod CIDR —
+#      adjust `ipBlock` to your CNI's pod CIDR and node IP.
+#
+# kubectl apply -f networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: avalanche-compute-isolation
+  namespace: avalanche
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: avalanche
+  policyTypes: ["Ingress"]
+  ingress:
+    # scheduler <-> executors (all warehouse compute traffic)
+    - from:
+        - podSelector: {}
+    # router on the host dialing scheduler gRPC (50050) and scheduler
+    # dialing executor flight services (50051/50052)
+    - from:
+        - ipBlock:
+            cidr: 10.42.0.0/16 # pod CIDR (k3s flannel default)
+        - ipBlock:
+            cidr: 184.107.176.4/32 # node / router host IP

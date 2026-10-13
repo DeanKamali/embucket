@@ -88,6 +88,7 @@ impl EnvConfig {
             aws_sdk_operation_attempt_timeout_secs: self.aws_sdk_operation_attempt_timeout_secs,
             iceberg_table_timeout_secs: self.iceberg_table_timeout_secs,
             iceberg_catalog_timeout_secs: self.iceberg_catalog_timeout_secs,
+            warehouse_network: None,
         }
     }
 }

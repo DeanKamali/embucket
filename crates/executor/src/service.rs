@@ -171,12 +171,15 @@ pub struct CoreExecutionService {
 }
 
 /// Manager with the real Docker driver (production).
-fn build_warehouse_manager(state_store: Arc<dyn StateStore>) -> Arc<WarehouseManager> {
+fn build_warehouse_manager(
+    state_store: Arc<dyn StateStore>,
+    network: Option<String>,
+) -> Arc<WarehouseManager> {
     Arc::new(WarehouseManager::new(
         state_store,
         Arc::new(DockerCliDriver::default()),
         BallistaImages::default(),
-        None,
+        network,
     ))
 }
 
@@ -231,9 +234,13 @@ impl CoreExecutionService {
             ex_error::StateStoreSnafu,
         )?) as Arc<dyn StateStore>;
         #[cfg(feature = "state-store")]
-        let warehouse = build_warehouse_manager(state_store.clone());
+        let warehouse =
+            build_warehouse_manager(state_store.clone(), config.warehouse_network.clone());
         #[cfg(not(feature = "state-store"))]
-        let warehouse = build_warehouse_manager(Arc::new(state_store::InMemoryStateStore::new()));
+        let warehouse =
+            build_warehouse_manager(Arc::new(state_store::InMemoryStateStore::new()), None);
+        // auto-suspend idle warehouses (design §5)
+        warehouse.clone().spawn_auto_suspend(60);
         Ok(Self {
             metastore,
             df_sessions: Arc::new(RwLock::new(HashMap::new())),

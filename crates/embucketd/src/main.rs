@@ -141,6 +141,7 @@ async fn async_main(
         aws_sdk_connect_timeout_secs: opts.aws_sdk_connect_timeout_secs,
         iceberg_table_timeout_secs: opts.iceberg_table_timeout_secs,
         iceberg_catalog_timeout_secs: opts.iceberg_catalog_timeout_secs,
+        warehouse_network: opts.warehouse_network.clone(),
     };
 
     let host = opts.host.clone().unwrap();

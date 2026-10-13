@@ -49,6 +49,13 @@ pub struct CliOpts {
 
     #[arg(
         long,
+        env = "WAREHOUSE_NETWORK",
+        help = "Docker network for warehouse compute containers (scheduler + executors)"
+    )]
+    pub warehouse_network: Option<String>,
+
+    #[arg(
+        long,
         env = "MAX_CONCURRENCY_LEVEL",
         default_value = "8",
         help = "Maximum number of running queries at the same time"

@@ -52,6 +52,9 @@ pub struct Config {
     pub aws_sdk_operation_attempt_timeout_secs: u64,
     pub iceberg_table_timeout_secs: u64,
     pub iceberg_catalog_timeout_secs: u64,
+    /// Docker network for warehouse compute containers (design §5). Required
+    /// for container-name DNS between scheduler and executors.
+    pub warehouse_network: Option<String>,
 }
 
 impl From<&Config> for CatalogListConfig {
@@ -97,6 +100,7 @@ impl Default for Config {
             aws_sdk_operation_attempt_timeout_secs: 10,
             iceberg_table_timeout_secs: 30,
             iceberg_catalog_timeout_secs: 10,
+            warehouse_network: None,
         }
     }
 }

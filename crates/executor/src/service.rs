@@ -178,7 +178,7 @@ fn build_warehouse_manager(
     Arc::new(WarehouseManager::new(
         state_store,
         Arc::new(DockerCliDriver::default()),
-        BallistaImages::default(),
+        BallistaImages::from_env(),
         network,
     ))
 }

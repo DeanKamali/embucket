@@ -35,6 +35,25 @@ impl Default for BallistaImages {
     }
 }
 
+impl BallistaImages {
+    /// Images with env override: `WAREHOUSE_SCHEDULER_IMAGE` and
+    /// `WAREHOUSE_EXECUTOR_IMAGE` (used by acceptance runs to point at the
+    /// Embucket-codec wrapper images).
+    #[must_use]
+    pub fn from_env() -> Self {
+        let default = Self::default();
+        let scheduler = std::env::var("WAREHOUSE_SCHEDULER_IMAGE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default.scheduler);
+        let executor = std::env::var("WAREHOUSE_EXECUTOR_IMAGE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default.executor);
+        Self { scheduler, executor }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateWarehouseRequest {
     pub name: String,

@@ -140,15 +140,11 @@ export VOLUME_SECRET_KEY=YOUR_SECRET_KEY
 
 ## Statestore settings
 
-When you enable the `state-store-query` feature, Embucket persists query state in DynamoDB. See [AWS Lambda deployment](/deploy/aws-lambda/) for how to enable this feature. Configure the table name and connection with the following variables.
+When you enable the `state-store-query` feature, Embucket persists query state in Postgres. See [AWS Lambda deployment](/deploy/aws-lambda/) for how to enable this feature. Configure the connection with the following variables.
 
 | Environment variable           | Default               |
 | ------------------------------ | --------------------- |
-| `STATESTORE_TABLE_NAME`        | `embucket-statestore` |
-| `STATESTORE_DYNAMODB_ENDPOINT` | unset                 |
-| `AWS_DDB_ACCESS_KEY_ID`        | unset                 |
-| `AWS_DDB_SECRET_ACCESS_KEY`    | unset                 |
-| `AWS_DDB_SESSION_TOKEN`        | unset                 |
+| `STATESTORE_PG_URL`            | unset (falls back to `DATABASE_URL`) |
 
 ## Lambda deploy-time variables
 

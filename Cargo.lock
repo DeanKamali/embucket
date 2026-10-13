@@ -886,32 +886,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-sdk-dynamodb"
-version = "1.130.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "093ade632b7d671f9374e89a3784463731987df9ece9259c75247111ea3ac985"
-dependencies = [
- "arc-swap",
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-observability",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-schema",
- "aws-smithy-types",
- "aws-types",
- "bytes",
- "fastrand",
- "http 1.5.0",
- "regex-lite",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "aws-sdk-s3tables"
 version = "1.71.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1388,12 +1362,6 @@ dependencies = [
  "tokio",
  "tower-service",
 ]
-
-[[package]]
-name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
 name = "base64"
@@ -3002,6 +2970,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e98a7e119cd347f4201e1159b19831029e203e2d8b790547708e8157b4acf1e"
 dependencies = [
  "deadpool-runtime 0.3.1",
+ "serde",
  "tokio",
 ]
 
@@ -3025,6 +2994,7 @@ dependencies = [
  "async-trait",
  "deadpool 0.13.1",
  "getrandom 0.4.3",
+ "serde",
  "tokio",
  "tokio-postgres",
  "tracing",
@@ -3451,8 +3421,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
- "aws-credential-types",
- "aws-sdk-dynamodb",
  "aws-sdk-s3tables",
  "bytes",
  "catalog",
@@ -6165,6 +6133,8 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
 ]
 
 [[package]]
@@ -7132,18 +7102,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_dynamo"
-version = "4.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "873a97c3f7a67dd042bceb47d056d288424b82d4c66b0a25e1a3b34675620951"
-dependencies = [
- "aws-sdk-dynamodb",
- "base64 0.21.7",
- "serde",
- "serde_core",
-]
-
-[[package]]
 name = "serde_json"
 version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7496,18 +7454,16 @@ name = "state-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-dynamodb",
  "chrono",
+ "deadpool-postgres",
  "error-stack",
  "error-stack-trace",
  "mockall",
  "serde",
- "serde_dynamo",
  "serde_json",
  "snafu",
  "tokio",
+ "tokio-postgres",
  "uuid",
  "xxhash-rust",
 ]

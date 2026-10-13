@@ -1,11 +1,4 @@
 #![allow(unused_assignments)]
-use aws_sdk_dynamodb::config::http::HttpResponse;
-use aws_sdk_dynamodb::error::SdkError;
-use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
-use aws_sdk_dynamodb::operation::get_item::GetItemError;
-use aws_sdk_dynamodb::operation::put_item::PutItemError;
-use aws_sdk_dynamodb::operation::query::QueryError;
-use serde_dynamo::Error as SerdeDynamoError;
 use snafu::{Location, Snafu};
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -24,59 +17,43 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Dynamodb get item error: {error}"))]
-    DynamoDbGetItem {
-        #[snafu(source(from(SdkError<GetItemError, HttpResponse>, Box::new)))]
-        error: Box<SdkError<GetItemError, HttpResponse>>,
+    #[snafu(display("Postgres pool build error: {error}"))]
+    PgPoolBuild {
+        #[snafu(source(from(deadpool_postgres::BuildError, Box::new)))]
+        error: Box<deadpool_postgres::BuildError>,
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Dynamodb put item error: {error}"))]
-    DynamoDbPutItem {
-        #[snafu(source(from(SdkError<PutItemError, HttpResponse>, Box::new)))]
-        error: Box<SdkError<PutItemError, HttpResponse>>,
+    #[snafu(display("Postgres pool error: {error}"))]
+    PgPool {
+        #[snafu(source(from(deadpool_postgres::PoolError, Box::new)))]
+        error: Box<deadpool_postgres::PoolError>,
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Dynamodb delete item error: {error}"))]
-    DynamoDbDeleteItem {
-        #[snafu(source(from(SdkError<DeleteItemError, HttpResponse>, Box::new)))]
-        error: Box<SdkError<DeleteItemError, HttpResponse>>,
+    #[snafu(display("Postgres error: {error}"))]
+    Pg {
+        #[snafu(source(from(tokio_postgres::Error, Box::new)))]
+        error: Box<tokio_postgres::Error>,
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Dynamodb query error: {error}"))]
-    DynamoDbQueryOutput {
-        #[snafu(source(from(SdkError<QueryError, HttpResponse>, Box::new)))]
-        error: Box<SdkError<QueryError, HttpResponse>>,
-        #[snafu(implicit)]
-        location: Location,
-    },
-    #[snafu(display("Dynamodb query error: {error}"))]
-    DynamoDbCredentialsError {
-        #[snafu(source(from(aws_credential_types::provider::error::CredentialsError, Box::new)))]
-        error: Box<aws_credential_types::provider::error::CredentialsError>,
-        #[snafu(implicit)]
-        location: Location,
-    },
-    #[snafu(display("Failed to serialize DynamoDB item: {error}"))]
-    FailedToSerializeDynamo {
+    #[snafu(display("Failed to serialize DB record: {error}"))]
+    FailedToSerializeRecord {
         #[snafu(source)]
-        error: SerdeDynamoError,
+        error: serde_json::Error,
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Failed to deserialize DynamoDB item: {error}"))]
-    FailedToDeserializeDynamo {
+    #[snafu(display("Failed to deserialize DB record: {error}"))]
+    FailedToDeserializeRecord {
         #[snafu(source)]
-        error: SerdeDynamoError,
+        error: serde_json::Error,
         #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("item not found"))]
     NotFound,
-    #[snafu(display("data attribute missing from DynamoDB item"))]
-    MissingData,
     #[snafu(display("invalid time: {value}"))]
     InvalidTime { value: String },
 }

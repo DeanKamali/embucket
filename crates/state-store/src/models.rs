@@ -44,7 +44,7 @@ impl Display for ExecutionStatus {
     }
 }
 
-/// Session entity persisted in `DynamoDB`.
+/// Session entity persisted in the durable state store (Postgres).
 ///
 /// This record is the durable representation of a session: it survives process
 /// restarts so that a reconnecting client can be rehydrated on any

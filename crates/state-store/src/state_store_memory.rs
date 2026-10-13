@@ -1,6 +1,6 @@
 //! In-memory [`StateStore`] implementation.
 //!
-//! Intended for tests and local development where no `DynamoDB` is available.
+//! Intended for tests and local development where no durable store is available.
 //! Data is lost when the instance is dropped, which is exactly the semantics
 //! of "no externalized state".
 

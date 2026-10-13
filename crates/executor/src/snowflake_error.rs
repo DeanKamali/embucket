@@ -285,14 +285,10 @@ fn catalog_error(error: &CatalogError, subtext: &[&str]) -> SnowflakeError {
 fn state_store_error(error: &StateStoreError, subtext: &[&str]) -> SnowflakeError {
     let subtext = [subtext, &["StateStore"]].concat();
     let message = match error {
-        StateStoreError::DynamoDbPutItem { error, .. } => {
-            aws_sdk_error_message("DynamoDB put", error)
-        }
-        StateStoreError::DynamoDbGetItem { error, .. } => {
-            aws_sdk_error_message("DynamoDB get", error)
-        }
-        StateStoreError::DynamoDbDeleteItem { error, .. } => {
-            aws_sdk_error_message("DynamoDB delete", error)
+        StateStoreError::Pg { error, .. } => format!("Postgres error: {error}"),
+        StateStoreError::PgPool { error, .. } => format!("Postgres pool error: {error}"),
+        StateStoreError::PgPoolBuild { error, .. } => {
+            format!("Postgres pool build error: {error}")
         }
         _ => error.to_string(),
     };

@@ -39,7 +39,7 @@ use crate::utils::{Config, MemPoolType};
 use catalog::catalog_list::EmbucketCatalogList;
 use catalog_metastore::{InMemoryMetastore, Metastore, TableIdent as MetastoreTableIdent};
 #[cfg(feature = "state-store")]
-use state_store::{DynamoDbStateStore, StateStore, models::Query};
+use state_store::{PostgresStateStore, StateStore, models::Query};
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 use tracing::Instrument;
@@ -200,7 +200,7 @@ impl CoreExecutionService {
         let catalog_list = Self::catalog_list(metastore.clone(), &config).await?;
         let runtime_env = Self::runtime_env(&config, catalog_list.clone())?;
         #[cfg(feature = "state-store")]
-        let state_store = DynamoDbStateStore::new_from_env()
+        let state_store = PostgresStateStore::new_from_env()
             .await
             .context(ex_error::StateStoreSnafu)?;
         Ok(Self {

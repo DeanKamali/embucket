@@ -549,15 +549,24 @@ impl UserQuery {
         mut subquery: Box<Query>,
     ) -> Result<QueryResult> {
         self.traverse_and_update_query(subquery.as_mut()).await;
+        let text = subquery.to_string();
         // Avalanche (design §6.3, v1 heuristic): a top-level SELECT with a
         // warehouse in scope runs on that warehouse's Ballista cluster.
         // Everything else (internal lookups, metadata, writes) stays local.
-        if let Some(scheduler_url) = self.session.warehouse_scheduler_url().await {
+        //
+        // Session-local table functions (WAREHOUSE_METERING_HISTORY, M5)
+        // read the router's in-memory metering ledger — never ship them to
+        // the cluster (their MemTable plan is not Ballista-serializable).
+        let scheduler_url = match self.session.warehouse_scheduler_url().await {
+            Some(url) if !is_session_local_table_function(&text) => Some(url),
+            _ => None,
+        };
+        if let Some(scheduler_url) = scheduler_url {
             return self
-                .execute_with_custom_plan_target(&subquery.to_string(), Some(scheduler_url))
+                .execute_with_custom_plan_target(&text, Some(scheduler_url))
                 .await;
         }
-        Box::pin(self.execute_with_custom_plan(&subquery.to_string())).await
+        Box::pin(self.execute_with_custom_plan(&text)).await
     }
 
     #[instrument(
@@ -3370,6 +3379,13 @@ fn build_target_schema(base_schema: &ArrowSchema) -> ArrowSchema {
     builder.push(Field::new(DATA_FILE_PATH_COLUMN, DataType::Utf8, true));
     builder.push(Field::new(MANIFEST_FILE_PATH_COLUMN, DataType::Utf8, true));
     builder.finish()
+}
+
+/// Queries referencing these table functions run locally regardless of the
+/// session warehouse: they read router-side session state (e.g. the M5
+/// metering ledger) that does not exist on warehouse compute.
+fn is_session_local_table_function(sql: &str) -> bool {
+    sql.to_ascii_lowercase().contains("warehouse_metering_history")
 }
 
 /// Converts merge clauses into projection expressions for copy-on-write operations.

@@ -11,7 +11,7 @@ use crate::error::{
     Error, FailedToDeserializeRecordSnafu, FailedToSerializeRecordSnafu, PgPoolBuildSnafu,
     PgPoolSnafu, PgSnafu, Result,
 };
-use crate::models::{Query, SessionRecord, WarehouseRecord};
+use crate::models::{Query, SessionRecord, WarehouseMeteringRecord, WarehouseRecord};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -63,31 +63,44 @@ impl PostgresStateStore {
     }
 
     async fn ensure_tables(&self) -> Result<()> {
-        let client = self.client().await?;
-        client
-            .batch_execute(
-                "CREATE TABLE IF NOT EXISTS state_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    record JSONB NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS state_queries (
-                    query_id TEXT PRIMARY KEY,
-                    request_id TEXT,
-                    session_id TEXT NOT NULL,
-                    record JSONB NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS state_warehouses (
-                    name TEXT PRIMARY KEY,
-                    record JSONB NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS state_queries_session_id
-                    ON state_queries (session_id);
-                CREATE INDEX IF NOT EXISTS state_queries_request_id
-                    ON state_queries (request_id)
-                    WHERE request_id IS NOT NULL;",
-            )
-            .await
-            .context(PgSnafu)
+        let mut client = self.client().await?;
+        // Serialize schema setup across processes/instances: concurrent
+        // `CREATE TABLE IF NOT EXISTS` races in Postgres (both connections
+        // pass the existence check, one hits a pg_type unique violation).
+        // Transaction-scoped advisory lock auto-releases on error/commit.
+        let mut tx = client.transaction().await.context(PgSnafu)?;
+        tx.batch_execute(
+            "SELECT pg_advisory_xact_lock(hashtext('embucket-state-store-schema'));
+             CREATE TABLE IF NOT EXISTS state_sessions (
+                session_id TEXT PRIMARY KEY,
+                record JSONB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS state_queries (
+                query_id TEXT PRIMARY KEY,
+                request_id TEXT,
+                session_id TEXT NOT NULL,
+                record JSONB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS state_warehouses (
+                name TEXT PRIMARY KEY,
+                record JSONB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS state_metering (
+                bucket_key TEXT PRIMARY KEY,
+                warehouse TEXT NOT NULL,
+                record JSONB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS state_metering_warehouse
+                ON state_metering (warehouse);
+            CREATE INDEX IF NOT EXISTS state_queries_session_id
+                ON state_queries (session_id);
+            CREATE INDEX IF NOT EXISTS state_queries_request_id
+                ON state_queries (request_id)
+                WHERE request_id IS NOT NULL;",
+        )
+        .await
+        .context(PgSnafu)?;
+        tx.commit().await.context(PgSnafu)
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Client> {
@@ -277,6 +290,49 @@ impl StateStore for PostgresStateStore {
             .context(PgSnafu)?;
         Ok(())
     }
+
+    async fn put_metering(&self, record: WarehouseMeteringRecord) -> Result<()> {
+        // Explicit SQL: the `warehouse` column is NOT NULL and the generic
+        // `upsert` helper only writes the key + record.
+        let json = serde_json::to_value(&record).context(FailedToSerializeRecordSnafu)?;
+        let client = self.client().await?;
+        let sql = "INSERT INTO state_metering (bucket_key, warehouse, record) \
+                   VALUES ($1, $2, $3) \
+                   ON CONFLICT (bucket_key) DO UPDATE SET record = EXCLUDED.record";
+        client
+            .execute(sql, &[&record.bucket_key(), &record.warehouse, &json])
+            .await
+            .context(PgSnafu)?;
+        Ok(())
+    }
+
+    async fn list_metering<'a>(
+        &self,
+        warehouse: Option<&'a str>,
+    ) -> Result<Vec<WarehouseMeteringRecord>> {
+        let client = self.client().await?;
+        let (sql, param): (&str, String) = match warehouse {
+            Some(name) => (
+                "SELECT record FROM state_metering WHERE warehouse = $1",
+                name.to_string(),
+            ),
+            None => ("SELECT record FROM state_metering", String::new()),
+        };
+        let rows = if warehouse.is_some() {
+            client.query(sql, &[&param]).await.context(PgSnafu)?
+        } else {
+            client.query(sql, &[]).await.context(PgSnafu)?
+        };
+        let mut records: Vec<WarehouseMeteringRecord> = rows
+            .into_iter()
+            .map(|row| {
+                let json: serde_json::Value = row.try_get("record").context(PgSnafu)?;
+                serde_json::from_value(json).context(FailedToDeserializeRecordSnafu)
+            })
+            .collect::<Result<_>>()?;
+        records.sort_by_key(|record| (record.start_time, record.warehouse.clone()));
+        Ok(records)
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +414,38 @@ mod tests {
             .await
             .expect("delete_query");
         assert!(store.get_query(&query_id.to_string()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_metering_round_trip() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let record = WarehouseMeteringRecord {
+            warehouse: "M5PGTEST".to_string(),
+            start_time: 1_760_000_000,
+            end_time: 1_760_003_600,
+            executor_count: 1,
+            credits_used: 0.5,
+        };
+        store.put_metering(record.clone()).await.expect("put_metering");
+
+        let filtered = store
+            .list_metering(Some("M5PGTEST"))
+            .await
+            .expect("list_metering");
+        assert_eq!(filtered.len(), 1);
+        assert!((filtered[0].credits_used - 0.5).abs() < 1e-9);
+
+        let mut updated = record;
+        updated.credits_used = 0.9;
+        store.put_metering(updated).await.expect("put_metering 2");
+        let filtered = store
+            .list_metering(Some("M5PGTEST"))
+            .await
+            .expect("list_metering 2");
+        assert_eq!(filtered.len(), 1);
+        assert!((filtered[0].credits_used - 0.9).abs() < 1e-9);
     }
 
     // Silence unused warning for HashMap import used by doc example above.

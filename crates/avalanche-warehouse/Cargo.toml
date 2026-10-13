@@ -7,6 +7,7 @@ license-file = { workspace = true }
 [dependencies]
 state-store = { path = "../state-store" }
 async-trait = { workspace = true }
+datafusion = { workspace = true }
 serde = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true }

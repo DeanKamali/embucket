@@ -9,6 +9,7 @@ use crate::error::{
     AlreadyExistsSnafu, InvalidAutoSuspendSnafu, InvalidSizeSnafu, NotFoundSnafu, Result,
     StateStoreSnafu,
 };
+use crate::metering::MeteringLedger;
 use crate::model::{Warehouse, WarehouseSize, WarehouseState};
 use snafu::ResultExt;
 use state_store::StateStore;
@@ -73,6 +74,11 @@ pub struct WarehouseManager {
     network: Option<String>,
     /// Last query activity per warehouse, for auto-suspend.
     last_activity: Mutex<HashMap<String, Instant>>,
+    /// Executor-seconds metering (M5).
+    pub(crate) ledger: Arc<MeteringLedger>,
+    /// Epoch seconds when the warehouse's current RUNNING window began
+    /// (last resume/create). Used to bill running time on suspend/drop.
+    running_since: Mutex<HashMap<String, u64>>,
 }
 
 const INTERNAL_SCHEDULER_PORT: u16 = 50050;
@@ -85,11 +91,37 @@ impl WarehouseManager {
         network: Option<String>,
     ) -> Self {
         Self {
-            state_store,
+            state_store: state_store.clone(),
             driver,
             images,
             network,
             last_activity: Mutex::new(HashMap::new()),
+            ledger: Arc::new(MeteringLedger::new(state_store)),
+            running_since: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Metering ledger (executor-seconds buckets) backing
+    /// `WAREHOUSE_METERING_HISTORY`.
+    #[must_use]
+    pub fn metering(&self) -> Arc<MeteringLedger> {
+        Arc::clone(&self.ledger)
+    }
+
+    /// Case-tolerant record lookup (session variables may differ in case
+    /// from the stored key): `USE WAREHOUSE etl` vs stored `ETL`.
+    pub async fn find_record(&self, name: &str) -> Option<WarehouseRecord> {
+        match self.record(name).await {
+            Ok(record) => Some(record),
+            Err(_) => self.record(&name.to_ascii_uppercase()).await.ok(),
+        }
+    }
+
+    /// Load persisted metering history into the ledger. Call once at startup
+    /// (best-effort: failures are logged and ignored).
+    pub async fn load_metering(&self) {
+        if let Err(err) = self.ledger.load().await {
+            tracing::warn!(%err, "failed to load metering history");
         }
     }
 
@@ -173,6 +205,10 @@ impl WarehouseManager {
             size,
             self.state(name).await? == WarehouseState::Running,
         ) {
+            // Bill the elapsed window before re-provisioning (at the new
+            // count — close enough for the partial window).
+            self.accrue_running_window(name, size.executor_count())
+                .await;
             self.start_compute(name, size, WarehouseState::Running)
                 .await?;
         }
@@ -182,13 +218,14 @@ impl WarehouseManager {
     pub async fn suspend(&self, name: &str) -> Result<Warehouse> {
         let record = self.record(name).await?;
         if self.state(name).await? == WarehouseState::Running {
-            for i in 0..WarehouseSize::parse(&record.size)
-                .ok_or_else(|| InvalidSizeSnafu {
-                    size: record.size.clone(),
-                }
-                .build())?
-                .executor_count()
-            {
+            let size = WarehouseSize::parse(&record.size).ok_or_else(|| InvalidSizeSnafu {
+                size: record.size.clone(),
+            }
+            .build())?;
+            // Bill the running window before the executors go down (M5).
+            self.accrue_running_window(&record.name, size.executor_count())
+                .await;
+            for i in 0..size.executor_count() {
                 self.driver
                     .stop(&executor_container_name(name, i))
                     .await?;
@@ -221,10 +258,10 @@ impl WarehouseManager {
     pub async fn scheduler_url(&self, name: &str) -> Result<String> {
         // resolve the record's exact key: session variables may differ in
         // case (`USE WAREHOUSE etl` vs stored `ETL`)
-        let record = match self.record(name).await {
-            Ok(record) => record,
-            Err(_) => self.record(&name.to_ascii_uppercase()).await?,
-        };
+        let record = self
+            .find_record(name)
+            .await
+            .ok_or_else(|| NotFoundSnafu { name: name.to_string() }.build())?;
         let port = record.scheduler_host_port.ok_or_else(|| {
             NotFoundSnafu {
                 name: record.name.clone(),
@@ -236,6 +273,14 @@ impl WarehouseManager {
 
     pub async fn drop_warehouse(&self, name: &str) -> Result<()> {
         let record = self.record(name).await?;
+        // Bill the running window before teardown (M5).
+        if matches!(self.state(name).await, Ok(WarehouseState::Running))
+            && let Some(size) = WarehouseSize::parse(&record.size)
+        {
+            self.accrue_running_window(&record.name, size.executor_count())
+                .await;
+            self.running_since.lock().await.remove(name);
+        }
         // stop executors regardless of state; stop scheduler too (full teardown)
         if let Some(size) = WarehouseSize::parse(&record.size) {
             for i in 0..size.executor_count() {
@@ -292,13 +337,9 @@ impl WarehouseManager {
     pub async fn ensure_running(&self, name: &str) {
         // resolve the record's exact key: session variables may differ in
         // case (`USE WAREHOUSE etl` vs stored `ETL`)
-        let record = match self.record(name).await {
-            Ok(record) => record,
-            Err(_) => match self.record(&name.to_ascii_uppercase()).await {
-                Ok(record) => record,
-                // not a managed warehouse — nothing to do
-                Err(_) => return,
-            },
+        let Some(record) = self.find_record(name).await else {
+            // not a managed warehouse — nothing to do
+            return;
         };
         self.touch(&record.name).await;
         let state = WarehouseState::parse(&record.state).unwrap_or(WarehouseState::Stopped);
@@ -343,6 +384,18 @@ impl WarehouseManager {
             for warehouse in self.list().await? {
                 if warehouse.state != WarehouseState::Running {
                     continue;
+                }
+                // Metering: bill the running window incrementally each tick
+                // (M5). Also adopts RUNNING warehouses found after a process
+                // restart (no window start yet — start billing from now).
+                if !self.running_since.lock().await.contains_key(&warehouse.name) {
+                    self.running_since
+                        .lock()
+                        .await
+                        .insert(warehouse.name.clone(), now_secs());
+                } else {
+                    self.accrue_running_window(&warehouse.name, warehouse.executor_count())
+                        .await;
                 }
                 let Some(auto_suspend) = warehouse.auto_suspend_secs.filter(|s| *s > 0) else {
                     continue;
@@ -435,7 +488,32 @@ impl WarehouseManager {
         }
 
         self.set_state(name, state).await?;
+        if state == WarehouseState::Running {
+            // Begin (or restart) the billed running window (M5 metering).
+            self.running_since
+                .lock()
+                .await
+                .insert(name.to_string(), now_secs());
+        }
         Ok(())
+    }
+
+    /// Bill `running_since → now` for a RUNNING warehouse at
+    /// `executor_count` credits/hour, then reset the window start. No-op when
+    /// the warehouse isn't running or the window is empty. Best-effort:
+    /// metering failures must never break warehouse lifecycle.
+    async fn accrue_running_window(&self, name: &str, executor_count: u32) {
+        let window_start = self.running_since.lock().await.get(name).copied();
+        let Some(start) = window_start else {
+            return;
+        };
+        let now = now_secs();
+        if now > start && executor_count > 0
+            && let Err(err) = self.ledger.accrue(name, executor_count, start, now).await
+        {
+            tracing::warn!(warehouse = name, %err, "metering accrual failed");
+        }
+        self.running_since.lock().await.insert(name.to_string(), now);
     }
 
     async fn record(&self, name: &str) -> Result<WarehouseRecord> {

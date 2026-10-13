@@ -21,3 +21,8 @@ metastore.yaml
 metastore.yaml
 docs/superpowers/
 *.pending-snap
+
+# test artifacts: insta pending snapshots + stray docker volume mounts from
+# file:/// locations resolved relative to the process cwd
+*.snap.new
+/file:

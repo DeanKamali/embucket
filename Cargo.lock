@@ -871,6 +871,7 @@ name = "avalanche-warehouse"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "datafusion",
  "serde",
  "snafu",
  "state-store",

@@ -15,7 +15,7 @@ use crate::query::UserQuery;
 use crate::query_types::QueryId;
 use crate::running_queries::RunningQueries;
 use crate::utils::Config;
-use avalanche_warehouse::WarehouseManager;
+use avalanche_warehouse::{MeteringHistoryTableFunc, WarehouseManager};
 use catalog::catalog_list::{DEFAULT_CATALOG, EmbucketCatalogList};
 use catalog_metastore::Metastore;
 #[cfg(feature = "state-store")]
@@ -161,6 +161,12 @@ impl UserSession {
         register_udfs(&mut ctx, &session_params_arc).context(ex_error::RegisterUDFSnafu)?;
         register_udafs(&mut ctx).context(ex_error::RegisterUDAFSnafu)?;
         register_udtfs(&ctx);
+        // metering history table function (M5) — reads the warehouse
+        // manager's executor-seconds ledger
+        ctx.register_udtf(
+            "warehouse_metering_history",
+            Arc::new(MeteringHistoryTableFunc::new(warehouse.metering())),
+        );
         register_json_udfs(&mut ctx).context(ex_error::RegisterUDFSnafu)?;
         //register_geo_native(&ctx);
         //register_geo_udfs(&ctx);
@@ -399,6 +405,13 @@ impl UserSession {
                 tracing::debug!(%err, warehouse, "no scheduler url for warehouse; running locally");
             })
             .ok()
+    }
+
+    /// Current warehouse name from the session variable (`USE WAREHOUSE` /
+    /// login), if any — used to stamp query records (M5).
+    #[must_use]
+    pub fn current_warehouse_name(&self) -> Option<String> {
+        self.get_session_variable("warehouse")
     }
 
     #[must_use]

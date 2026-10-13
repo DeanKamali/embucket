@@ -241,6 +241,8 @@ impl CoreExecutionService {
             build_warehouse_manager(Arc::new(state_store::InMemoryStateStore::new()), None);
         // auto-suspend idle warehouses (design §5)
         warehouse.clone().spawn_auto_suspend(60);
+        // metering history from prior runs (M5); logs and continues on failure
+        warehouse.load_metering().await;
         Ok(Self {
             metastore,
             df_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -795,6 +797,17 @@ impl ExecutionService for CoreExecutionService {
                     // effective database/schema at planning/execution time
                     query.set_database_name(query_obj.current_database());
                     query.set_schema_name(query_obj.current_schema());
+                    // effective warehouse at planning/execution time (M5):
+                    // real warehouse_* fields on the query record
+                    if let Some(warehouse_name) = query_obj.session.current_warehouse_name()
+                        && let Some(record) = query_obj.session.warehouse.find_record(&warehouse_name).await
+                    {
+                        query.set_warehouse_name(record.name);
+                        query.set_warehouse_size(record.size);
+                        if query.warehouse_type.is_none() {
+                            query.set_warehouse_type("STANDARD".to_string());
+                        }
+                    }
                 }
 
                 // Create nested task so in case of abort/timeout it can be aborted

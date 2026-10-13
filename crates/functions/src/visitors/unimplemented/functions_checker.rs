@@ -32,6 +32,11 @@ impl std::error::Error for UnimplementedFunctionError {}
 
 pub struct UnimplementedFunctionsChecker;
 
+/// Functions that are in the generated unimplemented registry but ARE
+/// implemented (as session-registered table functions) — the checker must
+/// not reject them.
+const IMPLEMENTED_TABLE_FUNCTIONS: &[&str] = &["WAREHOUSE_METERING_HISTORY"];
+
 impl VisitorMut for UnimplementedFunctionsChecker {
     type Break = UnimplementedFunctionError;
 
@@ -40,7 +45,9 @@ impl VisitorMut for UnimplementedFunctionsChecker {
             let func_name = func.name.to_string().to_uppercase();
             let snowflake_functions = get_snowflake_functions();
 
-            if snowflake_functions.is_unimplemented(&func_name) {
+            if !IMPLEMENTED_TABLE_FUNCTIONS.contains(&func_name.as_str())
+                && snowflake_functions.is_unimplemented(&func_name)
+            {
                 let details = snowflake_functions
                     .get_function_info(&func_name)
                     .and_then(|info| {

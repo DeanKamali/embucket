@@ -7,7 +7,8 @@ pub mod state_store_pg;
 pub use config::PgConfig;
 pub use error::{Error, Result};
 pub use models::{
-    ExecutionStatus, Query, QueryMetric, SessionRecord, Variable, ViewRecord, WarehouseRecord,
+    ExecutionStatus, Query, QueryMetric, SessionRecord, Variable, ViewRecord, WarehouseMeteringRecord,
+    WarehouseRecord,
 };
 pub use state_store_memory::InMemoryStateStore;
 pub use state_store_pg::PostgresStateStore;
@@ -31,4 +32,13 @@ pub trait StateStore: Send + Sync {
     async fn get_warehouse(&self, name: &str) -> Result<WarehouseRecord>;
     async fn list_warehouses(&self) -> Result<Vec<WarehouseRecord>>;
     async fn delete_warehouse(&self, name: &str) -> Result<()>;
+
+    /// Store one metering bucket (full replace of the bucket).
+    async fn put_metering(&self, record: WarehouseMeteringRecord) -> Result<()>;
+    /// List metering buckets, optionally filtered by warehouse, ordered by
+    /// start time.
+    async fn list_metering<'a>(
+        &self,
+        warehouse: Option<&'a str>,
+    ) -> Result<Vec<WarehouseMeteringRecord>>;
 }

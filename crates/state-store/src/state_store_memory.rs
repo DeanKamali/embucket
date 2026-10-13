@@ -7,7 +7,7 @@
 use crate::StateStore;
 use crate::error::Error;
 use crate::error::Result;
-use crate::models::{Query, SessionRecord, WarehouseRecord};
+use crate::models::{Query, SessionRecord, WarehouseMeteringRecord, WarehouseRecord};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -19,6 +19,7 @@ pub struct InMemoryStateStore {
     queries: Arc<RwLock<HashMap<String, Query>>>,
     queries_by_request_id: Arc<RwLock<HashMap<String, String>>>,
     warehouses: Arc<RwLock<HashMap<String, WarehouseRecord>>>,
+    metering: Arc<RwLock<HashMap<String, WarehouseMeteringRecord>>>,
 }
 
 impl InMemoryStateStore {
@@ -141,6 +142,28 @@ impl StateStore for InMemoryStateStore {
         self.warehouses.write().await.remove(name);
         Ok(())
     }
+
+    async fn put_metering(&self, record: WarehouseMeteringRecord) -> Result<()> {
+        self.metering
+            .write()
+            .await
+            .insert(record.bucket_key(), record);
+        Ok(())
+    }
+
+    async fn list_metering<'a>(
+        &self,
+        warehouse: Option<&'a str>,
+    ) -> Result<Vec<WarehouseMeteringRecord>> {
+        let metering = self.metering.read().await;
+        let mut records: Vec<WarehouseMeteringRecord> = metering
+            .values()
+            .filter(|record| warehouse.is_none_or(|name| record.warehouse == name))
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| (record.start_time, record.warehouse.clone()));
+        Ok(records)
+    }
 }
 
 #[cfg(test)]
@@ -206,5 +229,37 @@ mod tests {
             .await
             .expect("delete_query");
         assert!(store.get_query(&query_id.to_string()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_metering_round_trip() {
+        let store = InMemoryStateStore::new();
+        let record = WarehouseMeteringRecord {
+            warehouse: "M4WH".to_string(),
+            start_time: 1_760_000_000,
+            end_time: 1_760_003_600,
+            executor_count: 2,
+            credits_used: 0.75,
+        };
+        store.put_metering(record.clone()).await.expect("put_metering");
+
+        let all = store.list_metering(None).await.expect("list_metering");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].warehouse, "M4WH");
+        assert!((all[0].credits_used - 0.75).abs() < 1e-9);
+
+        let filtered = store
+            .list_metering(Some("m4wh"))
+            .await
+            .expect("list_metering filtered");
+        assert!(filtered.is_empty(), "filter is exact-match on name");
+
+        // full-bucket replace: same key overwrites
+        let mut updated = record.clone();
+        updated.credits_used = 1.25;
+        store.put_metering(updated).await.expect("put_metering 2");
+        let all = store.list_metering(Some("M4WH")).await.expect("list 2");
+        assert_eq!(all.len(), 1);
+        assert!((all[0].credits_used - 1.25).abs() < 1e-9);
     }
 }

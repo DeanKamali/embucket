@@ -60,7 +60,7 @@ impl VisitorMut for TableFunctionVisitor {
                         let func_name = name.to_string();
                         if matches!(
                             func_name.to_lowercase().as_str(),
-                            "result_scan" | "flatten"
+                            "result_scan" | "flatten" | "warehouse_metering_history"
                         ) {
                             item.relation = TableFactor::Function {
                                 name: name.clone(),

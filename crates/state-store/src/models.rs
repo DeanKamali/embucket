@@ -85,6 +85,34 @@ impl WarehouseRecord {
     }
 }
 
+/// Per-hour credit usage for one warehouse (Avalanche design §5 metering).
+///
+/// Mirrors one row of Snowflake's `WAREHOUSE_METERING_HISTORY`: usage is
+/// aggregated into hourly buckets (`start_time`..`end_time`), with
+/// `credits_used` = executor-seconds × executor-count / 3600. A warehouse
+/// resize mid-hour produces a separate row per executor count.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WarehouseMeteringRecord {
+    pub warehouse: String,
+    /// Hour-bucket start, seconds since UNIX epoch.
+    pub start_time: u64,
+    /// Hour-bucket end (`start_time + 3600`).
+    pub end_time: u64,
+    /// Executor count (size factor) during this bucket slice.
+    pub executor_count: u32,
+    /// Accrued credits in this bucket slice.
+    pub credits_used: f64,
+}
+
+impl WarehouseMeteringRecord {
+    /// Bucket key used as the durable store's primary key: one row per
+    /// (warehouse, hour, executor count).
+    #[must_use]
+    pub fn bucket_key(&self) -> String {
+        format!("{}:{}:{}", self.warehouse, self.start_time, self.executor_count)
+    }
+}
+
 /// Session entity persisted in the durable state store (Postgres).
 ///
 /// This record is the durable representation of a session: it survives process
@@ -415,6 +443,14 @@ impl Query {
 
     pub fn set_warehouse_type(&mut self, warehouse_type: String) {
         self.warehouse_type = Some(warehouse_type);
+    }
+
+    pub fn set_warehouse_name(&mut self, warehouse_name: String) {
+        self.warehouse_name = Some(warehouse_name);
+    }
+
+    pub fn set_warehouse_size(&mut self, warehouse_size: String) {
+        self.warehouse_size = Some(warehouse_size);
     }
 
     pub fn set_release_version(&mut self, release_version: String) {

@@ -8,7 +8,9 @@ use crate::error::{ContainerDriverSnafu, Result};
 use async_trait::async_trait;
 
 pub mod fake;
+pub mod k8s;
 pub use fake::FakeDriver;
+pub use k8s::KubectlDriver;
 
 /// One compute process of a warehouse (scheduler or single executor).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,22 @@ pub trait ContainerDriver: Send + Sync {
 
     /// True if a container with this name exists (running or stopped).
     async fn exists(&self, name: &str) -> Result<bool>;
+
+    /// Address the host-side Ballista client dials for a warehouse's
+    /// scheduler. Default: docker-style mapped host port on loopback
+    /// (embucketd runs on the docker host). Cluster drivers override this —
+    /// e.g. the k8s driver dials the scheduler pod IP directly.
+    async fn scheduler_url(&self, _warehouse: &str, host_port: Option<u16>) -> Result<String> {
+        let _ = _warehouse;
+        let port = host_port.ok_or_else(|| {
+            ContainerDriverSnafu {
+                message: "scheduler host port not allocated".to_string(),
+                detail: "warehouse record has no scheduler_host_port".to_string(),
+            }
+            .build()
+        })?;
+        Ok(format!("http://127.0.0.1:{port}"))
+    }
 }
 
 /// Runs containers through the local `docker` CLI.

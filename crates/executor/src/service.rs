@@ -36,7 +36,9 @@ use crate::running_queries::RunningQueryId;
 use crate::session::{SESSION_INACTIVITY_EXPIRATION_SECONDS, to_unix};
 use crate::tracing::SpanTracer;
 use crate::utils::{Config, MemPoolType};
-use avalanche_warehouse::{BallistaImages, DockerCliDriver, FakeDriver, WarehouseManager};
+use avalanche_warehouse::{
+    BallistaImages, ContainerDriver, DockerCliDriver, FakeDriver, KubectlDriver, WarehouseManager,
+};
 use catalog::catalog_list::EmbucketCatalogList;
 use catalog_metastore::{InMemoryMetastore, Metastore, TableIdent as MetastoreTableIdent};
 use state_store::StateStore;
@@ -175,9 +177,17 @@ fn build_warehouse_manager(
     state_store: Arc<dyn StateStore>,
     network: Option<String>,
 ) -> Arc<WarehouseManager> {
+    // `WAREHOUSE_DRIVER=k8s` runs warehouse compute as k8s pods (kubectl);
+    // default is the local Docker CLI driver.
+    let k8s = std::env::var("WAREHOUSE_DRIVER").is_ok_and(|v| v.eq_ignore_ascii_case("k8s"));
+    let driver: Arc<dyn ContainerDriver> = if k8s {
+        Arc::new(KubectlDriver::from_env())
+    } else {
+        Arc::new(DockerCliDriver::default())
+    };
     Arc::new(WarehouseManager::new(
         state_store,
-        Arc::new(DockerCliDriver::default()),
+        driver,
         BallistaImages::from_env(),
         network,
     ))

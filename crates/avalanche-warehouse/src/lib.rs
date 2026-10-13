@@ -10,7 +10,9 @@ pub mod metering;
 pub mod metering_table_fn;
 pub mod model;
 
-pub use driver::{ContainerDriver, ContainerSpec, DockerCliDriver, FakeDriver};
+pub use driver::{
+    ContainerDriver, ContainerSpec, DockerCliDriver, FakeDriver, KubectlDriver,
+};
 pub use error::{Error, Result};
 pub use manager::{
     BallistaImages, CreateWarehouseRequest, WarehouseManager, executor_container_name,

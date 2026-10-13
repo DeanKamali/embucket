@@ -262,13 +262,11 @@ impl WarehouseManager {
             .find_record(name)
             .await
             .ok_or_else(|| NotFoundSnafu { name: name.to_string() }.build())?;
-        let port = record.scheduler_host_port.ok_or_else(|| {
-            NotFoundSnafu {
-                name: record.name.clone(),
-            }
-            .build()
-        })?;
-        Ok(format!("http://127.0.0.1:{port}"))
+        // docker driver: mapped host port on loopback; k8s driver: scheduler
+        // pod IP (re-resolved per call, so restarts don't leave stale URLs)
+        self.driver
+            .scheduler_url(&record.name, record.scheduler_host_port)
+            .await
     }
 
     pub async fn drop_warehouse(&self, name: &str) -> Result<()> {

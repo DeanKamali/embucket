@@ -21,6 +21,9 @@ pub struct ContainerSpec {
     pub args: Vec<String>,
     /// env var name → value
     pub env: Vec<(String, String)>,
+    /// host path → container path, bind-mounted read-only (M7.2 TLS
+    /// material; k8s driver renders hostPath volumes)
+    pub volumes: Vec<(String, String)>,
     /// host port → container port
     pub ports: Vec<(u16, u16)>,
     /// Docker network to attach the container to (container-name DNS).
@@ -116,6 +119,10 @@ impl ContainerDriver for DockerCliDriver {
         for (k, v) in &spec.env {
             args.push("--env".to_string());
             args.push(format!("{k}={v}"));
+        }
+        for (host, container) in &spec.volumes {
+            args.push("-v".to_string());
+            args.push(format!("{host}:{container}:ro"));
         }
         for (host, container) in &spec.ports {
             args.push("-p".to_string());

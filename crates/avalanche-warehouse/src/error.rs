@@ -25,4 +25,10 @@ pub enum Error {
     },
     #[snafu(display("Container driver error: {message}: {detail}"))]
     ContainerDriver { message: String, detail: String },
+    #[snafu(display("{message}"))]
+    Tls {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }

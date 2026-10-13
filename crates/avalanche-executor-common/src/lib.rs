@@ -12,10 +12,13 @@
 
 pub mod codecs;
 pub mod storage;
+pub mod tls;
 pub mod udf_registry;
 
 pub use codecs::{EmbucketLogicalExtensionCodec, EmbucketPhysicalExtensionCodec};
 pub use storage::{register_storage_in_session, runtime_env_from_env, s3_store_from_env};
+pub use tls::{TlsError, TlsMaterial, TLS_DIR_ENV};
+pub use tls::CONTAINER_TLS_DIR;
 pub use udf_registry::FunctionMaps;
 
 use std::sync::Arc;
@@ -49,13 +52,42 @@ pub fn upgrade_session_for_warehouse(
     state: SessionState,
     scheduler_url: impl Into<String>,
 ) -> datafusion_common::Result<SessionState> {
-    let config = state
+    let scheduler_url = scheduler_url.into();
+    let mut config = state
         .config()
         .clone()
         .with_ballista_logical_extension_codec(logical_codec())
         .with_ballista_physical_extension_codec(physical_codec());
+    // Mutual TLS (M7.2, design §13.2): an `https://` scheduler URL dials the
+    // scheduler and executors with a client identity and verifies servers
+    // against the CA in `AVALANCHE_TLS_DIR`. Query submits and task shuffle
+    // reads both honor these session-config knobs (ballista-core 55).
+    if scheduler_url.starts_with("https://") {
+        let dir = tls::TlsMaterial::dir_from_env().ok_or_else(|| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "warehouse scheduler URL is {scheduler_url} but {} is not set \
+                 on the router (mutual TLS material required)",
+                tls::TLS_DIR_ENV
+            ))
+        })?;
+        let material = tls::TlsMaterial::load(&dir).map_err(|e| {
+            datafusion_common::DataFusionError::Execution(e.to_string())
+        })?;
+        let client_tls = material.tonic_client_config().map_err(|e| {
+            datafusion_common::DataFusionError::Execution(e.to_string())
+        })?;
+        let endpoint_override: ballista_core::extension::EndpointOverrideFn =
+            Arc::new(move |endpoint| {
+                endpoint
+                    .tls_config(client_tls.clone())
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            });
+        config = config
+            .with_ballista_use_tls(true)
+            .with_ballista_override_create_grpc_client_endpoint(endpoint_override);
+    }
     let state = SessionStateBuilder::new_from_existing(state)
         .with_config(config)
         .build();
-    state.upgrade_for_ballista(scheduler_url.into())
+    state.upgrade_for_ballista(scheduler_url)
 }

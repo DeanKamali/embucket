@@ -32,6 +32,8 @@ pub enum WarehouseStatement {
         initially_suspended: bool,
         statement_timeout_secs: Option<u64>,
         storage_credentials: Option<StorageCredentials>,
+        /// `TLS = TRUE/FALSE` (M7.2).
+        tls: Option<bool>,
         if_not_exists: bool,
     },
     AlterSet {
@@ -41,6 +43,9 @@ pub enum WarehouseStatement {
         auto_resume: Option<bool>,
         statement_timeout_secs: Option<u64>,
         storage: Option<StorageOp>,
+        /// `SET/UNSET TLS` (M7.2): `Some(true/false)` sets, `Some(false)` is
+        /// equivalent to unset (plaintext).
+        tls: Option<bool>,
     },
     Suspend {
         name: String,
@@ -197,6 +202,7 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
         initially_suspended: false,
         statement_timeout_secs: None,
         storage_credentials: None,
+        tls: None,
         if_not_exists,
     };
     // option list: `WITH` keyword, then `KEY [=] VALUE` pairs
@@ -252,6 +258,13 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
                 } = &mut stmt
                 {
                     *initially_suspended = val.unwrap_or(true);
+                }
+                i = next_index(upper, i + 1);
+            }
+            "TLS" => {
+                let val = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_bool(v));
+                if let WarehouseStatement::Create { tls, .. } = &mut stmt {
+                    *tls = val;
                 }
                 i = next_index(upper, i + 1);
             }
@@ -385,7 +398,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
         Some("SUSPEND") => Some(WarehouseStatement::Suspend { name }),
         Some("RESUME") => Some(WarehouseStatement::Resume { name }),
         Some("UNSET") => {
-            // `ALTER WAREHOUSE wh UNSET STORAGE_CREDENTIALS`
+            // `ALTER WAREHOUSE wh UNSET STORAGE_CREDENTIALS | TLS`
             if upper.get(i + 1).map(String::as_str) == Some("STORAGE_CREDENTIALS") {
                 Some(WarehouseStatement::AlterSet {
                     name,
@@ -394,6 +407,17 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                     auto_resume: None,
                     statement_timeout_secs: None,
                     storage: Some(StorageOp::Unset),
+                    tls: None,
+                })
+            } else if upper.get(i + 1).map(String::as_str) == Some("TLS") {
+                Some(WarehouseStatement::AlterSet {
+                    name,
+                    size: None,
+                    auto_suspend_secs: None,
+                    auto_resume: None,
+                    statement_timeout_secs: None,
+                    storage: None,
+                    tls: Some(false),
                 })
             } else {
                 None
@@ -406,6 +430,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
             let mut auto_resume = None;
             let mut statement_timeout_secs = None;
             let mut storage = None;
+            let mut tls = None;
             while i < upper.len() {
                 match upper[i].as_str() {
                     "SIZE" | "WAREHOUSE_SIZE" => {
@@ -431,6 +456,9 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                         {
                             storage = Some(StorageOp::Unset);
                             i += 2;
+                        } else if upper.get(i + 1).map(String::as_str) == Some("TLS") {
+                            tls = Some(false);
+                            i += 2;
                         } else {
                             return None;
                         }
@@ -450,6 +478,10 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                             value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_u64(v));
                         i = next_index(upper, i + 1);
                     }
+                    "TLS" => {
+                        tls = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_bool(v));
+                        i = next_index(upper, i + 1);
+                    }
                     _ => return None,
                 }
             }
@@ -460,6 +492,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                 auto_resume,
                 statement_timeout_secs,
                 storage,
+                tls,
             })
         }
         _ => None,
@@ -496,6 +529,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             initially_suspended,
             statement_timeout_secs,
             storage_credentials,
+            tls,
             if_not_exists,
         } => {
             if manager.get(name).await.is_ok() {
@@ -512,6 +546,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
                 initially_suspended: *initially_suspended,
                 statement_timeout_secs: *statement_timeout_secs,
                 storage_credentials: storage_credentials.clone(),
+                tls: tls.unwrap_or(false),
             };
             manager.create(req).await.map_err(warehouse_error)?;
             status_row()
@@ -523,6 +558,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             auto_resume,
             statement_timeout_secs,
             storage,
+            tls,
         } => {
             manager
                 .alter(
@@ -550,6 +586,12 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
                         .map_err(warehouse_error)?;
                 }
                 None => {}
+            }
+            // TLS toggle (M7.2): restart a running warehouse's compute so
+            // containers pick up the new mounts; also flips the advertised
+            // scheduler URL scheme.
+            if let Some(tls) = tls {
+                manager.set_tls(name, *tls).await.map_err(warehouse_error)?;
             }
             status_row()
         }
@@ -639,6 +681,8 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         Field::new("AUTO_RESUME", DataType::Utf8, false),
         // M7.1: display-safe credential summary — never secret values.
         Field::new("STORAGE", DataType::Utf8, true),
+        // M7.2: mutual TLS on/off.
+        Field::new("TLS", DataType::Utf8, false),
     ]));
 
     let created_on: Vec<Option<String>> = warehouses
@@ -674,6 +718,10 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         .iter()
         .map(|wh| wh.storage_summary.clone())
         .collect();
+    let tls: Vec<Option<String>> = warehouses
+        .iter()
+        .map(|wh| Some(wh.tls.to_string()))
+        .collect();
 
     let record = RecordBatch::try_new(
         schema.clone(),
@@ -686,6 +734,7 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
             Arc::new(StringArray::from(auto_suspend)),
             Arc::new(StringArray::from(auto_resume)),
             Arc::new(StringArray::from(storage)),
+            Arc::new(StringArray::from(tls)),
         ],
     )
     .context(ex_error::ArrowSnafu)?;
@@ -719,6 +768,7 @@ mod tests {
                 initially_suspended: false,
                 statement_timeout_secs: None,
                 storage_credentials: None,
+                tls: None,
                 if_not_exists: false,
             }
         );
@@ -749,6 +799,41 @@ mod tests {
         assert_eq!(creds.session_token, None);
         // redacted summary never leaks secrets
         assert!(!creds.summary().contains("minio123"));
+    }
+
+    #[test]
+    fn parses_tls_on_create() {
+        let stmt = parse("CREATE WAREHOUSE secure WITH TLS = TRUE SIZE = XSMALL;")
+            .expect("should parse");
+        assert!(
+            matches!(&stmt, WarehouseStatement::Create { tls: Some(true), .. }),
+            "TLS = TRUE should parse into Create {{ tls: Some(true) }}"
+        );
+        let stmt =
+            parse("CREATE WAREHOUSE plain WITH TLS = FALSE;").expect("should parse");
+        assert!(matches!(&stmt, WarehouseStatement::Create { tls: Some(false), .. }));
+        // no TLS option → None (plaintext default)
+        let stmt = parse("CREATE WAREHOUSE plain;").expect("should parse");
+        assert!(matches!(&stmt, WarehouseStatement::Create { tls: None, .. }));
+    }
+
+    #[test]
+    fn parses_alter_tls_set_and_unset() {
+        let stmt = parse("ALTER WAREHOUSE etl SET TLS = TRUE;").expect("should parse");
+        assert!(matches!(
+            &stmt,
+            WarehouseStatement::AlterSet { tls: Some(true), storage: None, .. }
+        ));
+        let stmt = parse("ALTER WAREHOUSE etl SET TLS = FALSE;").expect("should parse");
+        assert!(matches!(
+            &stmt,
+            WarehouseStatement::AlterSet { tls: Some(false), .. }
+        ));
+        let stmt = parse("ALTER WAREHOUSE etl UNSET TLS;").expect("should parse");
+        assert!(matches!(
+            &stmt,
+            WarehouseStatement::AlterSet { tls: Some(false), storage: None, .. }
+        ));
     }
 
     #[test]
@@ -792,6 +877,7 @@ mod tests {
                 auto_resume: None,
                 statement_timeout_secs: None,
                 storage: Some(StorageOp::Unset),
+                tls: None,
             })
         );
         assert_eq!(
@@ -824,6 +910,7 @@ mod tests {
                 auto_resume: None,
                 statement_timeout_secs: Some(0),
                 storage: None,
+                tls: None,
             })
         );
     }
@@ -840,6 +927,7 @@ mod tests {
                 initially_suspended: false,
                 statement_timeout_secs: None,
                 storage_credentials: None,
+                tls: None,
                 if_not_exists: false,
             }
         );
@@ -856,6 +944,7 @@ mod tests {
                 auto_resume: None,
                 statement_timeout_secs: None,
                 storage: None,
+                tls: None,
             })
         );
         assert_eq!(

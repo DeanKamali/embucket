@@ -5,6 +5,7 @@ edition = "2024"
 license-file = { workspace = true }
 
 [dependencies]
+avalanche-executor-common = { path = "../avalanche-executor-common" }
 state-store = { path = "../state-store" }
 async-trait = { workspace = true }
 datafusion = { workspace = true }

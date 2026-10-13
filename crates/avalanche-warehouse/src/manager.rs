@@ -7,10 +7,11 @@
 use crate::driver::{ContainerDriver, ContainerSpec};
 use crate::error::{
     AlreadyExistsSnafu, InvalidAutoSuspendSnafu, InvalidSizeSnafu, NotFoundSnafu, Result,
-    StateStoreSnafu,
+    StateStoreSnafu, TlsSnafu,
 };
 use crate::metering::MeteringLedger;
 use crate::model::{Warehouse, WarehouseSize, WarehouseState};
+use avalanche_executor_common::{CONTAINER_TLS_DIR, TlsMaterial, TLS_DIR_ENV};
 use snafu::ResultExt;
 use state_store::StateStore;
 use state_store::StorageCredentials;
@@ -71,6 +72,9 @@ pub struct CreateWarehouseRequest {
     /// Per-warehouse storage credentials (M7.1): injected into compute
     /// containers as env, never into plans.
     pub storage_credentials: Option<StorageCredentials>,
+    /// Mutual TLS (M7.2): start compute with `AVALANCHE_TLS_DIR` and
+    /// advertise the scheduler over `https://`.
+    pub tls: bool,
 }
 
 pub struct WarehouseManager {
@@ -156,6 +160,7 @@ impl WarehouseManager {
         );
         record.statement_timeout_secs = req.statement_timeout_secs;
         record.storage_credentials = req.storage_credentials.clone();
+        record.tls = req.tls;
         // Reserve a host port for the scheduler so host-side clients can dial
         // its gRPC endpoint. Best-effort: creation must not fail on it.
         record.scheduler_host_port = allocate_free_host_port();
@@ -264,6 +269,41 @@ impl WarehouseManager {
         self.get(name).await
     }
 
+    /// Toggle mutual TLS for a warehouse (M7.2). A running warehouse's
+    /// compute is restarted so containers pick up the TLS mounts.
+    ///
+    /// # Errors
+    ///
+    /// Errors if enabling TLS while the router has no `AVALANCHE_TLS_DIR`.
+    pub async fn set_tls(&self, name: &str, tls: bool) -> Result<Warehouse> {
+        let was_running = self.state(name).await? == WarehouseState::Running;
+        if tls {
+            // fail fast before persisting anything
+            self.tls_volumes().await?;
+        }
+        let mut record = self.record(name).await?;
+        record.tls = tls;
+        record.updated_at = Some(now_secs());
+        self.state_store
+            .put_warehouse(record)
+            .await
+            .context(StateStoreSnafu)?;
+        if was_running {
+            // Recreate containers so the new TLS mounts take effect.
+            if let Some(size) = WarehouseSize::parse(&self.record(name).await?.size) {
+                for i in 0..size.executor_count() {
+                    self.driver
+                        .stop(&executor_container_name(name, i))
+                        .await?;
+                }
+                self.driver.stop(&scheduler_container_name(name)).await?;
+                self.start_compute(name, size, WarehouseState::Running)
+                    .await?;
+            }
+        }
+        self.get(name).await
+    }
+
     pub async fn suspend(&self, name: &str) -> Result<Warehouse> {
         let record = self.record(name).await?;
         if self.state(name).await? == WarehouseState::Running {
@@ -313,9 +353,16 @@ impl WarehouseManager {
             .ok_or_else(|| NotFoundSnafu { name: name.to_string() }.build())?;
         // docker driver: mapped host port on loopback; k8s driver: scheduler
         // pod IP (re-resolved per call, so restarts don't leave stale URLs)
-        self.driver
+        let url = self
+            .driver
             .scheduler_url(&record.name, record.scheduler_host_port)
-            .await
+            .await?;
+        // TLS warehouses advertise over https (M7.2): the router keys its
+        // session TLS config off the scheme.
+        if record.tls && let Some(rest) = url.strip_prefix("http://") {
+            return Ok(format!("https://{rest}"));
+        }
+        Ok(url)
     }
 
     pub async fn drop_warehouse(&self, name: &str) -> Result<()> {
@@ -362,6 +409,7 @@ impl WarehouseManager {
                 .storage_credentials
                 .as_ref()
                 .map(StorageCredentials::summary),
+            tls: record.tls,
         })
     }
 
@@ -495,6 +543,20 @@ impl WarehouseManager {
             .and_then(|r| r.storage_credentials.as_ref())
             .map(StorageCredentials::env_vars)
             .unwrap_or_default();
+        // Mutual TLS (M7.2): mount the router's TLS material into the
+        // containers (read-only, CA private key excluded) and point the
+        // binaries at it. Volumes are (host path, container path) pairs.
+        let (mut container_env, container_volumes): (
+            Vec<(String, String)>,
+            Vec<(String, String)>,
+        ) = if record.as_ref().is_some_and(|r| r.tls) {
+            let mut env = vec![(TLS_DIR_ENV.to_string(), CONTAINER_TLS_DIR.to_string())];
+            env.extend(storage_env);
+            (env, self.tls_volumes().await?)
+        } else {
+            (storage_env, Vec::new())
+        };
+        container_env.sort();
         self.driver
             .start(&ContainerSpec {
                 name: sched_name.clone(),
@@ -509,7 +571,8 @@ impl WarehouseManager {
                     "--external-host".to_string(),
                     sched_name.clone(),
                 ],
-                env: storage_env.clone(),
+                env: container_env.clone(),
+                volumes: container_volumes.clone(),
                 ports: scheduler_host_port
                     .map_or_else(Vec::new, |host_port| {
                         vec![(host_port, INTERNAL_SCHEDULER_PORT)]
@@ -524,19 +587,32 @@ impl WarehouseManager {
             0
         };
         for i in 0..target {
+            let exec_name = executor_container_name(name, i);
+            let mut exec_args = vec![
+                "--bind-host".to_string(),
+                "0.0.0.0".to_string(),
+                "--scheduler-host".to_string(),
+                sched_name.clone(),
+                "--scheduler-port".to_string(),
+                INTERNAL_SCHEDULER_PORT.to_string(),
+            ];
+            // TLS warehouses (M7.2): executors advertise their container DNS
+            // name instead of the default container IP, so peers that dial
+            // their Flight endpoint verify the certificate against a SAN we
+            // can provision in advance (DNS names of the warehouse's own
+            // containers). The docker network resolves these names for
+            // scheduler-side fetches and cross-executor shuffle reads.
+            if record.as_ref().is_some_and(|r| r.tls) {
+                exec_args.push("--external-host".to_string());
+                exec_args.push(exec_name.clone());
+            }
             self.driver
                 .start(&ContainerSpec {
-                    name: executor_container_name(name, i),
+                    name: exec_name,
                     image: self.images.executor.clone(),
-                    args: vec![
-                        "--bind-host".to_string(),
-                        "0.0.0.0".to_string(),
-                        "--scheduler-host".to_string(),
-                        sched_name.clone(),
-                        "--scheduler-port".to_string(),
-                        INTERNAL_SCHEDULER_PORT.to_string(),
-                    ],
-                    env: storage_env.clone(),
+                    args: exec_args,
+                    env: container_env.clone(),
+                    volumes: container_volumes.clone(),
                     ports: vec![],
                     network: self.network.clone(),
                 })
@@ -577,6 +653,40 @@ impl WarehouseManager {
             .get_warehouse(name)
             .await
             .context(StateStoreSnafu)
+    }
+
+    /// Host→container read-only mounts for TLS warehouses (M7.2): the five
+    /// material files, never `ca.key`. Validates the files exist so TLS
+    /// warehouses fail fast at start/ALTER rather than at first dial.
+    async fn tls_volumes(&self) -> Result<Vec<(String, String)>> {
+        let dir = TlsMaterial::dir_from_env().ok_or_else(|| {
+            TlsSnafu {
+                message: format!(
+                    "TLS warehouse requires {TLS_DIR_ENV} on the router process \
+                     (run scripts/gen_certs.sh and point the env at the output dir)"
+                ),
+            }
+            .build()
+        })?;
+        let files = ["ca.crt", "server.crt", "server.key", "client.crt", "client.key"];
+        for file in files {
+            let path = dir.join(file);
+            if !path.is_file() {
+                return Err(TlsSnafu {
+                    message: format!("missing TLS material file {}", path.display()),
+                }
+                .build());
+            }
+        }
+        Ok(files
+            .into_iter()
+            .map(|file| {
+                (
+                    dir.join(file).to_string_lossy().to_string(),
+                    format!("{CONTAINER_TLS_DIR}/{file}"),
+                )
+            })
+            .collect())
     }
 
     async fn state(&self, name: &str) -> Result<WarehouseState> {

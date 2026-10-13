@@ -158,11 +158,46 @@ impl KubectlDriver {
                 .map(|(_, container_port)| json!({"containerPort": container_port}))
                 .collect::<Vec<_>>());
         }
+        // Per-spec read-only bind mounts (M7.2 TLS material). Rendered as
+        // hostPath volumes; the demo-data mount (host_data_path) is separate.
+        let spec_volumes: Vec<serde_json::Value> = spec
+            .volumes
+            .iter()
+            .enumerate()
+            .map(|(i, (host, mount_path))| {
+                let vol_name = format!("spec-vol-{i}");
+                container["volumeMounts"] = {
+                    let mut mounts = container
+                        .as_object()
+                        .and_then(|o| o.get("volumeMounts"))
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    mounts.push(json!({"name": vol_name, "mountPath": mount_path, "readOnly": true}));
+                    json!(mounts)
+                };
+                json!({"name": vol_name, "hostPath": {"path": host, "type": "File"}})
+            })
+            .collect();
         if let Some(host_path) = &self.host_data_path {
-            container["volumeMounts"] = json!([{
-                "name": "demo-data",
-                "mountPath": "/data",
-            }]);
+            let mut volumes = vec![json!({"name": "demo-data", "hostPath": {
+                "path": host_path.to_string_lossy(), "type": "Directory",
+            }})];
+            volumes.extend(spec_volumes);
+            container["volumeMounts"] = {
+                let mut mounts = vec![json!({
+                    "name": "demo-data",
+                    "mountPath": "/data",
+                })];
+                if let Some(existing) = container
+                    .as_object()
+                    .and_then(|o| o.get("volumeMounts"))
+                    .and_then(|v| v.as_array())
+                {
+                    mounts.extend(existing.iter().cloned());
+                }
+                json!(mounts)
+            };
             return json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
@@ -173,26 +208,41 @@ impl KubectlDriver {
                 },
                 "spec": {
                     "restartPolicy": "Always",
-                    "volumes": [{"name": "demo-data", "hostPath": {
-                        "path": host_path.to_string_lossy(), "type": "Directory",
-                    }}],
+                    "volumes": volumes,
                     "containers": [container],
                 },
             });
         }
-        json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": name,
-                "namespace": self.namespace,
-                "labels": {"app": name, "app.kubernetes.io/part-of": "avalanche"},
-            },
-            "spec": {
-                "restartPolicy": "Always",
-                "containers": [container],
-            },
-        })
+        if spec_volumes.is_empty() {
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "namespace": self.namespace,
+                    "labels": {"app": name, "app.kubernetes.io/part-of": "avalanche"},
+                },
+                "spec": {
+                    "restartPolicy": "Always",
+                    "containers": [container],
+                },
+            })
+        } else {
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "namespace": self.namespace,
+                    "labels": {"app": name, "app.kubernetes.io/part-of": "avalanche"},
+                },
+                "spec": {
+                    "restartPolicy": "Always",
+                    "volumes": spec_volumes,
+                    "containers": [container],
+                },
+            })
+        }
     }
 
     fn service_manifest(&self, spec: &ContainerSpec) -> serde_json::Value {
@@ -349,6 +399,7 @@ mod tests {
                 "avalanche-wh-ETL-scheduler".to_string(),
             ],
             env: vec![],
+            volumes: vec![],
             ports: vec![(30001, SCHEDULER_PORT)],
             network: None,
         };
@@ -382,6 +433,7 @@ mod tests {
             image: "avalanche-executor:m4".to_string(),
             args: vec!["--scheduler-host".to_string(), "avalanche-wh-ETL-scheduler".to_string()],
             env: vec![("BALLISTA_CONFIG".to_string(), "x".to_string())],
+            volumes: vec![],
             ports: vec![],
             network: None,
         };

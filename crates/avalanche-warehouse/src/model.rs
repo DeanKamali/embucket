@@ -154,6 +154,9 @@ pub struct Warehouse {
     /// Display-safe storage-credential summary (M7.1): never contains secret
     /// values; `None` = no scoped storage credentials.
     pub storage_summary: Option<String>,
+    /// Mutual TLS (M7.2): compute started with `AVALANCHE_TLS_DIR`, scheduler
+    /// advertised over `https://`.
+    pub tls: bool,
 }
 
 impl Warehouse {

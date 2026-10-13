@@ -72,6 +72,11 @@ pub struct WarehouseRecord {
     /// scoped storage access (v1 `file://` behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_credentials: Option<StorageCredentials>,
+    /// Mutual TLS (M7.2, design §13.2). When true, the warehouse compute is
+    /// started with `AVALANCHE_TLS_DIR` and the scheduler is advertised over
+    /// `https://`; without it everything stays plaintext.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 impl WarehouseRecord {
@@ -91,6 +96,7 @@ impl WarehouseRecord {
             updated_at: None,
             statement_timeout_secs: None,
             storage_credentials: None,
+            tls: false,
         }
     }
 }

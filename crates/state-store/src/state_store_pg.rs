@@ -11,7 +11,7 @@ use crate::error::{
     Error, FailedToDeserializeRecordSnafu, FailedToSerializeRecordSnafu, PgPoolBuildSnafu,
     PgPoolSnafu, PgSnafu, Result,
 };
-use crate::models::{Query, SessionRecord};
+use crate::models::{Query, SessionRecord, WarehouseRecord};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -77,6 +77,10 @@ impl PostgresStateStore {
                     session_id TEXT NOT NULL,
                     record JSONB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS state_warehouses (
+                    name TEXT PRIMARY KEY,
+                    record JSONB NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS state_queries_session_id
                     ON state_queries (session_id);
                 CREATE INDEX IF NOT EXISTS state_queries_request_id
@@ -91,7 +95,7 @@ impl PostgresStateStore {
         self.pool.get().await.context(PgPoolSnafu)
     }
 
-    async fn upsert<T: Serialize>(&self, table: &str, key: (&str, &str), record: &T) -> Result<()> {
+    async fn upsert<T: Serialize + Sync>(&self, table: &str, key: (&str, &str), record: &T) -> Result<()> {
         let json = serde_json::to_value(record).context(FailedToSerializeRecordSnafu)?;
         let client = self.client().await?;
         let sql = format!(
@@ -221,6 +225,43 @@ impl StateStore for PostgresStateStore {
 
     async fn update_query(&self, query: &Query) -> Result<()> {
         self.put_query(query).await
+    }
+
+    async fn put_warehouse(&self, warehouse: WarehouseRecord) -> Result<()> {
+        self.upsert("state_warehouses", ("name", &warehouse.name), &warehouse)
+            .await
+    }
+
+    async fn get_warehouse(&self, name: &str) -> Result<WarehouseRecord> {
+        get_one(
+            self,
+            "SELECT record FROM state_warehouses WHERE name = $1",
+            name,
+        )
+        .await
+    }
+
+    async fn list_warehouses(&self) -> Result<Vec<WarehouseRecord>> {
+        let client = self.client().await?;
+        let rows = client
+            .query("SELECT record FROM state_warehouses", &[])
+            .await
+            .context(PgSnafu)?;
+        rows.into_iter()
+            .map(|row| {
+                let json: serde_json::Value = row.try_get("record").context(PgSnafu)?;
+                serde_json::from_value(json).context(FailedToDeserializeRecordSnafu)
+            })
+            .collect()
+    }
+
+    async fn delete_warehouse(&self, name: &str) -> Result<()> {
+        let client = self.client().await?;
+        client
+            .execute("DELETE FROM state_warehouses WHERE name = $1", &[&name])
+            .await
+            .context(PgSnafu)?;
+        Ok(())
     }
 }
 

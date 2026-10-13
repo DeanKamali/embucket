@@ -7,7 +7,7 @@
 use crate::StateStore;
 use crate::error::Result;
 use crate::error::Error;
-use crate::models::{Query, SessionRecord};
+use crate::models::{Query, SessionRecord, WarehouseRecord};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -18,6 +18,7 @@ pub struct InMemoryStateStore {
     sessions: Arc<RwLock<HashMap<String, SessionRecord>>>,
     queries: Arc<RwLock<HashMap<String, Query>>>,
     queries_by_request_id: Arc<RwLock<HashMap<String, String>>>,
+    warehouses: Arc<RwLock<HashMap<String, WarehouseRecord>>>,
 }
 
 impl InMemoryStateStore {
@@ -102,19 +103,43 @@ impl StateStore for InMemoryStateStore {
 
     async fn delete_query(&self, query_id: &str) -> Result<()> {
         let mut queries = self.queries.write().await;
-        if let Some(removed) = queries.remove(query_id) {
-            if let Some(request_id) = &removed.request_id {
-                self.queries_by_request_id
-                    .write()
-                    .await
-                    .remove(&request_id.to_string());
-            }
+        if let Some(request_id) = queries.remove(query_id).and_then(|q| q.request_id) {
+            self.queries_by_request_id
+                .write()
+                .await
+                .remove(&request_id.to_string());
         }
         Ok(())
     }
 
     async fn update_query(&self, query: &Query) -> Result<()> {
         self.put_query(query).await
+    }
+
+    async fn put_warehouse(&self, warehouse: WarehouseRecord) -> Result<()> {
+        self.warehouses
+            .write()
+            .await
+            .insert(warehouse.name.clone(), warehouse);
+        Ok(())
+    }
+
+    async fn get_warehouse(&self, name: &str) -> Result<WarehouseRecord> {
+        self.warehouses
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or(Error::NotFound)
+    }
+
+    async fn list_warehouses(&self) -> Result<Vec<WarehouseRecord>> {
+        Ok(self.warehouses.read().await.values().cloned().collect())
+    }
+
+    async fn delete_warehouse(&self, name: &str) -> Result<()> {
+        self.warehouses.write().await.remove(name);
+        Ok(())
     }
 }
 

@@ -6,7 +6,9 @@ pub mod state_store_pg;
 
 pub use config::PgConfig;
 pub use error::{Error, Result};
-pub use models::{ExecutionStatus, Query, QueryMetric, SessionRecord, Variable, ViewRecord};
+pub use models::{
+    ExecutionStatus, Query, QueryMetric, SessionRecord, Variable, ViewRecord, WarehouseRecord,
+};
 pub use state_store_memory::InMemoryStateStore;
 pub use state_store_pg::PostgresStateStore;
 
@@ -24,4 +26,9 @@ pub trait StateStore: Send + Sync {
     async fn get_queries_by_session_id(&self, session_id: &str) -> Result<Vec<Query>>;
     async fn delete_query(&self, query_id: &str) -> Result<()>;
     async fn update_query(&self, query: &Query) -> Result<()>;
+
+    async fn put_warehouse(&self, warehouse: WarehouseRecord) -> Result<()>;
+    async fn get_warehouse(&self, name: &str) -> Result<WarehouseRecord>;
+    async fn list_warehouses(&self) -> Result<Vec<WarehouseRecord>>;
+    async fn delete_warehouse(&self, name: &str) -> Result<()>;
 }

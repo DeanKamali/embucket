@@ -44,6 +44,41 @@ impl Display for ExecutionStatus {
     }
 }
 
+/// Warehouse entity persisted in the durable state store (Postgres).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WarehouseRecord {
+    pub name: String,
+    /// Snowflake-style size, e.g. "XSMALL", "LARGE" (size → executor count is
+    /// an `avalanche-warehouse` concern).
+    pub size: String,
+    /// "RUNNING" or "SUSPENDED".
+    pub state: String,
+    /// Idle seconds before auto-suspend; 0 = never suspend.
+    pub auto_suspend_secs: u64,
+    pub auto_resume: bool,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+}
+
+impl WarehouseRecord {
+    #[must_use]
+    pub fn new(name: &str, size: &str, auto_suspend_secs: u64, auto_resume: bool) -> Self {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Self {
+            name: name.to_string(),
+            size: size.to_string(),
+            state: "SUSPENDED".to_string(),
+            auto_suspend_secs,
+            auto_resume,
+            created_at,
+            updated_at: None,
+        }
+    }
+}
+
 /// Session entity persisted in the durable state store (Postgres).
 ///
 /// This record is the durable representation of a session: it survives process
@@ -77,8 +112,7 @@ impl SessionRecord {
     pub fn new(session_id: &str) -> Self {
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
 
         Self {
             session_id: session_id.to_string(),

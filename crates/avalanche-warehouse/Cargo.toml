@@ -1,0 +1,19 @@
+[package]
+name = "avalanche-warehouse"
+version = "0.1.0"
+edition = "2024"
+license-file = { workspace = true }
+
+[dependencies]
+state-store = { path = "../state-store" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+snafu = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+
+[lints]
+workspace = true

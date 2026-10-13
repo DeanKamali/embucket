@@ -94,13 +94,12 @@ use iceberg_rust::table::manifest_list::snapshot_partition_bounds;
 use object_store::aws::{AmazonS3Builder, resolve_bucket_region};
 use object_store::{ClientOptions, ObjectStore};
 use snafu::{OptionExt, ResultExt, location};
-use sqlparser::ast::helpers::key_value_options::KeyValueOptions;
 use sqlparser::ast::helpers::key_value_options::KeyValueOptionKind;
+use sqlparser::ast::helpers::key_value_options::KeyValueOptions;
 use sqlparser::ast::helpers::stmt_data_loading::StageParamsObject;
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, CloudProviderParams, MergeAction, MergeClause,
-    MergeClauseKind, MergeInsertKind, MergeUpdateKind, ObjectType, PivotValueSource,
-    ShowObjects,
+    MergeClauseKind, MergeInsertKind, MergeUpdateKind, ObjectType, PivotValueSource, ShowObjects,
     ShowStatementFilter, ShowStatementIn, ShowStatementInParentType as ShowType,
     ShowStatementInParentType, TruncateTableTarget, Use, Value, visit_relations_mut,
 };
@@ -507,9 +506,9 @@ impl UserQuery {
                 let wrapped = if analyze {
                     LogicalPlan::Analyze(datafusion_expr::logical_plan::Analyze {
                         verbose,
-                        format: format.clone().unwrap_or(
-                            datafusion_expr::logical_plan::ExplainFormat::Indent,
-                        ),
+                        format: format
+                            .clone()
+                            .unwrap_or(datafusion_expr::logical_plan::ExplainFormat::Indent),
                         input: merge_plan,
                         schema,
                         analyze_level: None,
@@ -1055,9 +1054,8 @@ impl UserQuery {
                                 DataType::UInt8 => DataType::Int8,
                                 _ => field.data_type().clone(),
                             };
-                            let new_field =
-                                Field::new(field.name(), signed, field.is_nullable())
-                                    .with_metadata(field.metadata().clone());
+                            let new_field = Field::new(field.name(), signed, field.is_nullable())
+                                .with_metadata(field.metadata().clone());
                             Arc::new(new_field)
                         } else {
                             field.clone()
@@ -1118,14 +1116,12 @@ impl UserQuery {
         let table_schema = planner
             .build_schema(statement.columns)
             .context(ex_error::DataFusionSnafu)?;
-        let fields_with_ids =
-            new_fields_with_ids(table_schema.fields(), &mut 0)
-                .map_err(|err| DataFusionError::External(Box::new(err)))
-                .context(ex_error::DataFusionSnafu)?;
-        let fields_with_ids =
-            StructType::try_from(&fields_with_ids)
-                .map_err(|err| DataFusionError::External(Box::new(err)))
-                .context(ex_error::DataFusionSnafu)?;
+        let fields_with_ids = new_fields_with_ids(table_schema.fields(), &mut 0)
+            .map_err(|err| DataFusionError::External(Box::new(err)))
+            .context(ex_error::DataFusionSnafu)?;
+        let fields_with_ids = StructType::try_from(&fields_with_ids)
+            .map_err(|err| DataFusionError::External(Box::new(err)))
+            .context(ex_error::DataFusionSnafu)?;
 
         // TODO: Use the options with the table format in the future
         let _table_options = statement.options.clone();
@@ -1221,9 +1217,9 @@ impl UserQuery {
                     .eq_ignore_ascii_case("field_optionally_enclosed_by")
                 {
                     match &option.option_value {
-                        KeyValueOptionKind::Single(
-                            v,
-                        ) => v.value.to_string().into_bytes().first().copied(),
+                        KeyValueOptionKind::Single(v) => {
+                            v.value.to_string().into_bytes().first().copied()
+                        }
                         _ => None,
                     }
                 } else {
@@ -1437,13 +1433,12 @@ impl UserQuery {
 
                 let source_provider = self.get_caching_table_provider(&source_ident).await?;
 
-                let target_filter = if let Some(table) =
-                    source_provider.downcast_ref::<DataFusionTable>()
-                {
-                    target_filter_expression(table).await?
-                } else {
-                    None
-                };
+                let target_filter =
+                    if let Some(table) = source_provider.downcast_ref::<DataFusionTable>() {
+                        target_filter_expression(table).await?
+                    } else {
+                        None
+                    };
 
                 let source_table_source: Arc<dyn TableSource> =
                     Arc::new(DefaultTableSource::new(source_provider));
@@ -2229,8 +2224,8 @@ impl UserQuery {
                     .fail()?;
                 }
                 TableReference::full(database, schema, table)
-                }
-                _ => TableReference::full(String::new(), String::new(), String::new()),
+            }
+            _ => TableReference::full(String::new(), String::new(), String::new()),
         };
         Ok(table_ref)
     }
@@ -2789,9 +2784,7 @@ impl UserQuery {
                         let expr = if batch.schema().fields()[0].data_type().is_numeric() {
                             Expr::Value(Value::Number(value.clone(), false).with_empty_span())
                         } else {
-                            Expr::Value(
-                                Value::SingleQuotedString(value.clone()).with_empty_span(),
-                            )
+                            Expr::Value(Value::SingleQuotedString(value.clone()).with_empty_span())
                         };
 
                         // Alias the value so the pivot column keeps the plain
@@ -3770,7 +3763,11 @@ fn build_starts_with_filter(
     starts_with: Option<ValueWithSpan>,
     column_name: &str,
 ) -> Option<String> {
-    if let Some(ValueWithSpan { value: Value::SingleQuotedString(prefix), .. }) = starts_with {
+    if let Some(ValueWithSpan {
+        value: Value::SingleQuotedString(prefix),
+        ..
+    }) = starts_with
+    {
         let escaped = prefix.replace('\'', "''");
         Some(format!("{column_name} LIKE '{escaped}%'"))
     } else {
@@ -3899,9 +3896,7 @@ pub fn get_volume_kv_option(
         .iter()
         .find(|opt| opt.option_name.eq_ignore_ascii_case(key))
         .map(|opt| match &opt.option_value {
-            KeyValueOptionKind::Single(v) => {
-                v.value.to_string()
-            }
+            KeyValueOptionKind::Single(v) => v.value.to_string(),
             _ => String::new(),
         })
         .unwrap_or_default();

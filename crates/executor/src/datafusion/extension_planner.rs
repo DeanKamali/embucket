@@ -22,9 +22,7 @@ impl ExtensionPlanner for CustomExtensionPlanner {
         Option<std::sync::Arc<dyn datafusion_physical_plan::ExecutionPlan>>,
     > {
         if let Some(merge) = node.as_any().downcast_ref::<MergeIntoCOWSink>() {
-            let input = planner
-                .create_physical_plan(&merge.input, session)
-                .await?;
+            let input = planner.create_physical_plan(&merge.input, session).await?;
             Ok(Some(Arc::new(MergeIntoCOWSinkExec::new(
                 merge.schema.clone(),
                 input,

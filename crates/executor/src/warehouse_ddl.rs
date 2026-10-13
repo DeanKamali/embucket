@@ -13,13 +13,11 @@
 use crate::error::{self as ex_error, Error, Result};
 use crate::models::QueryResult;
 use crate::session::UserSession;
-use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use avalanche_warehouse::{
-    CreateWarehouseRequest, WarehouseManager, WarehouseSize,
-};
+use avalanche_warehouse::{CreateWarehouseRequest, WarehouseManager, WarehouseSize};
 use datafusion::arrow::array::{RecordBatch, StringArray};
-use snafu::ResultExt;
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use snafu::Location;
+use snafu::ResultExt;
 use std::sync::Arc;
 
 /// A parsed warehouse statement (v0 grammar, Snowflake subset).
@@ -150,7 +148,9 @@ pub fn parse(raw: &str) -> Option<WarehouseStatement> {
 fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement> {
     // CREATE [OR REPLACE] WAREHOUSE ...
     let mut i = 1;
-    if upper.get(i).map(String::as_str) == Some("OR") && upper.get(i + 1).map(String::as_str) == Some("REPLACE") {
+    if upper.get(i).map(String::as_str) == Some("OR")
+        && upper.get(i + 1).map(String::as_str) == Some("REPLACE")
+    {
         i += 2;
     }
     if upper.get(i).map(String::as_str) != Some("WAREHOUSE") {
@@ -210,7 +210,8 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
             "INITIALLY_SUSPENDED" => {
                 let val = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_bool(v));
                 if let WarehouseStatement::Create {
-                    initially_suspended, ..
+                    initially_suspended,
+                    ..
                 } = &mut stmt
                 {
                     *initially_suspended = val.unwrap_or(true);
@@ -225,7 +226,11 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
 
 /// Returns `(value_token, next_index)` if `index` holds an `=` sign (skipping
 /// it) or directly the value.
-fn value_at<'a>(tokens: &'a [String], upper: &[String], index: usize) -> Option<(&'a String, usize)> {
+fn value_at<'a>(
+    tokens: &'a [String],
+    upper: &[String],
+    index: usize,
+) -> Option<(&'a String, usize)> {
     match upper.get(index).map(String::as_str) {
         Some("=") => {
             let value = tokens.get(index + 1)?;
@@ -418,13 +423,15 @@ fn status_row() -> Result<QueryResult> {
         false,
     )]));
     Ok(QueryResult::new(
-        vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from(vec![
-                "Statement executed successfully.",
-            ]))],
-        )
-        .context(ex_error::ArrowSnafu)?],
+        vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(vec![
+                    "Statement executed successfully.",
+                ]))],
+            )
+            .context(ex_error::ArrowSnafu)?,
+        ],
         schema,
     ))
 }
@@ -445,37 +452,44 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         .iter()
         .map(|wh| Some(format_unix(wh.created_at)))
         .collect();
-    let names: Vec<Option<String>> = warehouses
-        .iter()
-        .map(|wh| Some(wh.name.clone()))
-        .collect();
+    let names: Vec<Option<String>> = warehouses.iter().map(|wh| Some(wh.name.clone())).collect();
     let states: Vec<Option<String>> = warehouses
         .iter()
         .map(|wh| Some(wh.state.as_str().to_string()))
         .collect();
-    let types: Vec<Option<String>> = warehouses.iter().map(|_| Some("STANDARD".to_string())).collect();
+    let types: Vec<Option<String>> = warehouses
+        .iter()
+        .map(|_| Some("STANDARD".to_string()))
+        .collect();
     let sizes: Vec<Option<String>> = warehouses
         .iter()
         .map(|wh| Some(wh.size.as_str().to_string()))
         .collect();
     let auto_suspend: Vec<Option<String>> = warehouses
         .iter()
-        .map(|wh| wh.auto_suspend_secs.filter(|s| *s > 0).map(|s| s.to_string()))
+        .map(|wh| {
+            wh.auto_suspend_secs
+                .filter(|s| *s > 0)
+                .map(|s| s.to_string())
+        })
         .collect();
     let auto_resume: Vec<Option<String>> = warehouses
         .iter()
         .map(|wh| Some(wh.auto_resume.to_string()))
         .collect();
 
-    let record = RecordBatch::try_new(schema.clone(), vec![
-        Arc::new(StringArray::from(created_on)),
-        Arc::new(StringArray::from(names)),
-        Arc::new(StringArray::from(states)),
-        Arc::new(StringArray::from(types)),
-        Arc::new(StringArray::from(sizes)),
-        Arc::new(StringArray::from(auto_suspend)),
-        Arc::new(StringArray::from(auto_resume)),
-    ])
+    let record = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(created_on)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(states)),
+            Arc::new(StringArray::from(types)),
+            Arc::new(StringArray::from(sizes)),
+            Arc::new(StringArray::from(auto_suspend)),
+            Arc::new(StringArray::from(auto_resume)),
+        ],
+    )
     .context(ex_error::ArrowSnafu)?;
 
     Ok(QueryResult::new(vec![record], schema))
@@ -530,14 +544,12 @@ mod tests {
     fn parses_alter_set_and_suspend() {
         assert_eq!(
             parse("ALTER WAREHOUSE wh SET WAREHOUSE_SIZE = 'LARGE' AUTO_SUSPEND = 300;"),
-            Some(
-                WarehouseStatement::AlterSet {
-                    name: "WH".to_string(),
-                    size: Some(WarehouseSize::Large),
-                    auto_suspend_secs: Some(300),
-                    auto_resume: None,
-                }
-            )
+            Some(WarehouseStatement::AlterSet {
+                name: "WH".to_string(),
+                size: Some(WarehouseSize::Large),
+                auto_suspend_secs: Some(300),
+                auto_resume: None,
+            })
         );
         assert_eq!(
             parse("ALTER WAREHOUSE IF EXISTS wh SUSPEND"),
@@ -562,17 +574,17 @@ mod tests {
                 if_exists: true,
             })
         );
-        assert!(matches!(parse("SHOW WAREHOUSES;"), Some(WarehouseStatement::Show)));
+        assert!(matches!(
+            parse("SHOW WAREHOUSES;"),
+            Some(WarehouseStatement::Show)
+        ));
         assert_eq!(
             parse("DESC WAREHOUSE wh"),
             Some(WarehouseStatement::Describe {
                 name: "WH".to_string()
             })
         );
-        assert_eq!(
-            parse("DESCRIBE WAREHOUSE wh"),
-            parse("DESC WAREHOUSE wh")
-        );
+        assert_eq!(parse("DESCRIBE WAREHOUSE wh"), parse("DESC WAREHOUSE wh"));
     }
 
     #[test]

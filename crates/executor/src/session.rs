@@ -118,8 +118,10 @@ impl UserSession {
         // Only set minimum_parallel_output_files if environment variable wasn't set
         if std::env::var_os("DATAFUSION_EXECUTION_MINIMUM_PARALLEL_OUTPUT_FILES").is_none() {
             config_options.execution.minimum_parallel_output_files =
-                datafusion_common::config::ConfigNonZeroUsize::try_new(MINIMUM_PARALLEL_OUTPUT_FILES)
-                    .context(ex_error::DataFusionSnafu)?;
+                datafusion_common::config::ConfigNonZeroUsize::try_new(
+                    MINIMUM_PARALLEL_OUTPUT_FILES,
+                )
+                .context(ex_error::DataFusionSnafu)?;
         }
 
         let state = SessionStateBuilder::new()
@@ -376,7 +378,8 @@ impl UserSession {
     }
 
     #[must_use]
-    pub fn get_session_variable(&self, variable: &str) -> Option<String> {        let state = self.ctx.state();
+    pub fn get_session_variable(&self, variable: &str) -> Option<String> {
+        let state = self.ctx.state();
         let config = state.config().options().extensions.get::<SessionParams>();
         if let Some(cfg) = config {
             return cfg.properties.get(variable).map(|v| v.value.clone());

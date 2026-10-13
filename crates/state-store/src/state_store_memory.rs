@@ -5,8 +5,8 @@
 //! of "no externalized state".
 
 use crate::StateStore;
-use crate::error::Result;
 use crate::error::Error;
+use crate::error::Result;
 use crate::models::{Query, SessionRecord, WarehouseRecord};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -201,7 +201,10 @@ mod tests {
                 .len(),
             1
         );
-        store.delete_query(&query_id.to_string()).await.expect("delete_query");
+        store
+            .delete_query(&query_id.to_string())
+            .await
+            .expect("delete_query");
         assert!(store.get_query(&query_id.to_string()).await.is_err());
     }
 }

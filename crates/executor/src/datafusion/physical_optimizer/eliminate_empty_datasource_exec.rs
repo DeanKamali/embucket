@@ -132,9 +132,7 @@ mod tests {
         let optimized = rule.optimize(data_source_exec, &ConfigOptions::default())?;
         // The rule should not transform the DataSourceExec since it's not empty
         assert!(
-            optimized
-                .downcast_ref::<DataSourceExec>()
-                .is_some(),
+            optimized.downcast_ref::<DataSourceExec>().is_some(),
             "DataSourceExec with non-empty partitioning should not be transformed to EmptyExec"
         );
         Ok(())

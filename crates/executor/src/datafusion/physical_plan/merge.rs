@@ -116,7 +116,9 @@ impl ExecutionPlan for MergeIntoCOWSinkExec {
         &self,
         _f: &mut dyn for<'a> std::ops::FnMut(
             &'a std::sync::Arc<dyn datafusion_physical_plan::PhysicalExpr>,
-        ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion>,
+        ) -> datafusion_common::Result<
+            datafusion_common::tree_node::TreeNodeRecursion,
+        >,
     ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion> {
         Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
     }
@@ -480,7 +482,9 @@ impl ExecutionPlan for MergeCOWFilterExec {
         &self,
         _f: &mut dyn for<'a> std::ops::FnMut(
             &'a std::sync::Arc<dyn datafusion_physical_plan::PhysicalExpr>,
-        ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion>,
+        ) -> datafusion_common::Result<
+            datafusion_common::tree_node::TreeNodeRecursion,
+        >,
     ) -> datafusion_common::Result<datafusion_common::tree_node::TreeNodeRecursion> {
         Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
     }

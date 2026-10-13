@@ -55,7 +55,10 @@ async fn test_rehydrate_session_from_state_store() {
     assert!(!svc_b.session_exists("s1").await);
 
     assert!(
-        svc_b.update_session_expiry("s1").await.expect("update_session_expiry"),
+        svc_b
+            .update_session_expiry("s1")
+            .await
+            .expect("update_session_expiry"),
         "session must be rehydrated from the state store"
     );
     assert!(svc_b.session_exists("s1").await);
@@ -63,11 +66,17 @@ async fn test_rehydrate_session_from_state_store() {
     // Login context is restored on the rehydrated session.
     let session = svc_b.get_session("s1").await.expect("get_session");
     assert_eq!(
-        session.metadata.attr(SessionMetadataAttr::UserName).as_deref(),
+        session
+            .metadata
+            .attr(SessionMetadataAttr::UserName)
+            .as_deref(),
         Some("test_user")
     );
     assert_eq!(
-        session.metadata.attr(SessionMetadataAttr::Warehouse).as_deref(),
+        session
+            .metadata
+            .attr(SessionMetadataAttr::Warehouse)
+            .as_deref(),
         Some("test_wh")
     );
     // Session parameters are restored.
@@ -77,7 +86,10 @@ async fn test_rehydrate_session_from_state_store() {
     );
 
     // The persisted record carries the login user.
-    let record = state_store.get_session("s1").await.expect("get_session record");
+    let record = state_store
+        .get_session("s1")
+        .await
+        .expect("get_session record");
     assert_eq!(record.user_name.as_deref(), Some("test_user"));
     assert_eq!(
         record.metadata.get("UserName").map(String::as_str),
@@ -106,11 +118,17 @@ async fn test_expired_session_is_not_rehydrated() {
             .unsigned_abs()
             .saturating_sub(1),
     );
-    state_store.update_session(record).await.expect("update_session");
+    state_store
+        .update_session(record)
+        .await
+        .expect("update_session");
 
     let svc_b = make_service(state_store.clone()).await;
     assert!(
-        !svc_b.update_session_expiry("s2").await.expect("update_session_expiry"),
+        !svc_b
+            .update_session_expiry("s2")
+            .await
+            .expect("update_session_expiry"),
         "expired session must not be rehydrated"
     );
     // Stale record was purged; a brand new session is created afterwards.
@@ -162,7 +180,10 @@ async fn test_set_attr_persists_to_state_store() {
 
     // The write-through is spawned on the runtime; poll until it lands.
     let record = wait_for_attr(&state_store, "s4", "req_id").await;
-    assert_eq!(record.attrs.get("req_id").map(String::as_str), Some("abc-123"));
+    assert_eq!(
+        record.attrs.get("req_id").map(String::as_str),
+        Some("abc-123")
+    );
 }
 
 // Ad-hoc session attributes must survive rehydration on a fresh instance
@@ -187,13 +208,26 @@ async fn test_attrs_round_trip_on_rehydration() {
     // Simulate a restart on a different process.
     let svc_b = make_service(state_store.clone()).await;
     assert!(
-        svc_b.update_session_expiry("s5").await.expect("update_session_expiry"),
+        svc_b
+            .update_session_expiry("s5")
+            .await
+            .expect("update_session_expiry"),
         "session must be rehydrated from the state store"
     );
 
     let rehydrated = svc_b.get_session("s5").await.expect("get_session");
-    assert_eq!(rehydrated.attrs.get("req_id").as_deref().map(String::as_str), Some("abc-123"));
-    assert_eq!(rehydrated.attrs.get("trace").as_deref().map(String::as_str), Some("xyz"));
+    assert_eq!(
+        rehydrated
+            .attrs
+            .get("req_id")
+            .as_deref()
+            .map(String::as_str),
+        Some("abc-123")
+    );
+    assert_eq!(
+        rehydrated.attrs.get("trace").as_deref().map(String::as_str),
+        Some("xyz")
+    );
 }
 
 // Polls the store until the spawned attrs write-through has persisted the

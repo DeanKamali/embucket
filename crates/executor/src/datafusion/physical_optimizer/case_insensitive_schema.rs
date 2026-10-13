@@ -27,9 +27,7 @@ impl CaseInsensitiveSchemaDataSourceExec {
     }
 }
 
-impl datafusion::physical_optimizer::PhysicalOptimizerRule
-    for CaseInsensitiveSchemaDataSourceExec
-{
+impl datafusion::physical_optimizer::PhysicalOptimizerRule for CaseInsensitiveSchemaDataSourceExec {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -52,9 +50,7 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion::datasource::physical_plan::{
-        FileGroup, FileScanConfigBuilder, ParquetSource,
-    };
+    use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::physical_optimizer::PhysicalOptimizerRule;
     use datafusion_common::config::ConfigOptions;
@@ -66,9 +62,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_noop_on_parquet_source() -> DFResult<()> {
-        let object_store_url = datafusion::datasource::object_store::ObjectStoreUrl::parse(
-            "s3://bucket",
-        )?;
+        let object_store_url =
+            datafusion::datasource::object_store::ObjectStoreUrl::parse("s3://bucket")?;
         let file_source = Arc::new(ParquetSource::new(schema()));
         let file_scan_config = Arc::new(
             FileScanConfigBuilder::new(object_store_url, file_source)

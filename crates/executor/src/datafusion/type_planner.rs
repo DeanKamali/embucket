@@ -1,7 +1,7 @@
 use datafusion::arrow::datatypes::{DECIMAL128_MAX_PRECISION, DataType, Field, Fields, TimeUnit};
 use datafusion::common::Result;
-use datafusion::logical_expr::planner::TypePlanner;
 use datafusion::logical_expr::HigherOrderUDF;
+use datafusion::logical_expr::planner::TypePlanner;
 use datafusion::logical_expr::sqlparser::ast;
 use datafusion::sql::planner::SqlToRel;
 use datafusion::sql::sqlparser::ast::DataType as SQLDataType;

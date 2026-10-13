@@ -56,7 +56,9 @@ impl CastAnalyzer {
             let original_name = name_preserver.save(&expr);
 
             let transformed_expr = expr.transform_up(|e| match &e {
-                Expr::Cast(cast) => self.rewrite_cast_to(cast.field.data_type(), &cast.expr, &e, false),
+                Expr::Cast(cast) => {
+                    self.rewrite_cast_to(cast.field.data_type(), &cast.expr, &e, false)
+                }
                 Expr::TryCast(try_cast) => {
                     self.rewrite_cast_to(try_cast.field.data_type(), &try_cast.expr, &e, true)
                 }

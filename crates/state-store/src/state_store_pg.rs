@@ -35,8 +35,7 @@ impl PostgresStateStore {
 
     /// Create a store from a libpq connection URL and ensure the schema exists.
     pub async fn new(connection_url: &str) -> Result<Self> {
-        let pg_config =
-            tokio_postgres::Config::from_str(connection_url).context(PgSnafu)?;
+        let pg_config = tokio_postgres::Config::from_str(connection_url).context(PgSnafu)?;
         let mgr = Manager::from_config(
             pg_config,
             NoTls,
@@ -95,7 +94,12 @@ impl PostgresStateStore {
         self.pool.get().await.context(PgPoolSnafu)
     }
 
-    async fn upsert<T: Serialize + Sync>(&self, table: &str, key: (&str, &str), record: &T) -> Result<()> {
+    async fn upsert<T: Serialize + Sync>(
+        &self,
+        table: &str,
+        key: (&str, &str),
+        record: &T,
+    ) -> Result<()> {
         let json = serde_json::to_value(record).context(FailedToSerializeRecordSnafu)?;
         let client = self.client().await?;
         let sql = format!(
@@ -130,8 +134,12 @@ impl StateStore for PostgresStateStore {
     }
 
     async fn put_session(&self, session: SessionRecord) -> Result<()> {
-        self.upsert("state_sessions", ("session_id", &session.session_id), &session)
-            .await
+        self.upsert(
+            "state_sessions",
+            ("session_id", &session.session_id),
+            &session,
+        )
+        .await
     }
 
     async fn get_session(&self, session_id: &str) -> Result<SessionRecord> {
@@ -146,7 +154,10 @@ impl StateStore for PostgresStateStore {
     async fn delete_session(&self, session_id: &str) -> Result<()> {
         let client = self.client().await?;
         client
-            .execute("DELETE FROM state_sessions WHERE session_id = $1", &[&session_id])
+            .execute(
+                "DELETE FROM state_sessions WHERE session_id = $1",
+                &[&session_id],
+            )
             .await
             .context(PgSnafu)?;
         Ok(())
@@ -217,7 +228,10 @@ impl StateStore for PostgresStateStore {
     async fn delete_query(&self, query_id: &str) -> Result<()> {
         let client = self.client().await?;
         client
-            .execute("DELETE FROM state_queries WHERE query_id = $1", &[&query_id])
+            .execute(
+                "DELETE FROM state_queries WHERE query_id = $1",
+                &[&query_id],
+            )
             .await
             .context(PgSnafu)?;
         Ok(())
@@ -288,8 +302,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_round_trip() {
-        let Some(store) = test_store().await else { return };
-        store.put_new_session("pg-s1").await.expect("put_new_session");
+        let Some(store) = test_store().await else {
+            return;
+        };
+        store
+            .put_new_session("pg-s1")
+            .await
+            .expect("put_new_session");
 
         let mut record = store.get_session("pg-s1").await.expect("get_session");
         record.user_name = Some("user".to_string());
@@ -315,7 +334,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_query_round_trip() {
-        let Some(store) = test_store().await else { return };
+        let Some(store) = test_store().await else {
+            return;
+        };
         let query_id = uuid::Uuid::new_v4();
         let query = Query::new("SELECT 1", query_id, "pg-s1", None);
         store.put_query(&query).await.expect("put_query");

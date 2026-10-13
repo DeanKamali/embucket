@@ -31,7 +31,10 @@ async fn warehouse_ddl_lifecycle_over_query_pipeline() {
     assert!(exec.execute().await.is_err());
 
     // IF NOT EXISTS succeeds on duplicate
-    let mut exec = session.query("CREATE WAREHOUSE IF NOT EXISTS analytics", QueryContext::default());
+    let mut exec = session.query(
+        "CREATE WAREHOUSE IF NOT EXISTS analytics",
+        QueryContext::default(),
+    );
     exec.execute().await.expect("if not exists");
 
     // SHOW WAREHOUSES is Snowflake-shaped
@@ -77,7 +80,10 @@ async fn warehouse_ddl_lifecycle_over_query_pipeline() {
     exec.execute().await.expect("drop");
     let mut exec = session.query("SHOW WAREHOUSES", QueryContext::default());
     let result = exec.execute().await.expect("show after drop");
-    assert!(!fmt(&result).contains("ANALYTICS"), "drop should remove the row");
+    assert!(
+        !fmt(&result).contains("ANALYTICS"),
+        "drop should remove the row"
+    );
 }
 
 #[tokio::test]
@@ -104,5 +110,9 @@ async fn use_warehouse_enables_resume_on_query() {
     let warehouse = session.warehouse.get("ETL").await.expect("get");
     assert_eq!(warehouse.state, WarehouseState::Running);
 
-    session.warehouse.drop_warehouse("ETL").await.expect("cleanup");
+    session
+        .warehouse
+        .drop_warehouse("ETL")
+        .await
+        .expect("cleanup");
 }

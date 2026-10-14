@@ -14,7 +14,8 @@ use dashmap::DashMap;
 use iceberg_rust::catalog::commit::{TableUpdate as IcebergTableUpdate, apply_table_updates};
 use iceberg_rust_spec::{
     schema::Schema as IcebergSchema,
-    table_metadata::{FormatVersion, TableMetadataBuilder},
+    snapshot::{SnapshotReference, SnapshotRetention},
+    table_metadata::{FormatVersion, SnapshotLog, TableMetadataBuilder},
     types::{StructField, Type},
 };
 use object_store::{ObjectStoreExt, ObjectStore, PutPayload, path::Path};
@@ -66,6 +67,21 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
     /// volume and current metadata lineage (zero data or metadata copy).
     /// Commits to either table after the clone diverge independently.
     async fn clone_table(&self, from: &TableIdent, to: &TableIdent) -> Result<RwObject<Table>>;
+
+    /// Zero-copy as-of clone (M9.4, design §15): creates `to` as a
+    /// metadata-only copy of `from` pinned to `snapshot_id` — the clone's
+    /// metadata contains only that snapshot (snapshot_log restarts with a
+    /// single `as_of_ms` entry), so reads on the clone reproduce the
+    /// source's state at that point. Data/manifest files stay under the
+    /// shared source location; the clone's pinned metadata JSON is written
+    /// under the clone's own prefix. Errors when the snapshot is unknown.
+    async fn clone_table_as_of(
+        &self,
+        from: &TableIdent,
+        to: &TableIdent,
+        snapshot_id: i64,
+        as_of_ms: i64,
+    ) -> Result<RwObject<Table>>;
 
     /// Zero-copy clone of a schema (M8, design §14): copies the schema
     /// record and every contained table against the source's *current*
@@ -773,6 +789,142 @@ impl Metastore for InMemoryMetastore {
         Ok(row)
     }
 
+    /// Zero-copy as-of clone (M9.4, design §15). See the trait doc.
+    #[instrument(
+        name = "Metastore::clone_table_as_of",
+        level = "debug",
+        skip(self),
+        err
+    )]
+    async fn clone_table_as_of(
+        &self,
+        from: &TableIdent,
+        to: &TableIdent,
+        snapshot_id: i64,
+        as_of_ms: i64,
+    ) -> Result<RwObject<Table>> {
+        let source = self.get_table(from).await?.ok_or_else(|| {
+            metastore_error::TableNotFoundSnafu {
+                table: from.table.clone(),
+                schema: from.schema.clone(),
+                db: from.database.clone(),
+            }
+            .build()
+        })?;
+        if source.data.format != TableFormat::Iceberg {
+            return metastore_error::UnsupportedSnafu {
+                message: format!(
+                    "time-travel clone requires an Iceberg table, '{}' is {:?}",
+                    from.table, source.data.format
+                ),
+            }
+            .fail();
+        }
+        let snapshot = source
+            .data
+            .metadata
+            .snapshots
+            .get(&snapshot_id)
+            .ok_or_else(|| {
+                metastore_error::SnapshotNotFoundSnafu {
+                    snapshot: snapshot_id,
+                    table: from.table.clone(),
+                    schema: from.schema.clone(),
+                    db: from.database.clone(),
+                }
+                .build()
+            })?;
+
+        {
+            let mut state = self.state.write().await;
+            if !state
+                .schemas
+                .contains_key(&Self::schema_key(&SchemaIdent::new(
+                    to.database.clone(),
+                    to.schema.clone(),
+                )))
+            {
+                return metastore_error::SchemaNotFoundSnafu {
+                    schema: to.schema.clone(),
+                    db: to.database.clone(),
+                }
+                .fail();
+            }
+            if state.tables.contains_key(&Self::table_key(to)) {
+                return metastore_error::TableAlreadyExistsSnafu {
+                    table: to.table.clone(),
+                    schema: to.schema.clone(),
+                    db: to.database.clone(),
+                }
+                .fail();
+            }
+        }
+
+        // Pinned metadata: same schema/location lineage as the source (all
+        // paths are relative to the shared volume root), but a snapshot
+        // history that starts at the as-of point. The fresh uuid +
+        // metadata JSON under the clone's own prefix make commits to either
+        // table independent, mirroring the M8 commit behavior.
+        let metadata = TableMetadataBuilder::default()
+            .format_version(source.data.metadata.format_version)
+            .location(source.data.metadata.location.clone())
+            .last_updated_ms(as_of_ms)
+            .last_column_id(source.data.metadata.last_column_id)
+            .schemas(source.data.metadata.schemas.clone())
+            .current_schema_id(source.data.metadata.current_schema_id)
+            .partition_specs(source.data.metadata.partition_specs.clone())
+            .default_spec_id(source.data.metadata.default_spec_id)
+            .last_partition_id(source.data.metadata.last_partition_id)
+            .properties(source.data.metadata.properties.clone())
+            .current_snapshot_id(Some(snapshot_id))
+            .snapshots(HashMap::from_iter([(snapshot_id, snapshot.clone())]))
+            .snapshot_log(vec![SnapshotLog {
+                snapshot_id,
+                timestamp_ms: as_of_ms,
+            }])
+            .refs(HashMap::from_iter([(
+                "main".to_string(),
+                SnapshotReference {
+                    snapshot_id,
+                    retention: SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                },
+            )]))
+            .build()
+            .context(metastore_error::TableMetadataBuilderSnafu)?;
+
+        let object_store = self.table_object_store(to).await?.ok_or_else(|| {
+            metastore_error::TableObjectStoreNotFoundSnafu {
+                table: to.table.clone(),
+                schema: to.schema.clone(),
+                db: to.database.clone(),
+            }
+            .build()
+        })?;
+        let metadata_location = self.put_metadata(to, object_store, &metadata).await?;
+
+        let clone = Table {
+            ident: to.clone(),
+            metadata,
+            metadata_location,
+            properties: source.data.properties.clone(),
+            volume_ident: source.data.volume_ident.clone(),
+            volume_location: source.data.volume_location.clone(),
+            is_temporary: source.data.is_temporary,
+            format: source.data.format,
+        };
+        let row = RwObject::new(clone);
+        self.state
+            .write()
+            .await
+            .tables
+            .insert(Self::table_key(to), row.clone());
+        Ok(row)
+    }
+
     #[instrument(name = "Metastore::get_table", level = "trace", ret)]
     async fn get_table(&self, ident: &TableIdent) -> Result<Option<RwObject<Table>>> {
         let state = self.state.read().await;
@@ -1199,5 +1351,95 @@ mod undrop_tests {
         // Schema is gone — restore still works at the metastore level.
         ms.undrop_table(&ident).await.expect("undrop");
         assert!(ms.get_table(&ident).await.unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod clone_as_of_tests {
+    //! As-of clone bounds (M9.4, design §15). The happy path is exercised by
+    //! the wire probe (`/tmp/m8probe/run10.sh`).
+
+    use super::*;
+    use crate::models::volumes::{Volume, VolumeType};
+    use iceberg_rust_spec::types::PrimitiveType;
+
+    fn test_schema() -> IcebergSchema {
+        let mut builder = IcebergSchema::builder();
+        builder.with_schema_id(0);
+        builder.with_struct_field(StructField::new(
+            1,
+            "id",
+            false,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        ));
+        builder.build().expect("schema builds")
+    }
+
+    async fn metastore_with_table(db: &str, schema: &str, table: &str) -> InMemoryMetastore {
+        let ms = InMemoryMetastore::new();
+        ms.create_volume(&"vol".to_string(), Volume::new("vol".into(), VolumeType::Memory))
+            .await
+            .expect("volume");
+        ms.create_database(
+            &db.to_string(),
+            Database {
+                ident: db.to_string(),
+                properties: None,
+                volume: "vol".to_string(),
+                should_refresh: false,
+            },
+        )
+        .await
+        .expect("database");
+        ms.create_schema(
+            &SchemaIdent::new(db.to_string(), schema.to_string()),
+            Schema {
+                ident: SchemaIdent::new(db.to_string(), schema.to_string()),
+                properties: None,
+            },
+        )
+        .await
+        .expect("schema");
+        ms.create_table(
+            &TableIdent::new(db, schema, table),
+            TableCreateRequest {
+                ident: TableIdent::new(db, schema, table),
+                properties: None,
+                format: Some(TableFormat::Iceberg),
+                location: None,
+                schema: test_schema(),
+                partition_spec: None,
+                sort_order: None,
+                stage_create: None,
+                volume_ident: Some("vol".to_string()),
+                is_temporary: Some(false),
+            },
+        )
+        .await
+        .expect("table");
+        ms
+    }
+
+    #[tokio::test]
+    async fn as_of_clone_rejects_unknown_snapshot() {
+        let ms = metastore_with_table("d", "s", "t").await;
+        let err = ms
+            .clone_table_as_of(
+                &TableIdent::new("d", "s", "t"),
+                &TableIdent::new("d", "s", "t2"),
+                42,
+                0,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Snapshot 42 not found"), "got: {err}");
+        // Target must not have been created by the failed clone.
+        assert!(!ms
+            .get_table(&TableIdent::new("d", "s", "t2"))
+            .await
+            .unwrap()
+            .is_some());
     }
 }

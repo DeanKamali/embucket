@@ -113,6 +113,23 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Snapshot {snapshot} not found for table {table} in {db}.{schema}"))]
+    SnapshotNotFound {
+        snapshot: i64,
+        table: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Unsupported operation: {message}"))]
+    Unsupported {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display(
         "Table Object Store for table {table} in schema {schema} in database {db} not found"
     ))]

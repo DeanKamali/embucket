@@ -226,4 +226,60 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Stream {stream} already exists in schema {schema} in database {db}"))]
+    StreamAlreadyExists {
+        stream: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Stream {stream} not found in {db}.{schema}"))]
+    StreamNotFound {
+        stream: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Task {task} already exists in schema {schema} in database {db}"))]
+    TaskAlreadyExists {
+        task: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Task {task} not found in {db}.{schema}"))]
+    TaskNotFound {
+        task: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Dynamic table {table} already exists in schema {schema} in database {db}"
+    ))]
+    DynamicTableAlreadyExists {
+        table: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Dynamic table {table} not found in {db}.{schema}"))]
+    DynamicTableNotFound {
+        table: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }

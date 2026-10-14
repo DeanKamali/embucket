@@ -2,6 +2,7 @@ use crate::error::{self as metastore_error, Result};
 use crate::metastore_settings_config::MetastoreSettingsConfig;
 use crate::models::{
     RwObject,
+    automation::{DynamicTable, Stream, Task},
     database::{Database, DatabaseIdent},
     schema::{Schema, SchemaIdent},
     table::{Table, TableCreateRequest, TableFormat, TableIdent, TableRequirementExt, TableUpdate},
@@ -160,6 +161,44 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
     async fn url_for_table(&self, ident: &TableIdent) -> Result<String>;
     async fn volume_for_table(&self, ident: &TableIdent) -> Result<Option<RwObject<Volume>>>;
     fn settings_config(&self) -> Option<MetastoreSettingsConfig>;
+
+    /// Streams (design §18, M11). All three automation object families
+    /// share the schema namespace with tables — creation rejects a name
+    /// occupied by any other object kind.
+    async fn create_stream(&self, ident: &TableIdent, stream: Stream) -> Result<RwObject<Stream>>;
+    async fn get_stream(&self, ident: &TableIdent) -> Result<Option<RwObject<Stream>>>;
+    async fn list_streams(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Stream>>>;
+    async fn update_stream(&self, ident: &TableIdent, stream: Stream) -> Result<RwObject<Stream>>;
+    async fn delete_stream(&self, ident: &TableIdent) -> Result<()>;
+
+    /// Tasks (design §18, M11).
+    async fn create_task(&self, ident: &TableIdent, task: Task) -> Result<RwObject<Task>>;
+    async fn get_task(&self, ident: &TableIdent) -> Result<Option<RwObject<Task>>>;
+    async fn list_tasks(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Task>>>;
+    /// Every task across the metastore (scheduler iteration).
+    async fn list_all_tasks(&self) -> Result<Vec<RwObject<Task>>>;
+    async fn update_task(&self, ident: &TableIdent, task: Task) -> Result<RwObject<Task>>;
+    async fn delete_task(&self, ident: &TableIdent) -> Result<()>;
+
+    /// Dynamic-table definition records (design §18, M11). The target table
+    /// itself is a regular metastore table.
+    async fn create_dynamic_table(
+        &self,
+        ident: &TableIdent,
+        dynamic_table: DynamicTable,
+    ) -> Result<RwObject<DynamicTable>>;
+    async fn get_dynamic_table(&self, ident: &TableIdent)
+    -> Result<Option<RwObject<DynamicTable>>>;
+    async fn list_dynamic_tables(&self, schema: &SchemaIdent)
+    -> Result<Vec<RwObject<DynamicTable>>>;
+    /// Every dynamic-table record across the metastore (scheduler iteration).
+    async fn list_all_dynamic_tables(&self) -> Result<Vec<RwObject<DynamicTable>>>;
+    async fn update_dynamic_table(
+        &self,
+        ident: &TableIdent,
+        dynamic_table: DynamicTable,
+    ) -> Result<RwObject<DynamicTable>>;
+    async fn delete_dynamic_table(&self, ident: &TableIdent) -> Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -172,6 +211,9 @@ struct MetastoreState {
     /// drop time. Keyed by table key; a re-drop of the same name overwrites
     /// the previous tombstone (UNDROP restores the most recent drop).
     dropped_tables: HashMap<(DatabaseIdent, String, String), (RwObject<Table>, i64)>,
+    streams: HashMap<(DatabaseIdent, String, String), RwObject<Stream>>,
+    tasks: HashMap<(DatabaseIdent, String, String), RwObject<Task>>,
+    dynamic_tables: HashMap<(DatabaseIdent, String, String), RwObject<DynamicTable>>,
 }
 
 #[derive(Debug, Default)]
@@ -634,6 +676,10 @@ impl Metastore for InMemoryMetastore {
             .fail();
         }
 
+        // Schema objects share one namespace (design §18.1-6): reject a
+        // name occupied by a stream, task, or dynamic-table record.
+        Self::assert_object_name_free(&state, ident)?;
+
         if table.volume_ident.is_none() {
             let database = Self::ensure_database(&state, &ident.database)?;
             table.volume_ident = Some(database.volume.clone());
@@ -1086,9 +1132,305 @@ impl Metastore for InMemoryMetastore {
     fn settings_config(&self) -> Option<MetastoreSettingsConfig> {
         self.settings_config.clone()
     }
+
+    #[instrument(name = "Metastore::create_stream", level = "debug", skip(self, stream), err)]
+    async fn create_stream(&self, ident: &TableIdent, stream: Stream) -> Result<RwObject<Stream>> {
+        let mut state = self.state.write().await;
+        if !state
+            .schemas
+            .contains_key(&Self::schema_key(&ident.clone().into()))
+        {
+            return metastore_error::SchemaNotFoundSnafu {
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        Self::assert_object_name_free(&state, ident)?;
+        let row = RwObject::new(stream);
+        state.streams.insert(Self::table_key(ident), row.clone());
+        Ok(row)
+    }
+
+    #[instrument(name = "Metastore::get_stream", level = "debug", skip(self), err)]
+    async fn get_stream(&self, ident: &TableIdent) -> Result<Option<RwObject<Stream>>> {
+        let state = self.state.read().await;
+        Ok(state.streams.get(&Self::table_key(ident)).cloned())
+    }
+
+    #[instrument(name = "Metastore::list_streams", level = "debug", skip(self), err)]
+    async fn list_streams(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Stream>>> {
+        let state = self.state.read().await;
+        Ok(state
+            .streams
+            .iter()
+            .filter(|((db, sch, _), _)| db == &schema.database && sch == &schema.schema)
+            .map(|(_, stream)| stream.clone())
+            .collect())
+    }
+
+    #[instrument(name = "Metastore::update_stream", level = "debug", skip(self, stream), err)]
+    async fn update_stream(&self, ident: &TableIdent, stream: Stream) -> Result<RwObject<Stream>> {
+        let mut state = self.state.write().await;
+        let row = state
+            .streams
+            .get_mut(&Self::table_key(ident))
+            .ok_or_else(|| {
+                metastore_error::StreamNotFoundSnafu {
+                    stream: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .build()
+            })?;
+        row.update(stream);
+        Ok(row.clone())
+    }
+
+    #[instrument(name = "Metastore::delete_stream", level = "debug", skip(self), err)]
+    async fn delete_stream(&self, ident: &TableIdent) -> Result<()> {
+        let mut state = self.state.write().await;
+        state
+            .streams
+            .remove(&Self::table_key(ident))
+            .ok_or_else(|| {
+                metastore_error::StreamNotFoundSnafu {
+                    stream: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .build()
+            })?;
+        Ok(())
+    }
+
+    #[instrument(name = "Metastore::create_task", level = "debug", skip(self, task), err)]
+    async fn create_task(&self, ident: &TableIdent, task: Task) -> Result<RwObject<Task>> {
+        let mut state = self.state.write().await;
+        if !state
+            .schemas
+            .contains_key(&Self::schema_key(&ident.clone().into()))
+        {
+            return metastore_error::SchemaNotFoundSnafu {
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        Self::assert_object_name_free(&state, ident)?;
+        let row = RwObject::new(task);
+        state.tasks.insert(Self::table_key(ident), row.clone());
+        Ok(row)
+    }
+
+    #[instrument(name = "Metastore::get_task", level = "debug", skip(self), err)]
+    async fn get_task(&self, ident: &TableIdent) -> Result<Option<RwObject<Task>>> {
+        let state = self.state.read().await;
+        Ok(state.tasks.get(&Self::table_key(ident)).cloned())
+    }
+
+    #[instrument(name = "Metastore::list_tasks", level = "debug", skip(self), err)]
+    async fn list_tasks(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Task>>> {
+        let state = self.state.read().await;
+        Ok(state
+            .tasks
+            .iter()
+            .filter(|((db, sch, _), _)| db == &schema.database && sch == &schema.schema)
+            .map(|(_, task)| task.clone())
+            .collect())
+    }
+
+    #[instrument(name = "Metastore::list_all_tasks", level = "debug", skip(self), err)]
+    async fn list_all_tasks(&self) -> Result<Vec<RwObject<Task>>> {
+        let state = self.state.read().await;
+        Ok(state.tasks.values().cloned().collect())
+    }
+
+    #[instrument(name = "Metastore::update_task", level = "debug", skip(self, task), err)]
+    async fn update_task(&self, ident: &TableIdent, task: Task) -> Result<RwObject<Task>> {
+        let mut state = self.state.write().await;
+        let row = state
+            .tasks
+            .get_mut(&Self::table_key(ident))
+            .ok_or_else(|| {
+                metastore_error::TaskNotFoundSnafu {
+                    task: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .build()
+            })?;
+        row.update(task);
+        Ok(row.clone())
+    }
+
+    #[instrument(name = "Metastore::delete_task", level = "debug", skip(self), err)]
+    async fn delete_task(&self, ident: &TableIdent) -> Result<()> {
+        let mut state = self.state.write().await;
+        state
+            .tasks
+            .remove(&Self::table_key(ident))
+            .ok_or_else(|| {
+                metastore_error::TaskNotFoundSnafu {
+                    task: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .build()
+            })?;
+        Ok(())
+    }
+
+    #[instrument(
+        name = "Metastore::create_dynamic_table",
+        level = "debug",
+        skip(self, dynamic_table),
+        err
+    )]
+    async fn create_dynamic_table(
+        &self,
+        ident: &TableIdent,
+        dynamic_table: DynamicTable,
+    ) -> Result<RwObject<DynamicTable>> {
+        let mut state = self.state.write().await;
+        if !state
+            .schemas
+            .contains_key(&Self::schema_key(&ident.clone().into()))
+        {
+            return metastore_error::SchemaNotFoundSnafu {
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        Self::assert_object_name_free(&state, ident)?;
+        let row = RwObject::new(dynamic_table);
+        state
+            .dynamic_tables
+            .insert(Self::table_key(ident), row.clone());
+        Ok(row)
+    }
+
+    #[instrument(name = "Metastore::get_dynamic_table", level = "debug", skip(self), err)]
+    async fn get_dynamic_table(
+        &self,
+        ident: &TableIdent,
+    ) -> Result<Option<RwObject<DynamicTable>>> {
+        let state = self.state.read().await;
+        Ok(state.dynamic_tables.get(&Self::table_key(ident)).cloned())
+    }
+
+    #[instrument(name = "Metastore::list_dynamic_tables", level = "debug", skip(self), err)]
+    async fn list_dynamic_tables(
+        &self,
+        schema: &SchemaIdent,
+    ) -> Result<Vec<RwObject<DynamicTable>>> {
+        let state = self.state.read().await;
+        Ok(state
+            .dynamic_tables
+            .iter()
+            .filter(|((db, sch, _), _)| db == &schema.database && sch == &schema.schema)
+            .map(|(_, dynamic_table)| dynamic_table.clone())
+            .collect())
+    }
+
+    #[instrument(
+        name = "Metastore::list_all_dynamic_tables",
+        level = "debug",
+        skip(self),
+        err
+    )]
+    async fn list_all_dynamic_tables(&self) -> Result<Vec<RwObject<DynamicTable>>> {
+        let state = self.state.read().await;
+        Ok(state.dynamic_tables.values().cloned().collect())
+    }
+
+    #[instrument(
+        name = "Metastore::update_dynamic_table",
+        level = "debug",
+        skip(self, dynamic_table),
+        err
+    )]
+    async fn update_dynamic_table(
+        &self,
+        ident: &TableIdent,
+        dynamic_table: DynamicTable,
+    ) -> Result<RwObject<DynamicTable>> {
+        let mut state = self.state.write().await;
+        let row = state
+            .dynamic_tables
+            .get_mut(&Self::table_key(ident))
+            .ok_or_else(|| {
+                metastore_error::DynamicTableNotFoundSnafu {
+                    table: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .build()
+            })?;
+        row.update(dynamic_table);
+        Ok(row.clone())
+    }
+
+    #[instrument(name = "Metastore::delete_dynamic_table", level = "debug", skip(self), err)]
+    async fn delete_dynamic_table(&self, ident: &TableIdent) -> Result<()> {
+        let mut state = self.state.write().await;
+        state
+            .dynamic_tables
+            .remove(&Self::table_key(ident))
+            .ok_or_else(|| {
+                metastore_error::DynamicTableNotFoundSnafu {
+                    table: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .build()
+            })?;
+        Ok(())
+    }
 }
 
 impl InMemoryMetastore {
+    /// Every schema object kind shares one namespace (design §18.1-6):
+    /// reject `ident` when a table, stream, task, or dynamic-table record
+    /// already occupies the name.
+    fn assert_object_name_free(state: &MetastoreState, ident: &TableIdent) -> Result<()> {
+        let key = Self::table_key(ident);
+        if state.tables.contains_key(&key) {
+            return metastore_error::TableAlreadyExistsSnafu {
+                table: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        if state.streams.contains_key(&key) {
+            return metastore_error::StreamAlreadyExistsSnafu {
+                stream: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        if state.tasks.contains_key(&key) {
+            return metastore_error::TaskAlreadyExistsSnafu {
+                task: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        if state.dynamic_tables.contains_key(&key) {
+            return metastore_error::DynamicTableAlreadyExistsSnafu {
+                table: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        Ok(())
+    }
+
     #[instrument(
         name = "Metastore::table_object_store_from_request",
         level = "trace",
@@ -1441,5 +1783,263 @@ mod clone_as_of_tests {
             .await
             .unwrap()
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod automation_tests {
+    //! Automation object store semantics for M11 (design §18): shared
+    //! schema namespace across object kinds, stream offset updates, task
+    //! state updates, dynamic-table record lifecycle.
+
+    use super::*;
+    use crate::models::automation::{TaskRunState, TaskSchedule, TaskState};
+    use crate::models::volumes::{Volume, VolumeType};
+    use iceberg_rust_spec::types::PrimitiveType;
+
+    fn test_schema() -> IcebergSchema {
+        let mut builder = IcebergSchema::builder();
+        builder.with_schema_id(0);
+        builder.with_struct_field(StructField::new(
+            1,
+            "id",
+            false,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        ));
+        builder.build().expect("schema builds")
+    }
+
+    async fn metastore_with_table(db: &str, schema: &str, table: &str) -> InMemoryMetastore {
+        let ms = InMemoryMetastore::new();
+        ms.create_volume(&"vol".to_string(), Volume::new("vol".into(), VolumeType::Memory))
+            .await
+            .expect("volume");
+        ms.create_database(
+            &db.to_string(),
+            Database {
+                ident: db.to_string(),
+                properties: None,
+                volume: "vol".to_string(),
+                should_refresh: false,
+            },
+        )
+        .await
+        .expect("database");
+        ms.create_schema(
+            &SchemaIdent::new(db.to_string(), schema.to_string()),
+            Schema {
+                ident: SchemaIdent::new(db.to_string(), schema.to_string()),
+                properties: None,
+            },
+        )
+        .await
+        .expect("schema");
+        ms.create_table(
+            &TableIdent::new(db, schema, table),
+            TableCreateRequest {
+                ident: TableIdent::new(db, schema, table),
+                properties: None,
+                format: Some(TableFormat::Iceberg),
+                location: None,
+                schema: test_schema(),
+                partition_spec: None,
+                sort_order: None,
+                stage_create: None,
+                volume_ident: Some("vol".to_string()),
+                is_temporary: Some(false),
+            },
+        )
+        .await
+        .expect("table");
+        ms
+    }
+
+    #[tokio::test]
+    async fn stream_create_get_update_delete_roundtrip() {
+        let ms = metastore_with_table("d", "s", "src").await;
+        let ident = TableIdent::new("d", "s", "st");
+        let stream = Stream {
+            ident: ident.clone(),
+            source: TableIdent::new("d", "s", "src"),
+            offset_snapshot: Some(42),
+            append_only: false,
+            comment: None,
+        };
+        let row = ms.create_stream(&ident, stream).await.expect("create");
+        assert_eq!(row.offset_snapshot, Some(42));
+
+        let updated = Stream {
+            offset_snapshot: Some(77),
+            ..row.data.clone()
+        };
+        let advanced = ms.update_stream(&ident, updated).await.expect("update");
+        assert_eq!(advanced.offset_snapshot, Some(77));
+        let fetched = ms.get_stream(&ident).await.expect("get").expect("exists");
+        assert_eq!(fetched.offset_snapshot, Some(77));
+        assert_eq!(
+            ms.list_streams(&SchemaIdent::new("d".to_string(), "s".to_string()))
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+
+        ms.delete_stream(&ident).await.expect("delete");
+        assert!(ms.get_stream(&ident).await.expect("get").is_none());
+        assert!(ms.delete_stream(&ident).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn object_names_share_one_namespace() {
+        let ms = metastore_with_table("d", "s", "src").await;
+        // Stream named like the existing table is rejected.
+        let stream = Stream {
+            ident: TableIdent::new("d", "s", "src"),
+            source: TableIdent::new("d", "s", "src"),
+            offset_snapshot: None,
+            append_only: false,
+            comment: None,
+        };
+        assert!(ms.create_stream(&stream.ident.clone(), stream).await.is_err());
+        // A second stream with the same name is rejected.
+        let st = TableIdent::new("d", "s", "st");
+        let stream = Stream {
+            ident: st.clone(),
+            source: TableIdent::new("d", "s", "src"),
+            offset_snapshot: None,
+            append_only: false,
+            comment: None,
+        };
+        ms.create_stream(&st, stream).await.expect("stream");
+        let colliding = Stream {
+            ident: st.clone(),
+            source: TableIdent::new("d", "s", "src"),
+            offset_snapshot: None,
+            append_only: false,
+            comment: None,
+        };
+        assert!(ms.create_stream(&st, colliding).await.is_err());
+        // Task colliding with the stream is rejected.
+        let task = Task {
+            ident: st.clone(),
+            definition: "SELECT 1".to_string(),
+            schedule: None,
+            state: TaskState::Started,
+            warehouse: None,
+            predecessor: None,
+            last_run_ms: None,
+            last_run_state: None,
+        };
+        assert!(ms.create_task(&st, task.clone()).await.is_err());
+        // Table colliding with the stream is rejected.
+        assert!(ms
+            .create_table(
+                &st,
+                TableCreateRequest {
+                    ident: st.clone(),
+                    properties: None,
+                    format: Some(TableFormat::Iceberg),
+                    location: None,
+                    schema: test_schema(),
+                    partition_spec: None,
+                    sort_order: None,
+                    stage_create: None,
+                    volume_ident: Some("vol".to_string()),
+                    is_temporary: Some(false),
+                }
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn task_lifecycle_and_listing() {
+        let ms = metastore_with_table("d", "s", "src").await;
+        let ident = TableIdent::new("d", "s", "tk");
+        let task = Task {
+            ident: ident.clone(),
+            definition: "INSERT INTO d.s.src VALUES (1)".to_string(),
+            schedule: Some(TaskSchedule::Minutes(5)),
+            state: TaskState::Started,
+            warehouse: Some("wh".to_string()),
+            predecessor: None,
+            last_run_ms: None,
+            last_run_state: None,
+        };
+        ms.create_task(&ident, task).await.expect("create");
+
+        let fetched = ms.get_task(&ident).await.expect("get").expect("exists");
+        assert_eq!(fetched.state, TaskState::Started);
+        assert_eq!(fetched.schedule, Some(TaskSchedule::Minutes(5)));
+
+        let suspended = Task {
+            state: TaskState::Suspended,
+            last_run_ms: Some(1_000),
+            last_run_state: Some(TaskRunState::Succeeded),
+            ..fetched.data.clone()
+        };
+        ms.update_task(&ident, suspended).await.expect("update");
+        let after = ms.get_task(&ident).await.expect("get").expect("exists");
+        assert_eq!(after.state, TaskState::Suspended);
+        assert_eq!(after.last_run_state, Some(TaskRunState::Succeeded));
+
+        assert_eq!(
+            ms.list_all_tasks().await.expect("list_all").len(),
+            1
+        );
+        assert_eq!(
+            ms.list_tasks(&SchemaIdent::new("d".to_string(), "s".to_string()))
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+        assert!(ms
+            .list_tasks(&SchemaIdent::new("d".to_string(), "other".to_string()))
+            .await
+            .expect("list other")
+            .is_empty());
+
+        ms.delete_task(&ident).await.expect("delete");
+        assert!(ms.get_task(&ident).await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_table_record_lifecycle() {
+        let ms = metastore_with_table("d", "s", "src").await;
+        let ident = TableIdent::new("d", "s", "dt");
+        let record = DynamicTable {
+            ident: ident.clone(),
+            definition: "SELECT * FROM d.s.src".to_string(),
+            warehouse: Some("wh".to_string()),
+            target_lag_seconds: Some(60),
+            last_refresh_ms: None,
+        };
+        ms.create_dynamic_table(&ident, record).await.expect("create");
+        let fetched = ms
+            .get_dynamic_table(&ident)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.target_lag_seconds, Some(60));
+
+        let refreshed = DynamicTable {
+            last_refresh_ms: Some(5_000),
+            ..fetched.data.clone()
+        };
+        ms.update_dynamic_table(&ident, refreshed)
+            .await
+            .expect("update");
+        assert_eq!(
+            ms.list_all_dynamic_tables().await.expect("list_all").len(),
+            1
+        );
+        ms.delete_dynamic_table(&ident).await.expect("delete");
+        assert!(ms
+            .get_dynamic_table(&ident)
+            .await
+            .expect("get")
+            .is_none());
     }
 }

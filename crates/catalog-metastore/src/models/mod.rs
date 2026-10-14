@@ -3,11 +3,13 @@ use std::ops::Deref;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
+pub mod automation;
 pub mod database;
 pub mod schema;
 pub mod table;
 pub mod volumes;
 
+pub use automation::*;
 pub use database::*;
 pub use schema::*;
 pub use table::*;

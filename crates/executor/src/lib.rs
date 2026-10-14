@@ -14,6 +14,7 @@ pub mod query;
 pub mod query_task_result;
 pub mod query_types;
 pub mod running_queries;
+pub mod scheduler;
 pub mod service;
 pub mod session;
 pub mod snowflake_error;

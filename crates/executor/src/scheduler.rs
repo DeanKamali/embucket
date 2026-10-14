@@ -12,12 +12,11 @@ use crate::models::QueryContext;
 use crate::query::UserQuery;
 use crate::service::CoreExecutionService;
 use catalog_metastore::models::{DynamicTable, RwObject, TableIdent, Task, TaskRunState, TaskSchedule, TaskState};
-use catalog_metastore::Metastore;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{error, info, warn};
 

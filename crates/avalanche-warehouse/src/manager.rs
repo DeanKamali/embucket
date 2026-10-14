@@ -697,6 +697,12 @@ impl WarehouseManager {
                 base_sched_name.clone(),
                 "--scheduler-port".to_string(),
                 INTERNAL_SCHEDULER_PORT.to_string(),
+                // Tight heartbeats (M7.3): the registration scheduler may die
+                // mid-life; the survivor only sees the executor again on its
+                // next heartbeat (self-registration from heartbeat metadata),
+                // so a short interval bounds the HA failover window.
+                "--executor-heartbeat-interval-seconds".to_string(),
+                "10".to_string(),
             ];
             // TLS warehouses (M7.2): executors advertise their container DNS
             // name instead of the default container IP, so peers that dial

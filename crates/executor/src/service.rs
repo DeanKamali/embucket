@@ -1,4 +1,6 @@
 use bytes::{Buf, Bytes};
+use chrono::Utc;
+use functions::session_params::SessionProperty;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::csv::ReaderBuilder;
 use datafusion::arrow::csv::reader::Format;
@@ -287,6 +289,56 @@ impl CoreExecutionService {
     pub fn with_account(mut self, account: Arc<dyn AccountStore>) -> Self {
         self.account = Some(account);
         self
+    }
+
+    /// Metastore handle for the automation scheduler (design §18.1-4).
+    #[must_use]
+    pub fn metastore_clone(&self) -> Arc<dyn Metastore> {
+        self.metastore.clone()
+    }
+
+    /// Internal session for automation runs (scheduler tasks / dynamic
+    /// table refreshes). No login metadata -> `authz: None` (unenforced,
+    /// established M10 internal semantics); context vars set from the
+    /// automation object's identity and warehouse.
+    pub async fn internal_automation_session(
+        &self,
+        session_id: &str,
+        database: Option<String>,
+        schema: Option<String>,
+        warehouse: Option<String>,
+    ) -> Result<Arc<UserSession>> {
+        let session = ExecutionService::create_session(self, session_id, None).await?;
+        let mut params = HashMap::new();
+        for (name, value) in [
+            ("database", database),
+            ("schema", schema),
+            ("warehouse", warehouse),
+        ] {
+            if let Some(value) = value {
+                params.insert(
+                    name.to_string(),
+                    SessionProperty {
+                        session_id: Some(session.session_id.clone()),
+                        created_on: Utc::now(),
+                        updated_on: Utc::now(),
+                        value,
+                        property_type: "STRING".into(),
+                        comment: None,
+                        name: name.to_string(),
+                    },
+                );
+            }
+        }
+        if !params.is_empty() {
+            session.set_session_variable(true, params).await?;
+        }
+        // Cold warehouse auto-resume (design §5): warehouse runs happen
+        // outside the request path, so explicitly ensure it is up.
+        if let Some(warehouse) = session.get_session_variable("warehouse") {
+            session.warehouse.ensure_running(&warehouse).await;
+        }
+        Ok(session)
     }
 
     #[tracing::instrument(

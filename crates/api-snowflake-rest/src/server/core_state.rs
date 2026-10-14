@@ -136,6 +136,9 @@ async fn create_executor(
         None => executor,
     };
     let executor = Arc::new(executor);
+    // Automation scheduler (design §18.1-4, M11): in-process tokio loop for
+    // due tasks and dynamic-table lag refreshes; exits with the service.
+    executor::scheduler::spawn(&executor);
     tracing::info!("Execution service created");
     Ok(executor)
 }

@@ -40,8 +40,25 @@ pub async fn handle_login_request(
         ..
     } = credentials;
 
-    if login_name != *state.config.auth.demo_user || password != *state.config.auth.demo_password {
-        return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+    // Account-plane login (design §17, M10): the account store is the primary
+    // credential source when configured; the static demo credentials remain
+    // the fallback for deployments without an account store.
+    match &state.config.account {
+        Some(store) => match store.authenticate(&login_name, &password).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return api_snowflake_rest_error::InvalidAuthDataSnafu.fail(),
+            Err(e) => {
+                tracing::error!(error = %e, "account store authentication failed");
+                return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+            }
+        },
+        None => {
+            if login_name != *state.config.auth.demo_user
+                || password != *state.config.auth.demo_password
+            {
+                return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+            }
+        }
     }
 
     // host is required to check token audience claim

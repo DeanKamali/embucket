@@ -9,6 +9,7 @@ use api_snowflake_rest::server::core_state::CoreState;
 use api_snowflake_rest::server::core_state::MetastoreConfig;
 use api_snowflake_rest::server::make_snowflake_router;
 use api_snowflake_rest::server::server_models::RestApiConfig;
+use avalanche_account::store::AccountStore;
 use api_snowflake_rest::server::state::AppState;
 use api_snowflake_rest_sessions::session::SESSION_EXPIRATION_SECONDS;
 use axum::http::StatusCode;
@@ -114,12 +115,19 @@ async fn async_main(
         .data_format
         .clone()
         .unwrap_or_else(|| "json".to_string());
+    // Account store (design §17, M10): the demo credentials bootstrap the
+    // built-in ACCOUNTADMIN identity, so all pre-M10 behavior is unchanged.
+    let demo_user = opts.auth_demo_user.clone().unwrap();
+    let demo_password = opts.auth_demo_password.clone().unwrap();
+    let account_store: Arc<dyn AccountStore> =
+        Arc::new(avalanche_account::store::InMemoryAccountStore::new().with_admin(
+            &demo_user,
+            &demo_password,
+        ));
     let snowflake_rest_cfg = RestApiConfig::new(&data_format, opts.jwt_secret())
         .expect("Failed to create snowflake config")
-        .with_demo_credentials(
-            opts.auth_demo_user.clone().unwrap(),
-            opts.auth_demo_password.clone().unwrap(),
-        );
+        .with_demo_credentials(demo_user, demo_password)
+        .with_account(account_store);
 
     let execution_cfg = ExecutionConfig {
         embucket_version: BuildInfo::VERSION.to_string(),

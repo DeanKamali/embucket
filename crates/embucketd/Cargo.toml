@@ -6,6 +6,7 @@ license-file.workspace = true
 
 [dependencies]
 queries = { workspace = true, optional = true }
+avalanche-account = { path = "../avalanche-account" }
 executor = { path = "../executor" }
 catalog-metastore = { path = "../catalog-metastore" }
 api-snowflake-rest = { path = "../api-snowflake-rest" }

@@ -9,6 +9,7 @@ use catalog_metastore::metastore_bootstrap_config::MetastoreBootstrapConfig;
 use catalog_metastore::metastore_settings_config::MetastoreSettingsConfig;
 use executor::service::CoreExecutionService;
 use executor::utils::Config as ExecutionConfig;
+use avalanche_account::store::AccountStore;
 use snafu::ResultExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +39,12 @@ impl CoreState {
     ) -> Result<Self> {
         let metastore = create_metastore(metastore_settings_config);
         apply_metastore_bootstrap_config(metastore.clone(), metastore_bootstrap_config).await?;
-        let executor = create_executor(metastore.clone(), execution_cfg).await?;
+        let executor = create_executor(
+            metastore.clone(),
+            execution_cfg,
+            rest_api_config.account.clone(),
+        )
+        .await?;
         Ok(Self {
             executor,
             metastore,
@@ -119,13 +125,17 @@ async fn apply_metastore_bootstrap_config(
 async fn create_executor(
     metastore: Arc<dyn Metastore>,
     execution_cfg: ExecutionConfig,
+    account: Option<Arc<dyn AccountStore>>,
 ) -> Result<Arc<CoreExecutionService>> {
     tracing::info!("Creating execution service");
-    let executor = Arc::new(
-        CoreExecutionService::new(metastore, Arc::new(execution_cfg))
-            .await
-            .context(CreateExecutorSnafu)?,
-    );
+    let executor = CoreExecutionService::new(metastore, Arc::new(execution_cfg))
+        .await
+        .context(CreateExecutorSnafu)?;
+    let executor = match account {
+        Some(account) => executor.with_account(account),
+        None => executor,
+    };
+    let executor = Arc::new(executor);
     tracing::info!("Execution service created");
     Ok(executor)
 }

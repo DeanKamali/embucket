@@ -317,6 +317,12 @@ impl TableProvider for StreamTable {
 
         // APPEND_ONLY streams surface only added files (§18.1-2): filter on
         // the inner change-status column BEFORE the projection drops it.
+        // For standard streams, wrap in a no-op `TRUE` filter: the inner
+        // changed-file scan reports Exact statistics that count only added
+        // files, which lets DataFusion's aggregate rule replace COUNT(*)
+        // with a placeholder that undercounts (DELETE rows from rewritten
+        // files are invisible to those statistics). The filter degrades
+        // statistics to inexact so aggregates execute against real rows.
         let mut plan: Arc<dyn ExecutionPlan> = if self.append_only && self.has_status_column {
             let predicate = self.physical(
                 &col(CHANGE_FILE_STATUS_COLUMN).eq(lit("ADDED")),
@@ -324,7 +330,8 @@ impl TableProvider for StreamTable {
             )?;
             Arc::new(FilterExec::try_new(predicate, inner_exec)?)
         } else {
-            inner_exec
+            let predicate = self.physical(&lit(true), &inner_exec.schema())?;
+            Arc::new(FilterExec::try_new(predicate, inner_exec)?)
         };
 
         // Projection onto the declared stream schema (source columns in

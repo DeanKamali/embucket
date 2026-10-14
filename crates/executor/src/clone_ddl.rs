@@ -17,6 +17,7 @@
 use crate::error::{self as ex_error, Error, Result};
 use crate::models::QueryResult;
 use crate::session::UserSession;
+use catalog::catalog_list::EmbucketCatalogList;
 use catalog_metastore::models::{SchemaIdent, TableIdent};
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -239,6 +240,15 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
                 .clone_database(&from, &to)
                 .await
                 .map_err(|e| external_error("clone", e))?;
+            // Make the new database queryable in this session's catalog
+            // registry (upserts every metastore database, incl. the clone).
+            let catalog_list: Arc<dyn datafusion::catalog::CatalogProviderList> =
+                Arc::clone(session.ctx.state().catalog_list());
+            if let Ok(list) = Arc::downcast::<EmbucketCatalogList>(catalog_list) {
+                list.register_catalog(&to)
+                    .await
+                    .map_err(|e| external_error("clone", e))?;
+            }
         }
     }
     status_row()

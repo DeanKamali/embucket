@@ -71,6 +71,75 @@ impl EmbucketCatalogList {
         }
     }
 
+    /// Registers an existing metastore database as a queryable catalog
+    /// without creating it (M8: `DATABASE … CLONE` creates the metastore
+    /// record, then registers it here). No-op if already registered.
+    #[tracing::instrument(
+        name = "EmbucketCatalogList::register_catalog",
+        level = "debug",
+        skip(self),
+        err
+    )]
+    pub async fn register_catalog(&self, name: &str) -> Result<()> {
+        if self.catalogs.contains_key(name) {
+            return Ok(());
+        }
+        let database = self
+            .metastore
+            .get_database(&name.to_string())
+            .await
+            .context(MetastoreSnafu)?
+            .ok_or_else(|| {
+                InvalidCacheSnafu {
+                    entity: "database",
+                    name,
+                }
+                .build()
+            })?;
+        let volume = self
+            .metastore
+            .get_volume(&database.volume)
+            .await
+            .context(MetastoreSnafu)?
+            .context(MissingVolumeSnafu {
+                name: database.volume.clone(),
+            })?;
+        let catalog = match &volume.volume {
+            VolumeType::S3Tables(vol) => {
+                self.s3tables_iceberg_catalog(vol.clone(), &database).await?
+            }
+            VolumeType::Memory => self
+                .get_embucket_catalog(&database)
+                .await?
+                .with_catalog_type(CatalogType::Memory),
+            _ => self.get_embucket_catalog(&database).await?,
+        };
+        let caching = Arc::new(catalog);
+        // Warm the schema cache with metastore-backed providers (same as
+        // `CREATE SCHEMA` traffic does for normally created databases).
+        // Without this, `CachingCatalog::lookup_schema_provider` falls back
+        // to the pure-iceberg provider, which resolves non-iceberg tables
+        // (e.g. external parquet tables cloned into this database) as empty.
+        if !matches!(caching.catalog_type, CatalogType::S3tables) {
+            for schema_name in caching.catalog.schema_names() {
+                if let Some(provider) = caching.catalog.schema(&schema_name) {
+                    caching.schemas_cache.insert(
+                        schema_name.clone(),
+                        Arc::new(CachingSchema {
+                            schema: provider,
+                            iceberg_catalog: caching.iceberg_catalog.clone(),
+                            name: schema_name,
+                            tables_cache: DashMap::new(),
+                            config: caching.config.clone(),
+                        }),
+                    );
+                }
+            }
+        }
+        self.catalogs.insert(name.to_owned(), caching);
+        Ok(())
+    }
+
     #[tracing::instrument(
         name = "EmbucketCatalogList::drop_catalog",
         level = "debug",

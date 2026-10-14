@@ -61,6 +61,68 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         table: TableCreateRequest,
     ) -> Result<RwObject<Table>>;
     async fn register_table(&self, ident: &TableIdent, table: Table) -> Result<RwObject<Table>>;
+    /// Zero-copy clone (M8, design §14): creates `to` as a metadata-only
+    /// copy of `from` — same schema, snapshots and refs, same volume (so the
+    /// clone reads the source's data files), but a fresh table location and
+    /// metadata lineage. Commits to either table after the clone do not
+    /// affect the other.
+    async fn clone_table(&self, from: &TableIdent, to: &TableIdent) -> Result<RwObject<Table>>;
+
+    /// Zero-copy clone of a schema (M8, design §14): copies the schema
+    /// record and every contained table against the source's *current*
+    /// metadata at clone time. Returns the number of cloned tables.
+    async fn clone_schema(&self, from: &SchemaIdent, to: &SchemaIdent) -> Result<usize> {
+        let source = self.get_schema(from).await?.ok_or_else(|| {
+            metastore_error::SchemaNotFoundSnafu {
+                schema: from.schema.clone(),
+                db: from.database.clone(),
+            }
+            .build()
+        })?;
+        let schema = Schema {
+            ident: to.clone(),
+            properties: source.data.properties.clone(),
+        };
+        self.create_schema(to, schema).await?;
+        let tables = self.list_tables(from).await?;
+        for table in &tables {
+            let target = TableIdent::new(
+                &to.database,
+                &to.schema,
+                &table.data.ident.table,
+            );
+            let source = &table.data.ident;
+            self.clone_table(source, &target).await?;
+        }
+        Ok(tables.len())
+    }
+
+    /// Zero-copy clone of a database (M8, design §14): copies the database
+    /// record (same volume), every schema, and every table against the
+    /// source's current metadata at clone time.
+    async fn clone_database(&self, from: &DatabaseIdent, to: &DatabaseIdent) -> Result<usize> {
+        let source = self.get_database(from).await?.ok_or_else(|| {
+            metastore_error::DatabaseNotFoundSnafu {
+                db: from.to_string(),
+            }
+            .build()
+        })?;
+        let database = Database {
+            ident: to.to_string(),
+            properties: source.data.properties.clone(),
+            volume: source.data.volume.clone(),
+            should_refresh: false,
+        };
+        self.create_database(&to.to_string(), database).await?;
+        let mut cloned = 0;
+        for schema in self.list_schemas(from).await? {
+            let target_schema =
+                SchemaIdent::new(to.to_string(), schema.data.ident.schema.clone());
+            let source_schema = schema.data.ident.clone();
+            cloned += self.clone_schema(&source_schema, &target_schema).await?;
+        }
+        Ok(cloned)
+    }
     async fn get_table(&self, ident: &TableIdent) -> Result<Option<RwObject<Table>>>;
     async fn update_table(
         &self,
@@ -622,6 +684,84 @@ impl Metastore for InMemoryMetastore {
         let mut state = self.state.write().await;
         let row = RwObject::new(table);
         state.tables.insert(Self::table_key(ident), row.clone());
+        Ok(row)
+    }
+
+    /// Zero-copy clone (M8, design §14). Metadata-only: the clone shares the
+    /// source's snapshots/manifests (absolute paths) and volume, but gets its
+    /// own location and a fresh metadata JSON, so subsequent commits to
+    /// either table are independent.
+    #[instrument(
+        name = "Metastore::clone_table",
+        level = "debug",
+        skip(self),
+        err
+    )]
+    async fn clone_table(&self, from: &TableIdent, to: &TableIdent) -> Result<RwObject<Table>> {
+        let source = self.get_table(from).await?.ok_or_else(|| {
+            metastore_error::TableNotFoundSnafu {
+                table: from.table.clone(),
+                schema: from.schema.clone(),
+                db: from.database.clone(),
+            }
+            .build()
+        })?;
+
+        // Object store first: resolving it takes a state read lock, and the
+        // metadata write below must happen before the clone record exists.
+        let object_store = self
+            .table_object_store(from)
+            .await?
+            .ok_or_else(|| {
+                metastore_error::VolumeNotFoundSnafu {
+                    volume: source.data.volume_ident.clone().unwrap_or_default(),
+                }
+                .build()
+            })?;
+
+        let mut metadata = source.data.metadata.clone();
+        metadata.location = Self::default_table_location(to);
+        let metadata_location = self
+            .put_metadata(to, object_store.clone(), &metadata)
+            .await?;
+
+        let mut state = self.state.write().await;
+
+        if !state
+            .schemas
+            .contains_key(&Self::schema_key(&SchemaIdent::new(
+                to.database.clone(),
+                to.schema.clone(),
+            )))
+        {
+            return metastore_error::SchemaNotFoundSnafu {
+                schema: to.schema.clone(),
+                db: to.database.clone(),
+            }
+            .fail();
+        }
+
+        if state.tables.contains_key(&Self::table_key(to)) {
+            return metastore_error::TableAlreadyExistsSnafu {
+                table: to.table.clone(),
+                schema: to.schema.clone(),
+                db: to.database.clone(),
+            }
+            .fail();
+        }
+
+        let clone = Table {
+            ident: to.clone(),
+            metadata,
+            metadata_location,
+            properties: source.data.properties.clone(),
+            volume_ident: source.data.volume_ident.clone(),
+            volume_location: Some(Self::default_table_location(to)),
+            is_temporary: false,
+            format: source.data.format.clone(),
+        };
+        let row = RwObject::new(clone);
+        state.tables.insert(Self::table_key(to), row.clone());
         Ok(row)
     }
 

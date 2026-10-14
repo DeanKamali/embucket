@@ -104,6 +104,15 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Table {table} in {db}.{schema} is not dropped"))]
+    TableNotDropped {
+        table: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display(
         "Table Object Store for table {table} in schema {schema} in database {db} not found"
     ))]

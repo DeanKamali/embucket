@@ -299,6 +299,7 @@ fn schema_ident(parts: &[String]) -> SchemaIdent {
 }
 
 /// `Statement executed successfully.` row, matching other DDL responses.
+/// Shared with the other pre-parse DDL hooks (warehouse_ddl, undrop_ddl).
 #[allow(clippy::missing_errors_doc)]
 pub fn status_row() -> Result<QueryResult> {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(

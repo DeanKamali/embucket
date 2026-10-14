@@ -355,6 +355,13 @@ impl UserQuery {
         {
             return result;
         }
+        // UNDROP (design §15, M9.3) — pre-parse: the sqlparser fork has no
+        // UNDROP grammar either.
+        if let Some(result) =
+            crate::undrop_ddl::try_execute(&self.raw_query, &self.session).await
+        {
+            return result;
+        }
         // Time travel (design §15, M9.2) — pre-parse AT() predicate rewrite:
         // the sqlparser fork has no AT() grammar either.
         crate::time_travel::rewrite(&mut self.raw_query, &self.session).await?;

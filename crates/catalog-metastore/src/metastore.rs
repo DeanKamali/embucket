@@ -129,6 +129,15 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         update: TableUpdate,
     ) -> Result<RwObject<Table>>;
     async fn delete_table(&self, ident: &TableIdent, cascade: bool) -> Result<()>;
+
+    /// Restore the most recently dropped version of `ident` (design §15,
+    /// M9.3). Errors when a live table already occupies the name, or when
+    /// there is no tombstone for it.
+    async fn undrop_table(&self, ident: &TableIdent) -> Result<RwObject<Table>>;
+
+    /// Tables currently tombstoned (dropped) in `schema`, most recent drop
+    /// first.
+    async fn list_dropped_tables(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Table>>>;
     async fn table_object_store(&self, ident: &TableIdent) -> Result<Option<Arc<dyn ObjectStore>>>;
 
     async fn table_exists(&self, ident: &TableIdent) -> Result<bool>;
@@ -143,6 +152,10 @@ struct MetastoreState {
     databases: HashMap<DatabaseIdent, RwObject<Database>>,
     schemas: HashMap<(DatabaseIdent, String), RwObject<Schema>>,
     tables: HashMap<(DatabaseIdent, String, String), RwObject<Table>>,
+    /// Tombstones for dropped tables (design §15, M9.3): record + epoch-ms
+    /// drop time. Keyed by table key; a re-drop of the same name overwrites
+    /// the previous tombstone (UNDROP restores the most recent drop).
+    dropped_tables: HashMap<(DatabaseIdent, String, String), (RwObject<Table>, i64)>,
 }
 
 #[derive(Debug, Default)]
@@ -174,6 +187,10 @@ impl InMemoryMetastore {
     #[instrument(name = "Metastore::metadata_file_name", level = "trace", ret)]
     fn metadata_file_name() -> String {
         format!("{}.metadata.json", Uuid::new_v4())
+    }
+
+    fn now_ms() -> i64 {
+        Utc::now().timestamp_millis()
     }
 
     fn default_table_location(ident: &TableIdent) -> String {
@@ -330,7 +347,9 @@ impl Metastore for InMemoryMetastore {
                 .cloned()
                 .collect();
             for key in table_keys {
-                state.tables.remove(&key);
+                if let Some(table) = state.tables.remove(&key) {
+                    state.dropped_tables.insert(key, (table, Self::now_ms()));
+                }
             }
             for db in in_use {
                 state.databases.remove(&db);
@@ -449,7 +468,11 @@ impl Metastore for InMemoryMetastore {
             .cloned()
             .collect();
         for key in &table_keys {
-            state.tables.remove(key);
+            if let Some(table) = state.tables.remove(key) {
+                state
+                    .dropped_tables
+                    .insert(key.clone(), (table, Self::now_ms()));
+            }
         }
         state.databases.remove(name);
         Ok(())
@@ -543,7 +566,9 @@ impl Metastore for InMemoryMetastore {
             .fail();
         }
         for key in tables {
-            state.tables.remove(&key);
+            if let Some(table) = state.tables.remove(&key) {
+                state.dropped_tables.insert(key, (table, Self::now_ms()));
+            }
         }
         state.schemas.remove(&Self::schema_key(ident));
         Ok(())
@@ -808,8 +833,49 @@ impl Metastore for InMemoryMetastore {
     #[instrument(name = "Metastore::delete_table", level = "debug", skip(self), err)]
     async fn delete_table(&self, ident: &TableIdent, _cascade: bool) -> Result<()> {
         let mut state = self.state.write().await;
-        state.tables.remove(&Self::table_key(ident));
+        if let Some(table) = state.tables.remove(&Self::table_key(ident)) {
+            state
+                .dropped_tables
+                .insert(Self::table_key(ident), (table, Self::now_ms()));
+        }
         Ok(())
+    }
+
+    #[instrument(name = "Metastore::undrop_table", level = "debug", skip(self), err)]
+    async fn undrop_table(&self, ident: &TableIdent) -> Result<RwObject<Table>> {
+        let mut state = self.state.write().await;
+        let key = Self::table_key(ident);
+        if state.tables.contains_key(&key) {
+            return metastore_error::TableAlreadyExistsSnafu {
+                table: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        let Some((table, _)) = state.dropped_tables.remove(&key) else {
+            return metastore_error::TableNotDroppedSnafu {
+                table: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        };
+        state.tables.insert(key, table.clone());
+        Ok(table)
+    }
+
+    #[instrument(name = "Metastore::list_dropped_tables", level = "trace", skip(self), err)]
+    async fn list_dropped_tables(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Table>>> {
+        let state = self.state.read().await;
+        let mut items: Vec<(RwObject<Table>, i64)> = state
+            .dropped_tables
+            .iter()
+            .filter(|((db, sch, _), _)| db == &schema.database && sch == &schema.schema)
+            .map(|(_, (table, dropped_at))| (table.clone(), *dropped_at))
+            .collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1));
+        Ok(items.into_iter().map(|(table, _)| table).collect())
     }
 
     #[instrument(name = "Metastore::table_object_store", level = "trace", ret)]
@@ -970,4 +1036,168 @@ fn convert_schema_fields_to_lowercase(schema: &IcebergSchema) -> Result<IcebergS
     }
 
     builder.build().context(metastore_error::IcebergSpecSnafu)
+}
+
+#[cfg(test)]
+mod undrop_tests {
+    //! Tombstone semantics for M9.3 (design §15): drop → hidden + tombstoned,
+    //! UNDROP restores the most recent drop, bounded errors otherwise.
+
+    use super::*;
+    use crate::models::volumes::{Volume, VolumeType};
+    use iceberg_rust_spec::types::PrimitiveType;
+
+    fn test_schema() -> IcebergSchema {
+        let mut builder = IcebergSchema::builder();
+        builder.with_schema_id(0);
+        builder.with_struct_field(StructField::new(
+            1,
+            "id",
+            false,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        ));
+        builder.build().expect("schema builds")
+    }
+
+    async fn metastore_with_table(db: &str, schema: &str, table: &str) -> InMemoryMetastore {
+        let ms = InMemoryMetastore::new();
+        ms.create_volume(&"vol".to_string(), Volume::new("vol".into(), VolumeType::Memory))
+            .await
+            .expect("volume");
+        ms.create_database(
+            &db.to_string(),
+            Database {
+                ident: db.to_string(),
+                properties: None,
+                volume: "vol".to_string(),
+                should_refresh: false,
+            },
+        )
+        .await
+        .expect("database");
+        ms.create_schema(
+            &SchemaIdent::new(db.to_string(), schema.to_string()),
+            Schema {
+                ident: SchemaIdent::new(db.to_string(), schema.to_string()),
+                properties: None,
+            },
+        )
+        .await
+        .expect("schema");
+        ms.create_table(
+            &TableIdent::new(db, schema, table),
+            TableCreateRequest {
+                ident: TableIdent::new(db, schema, table),
+                properties: None,
+                format: Some(TableFormat::Iceberg),
+                location: None,
+                schema: test_schema(),
+                partition_spec: None,
+                sort_order: None,
+                stage_create: None,
+                volume_ident: Some("vol".to_string()),
+                is_temporary: Some(false),
+            },
+        )
+        .await
+        .expect("table");
+        ms
+    }
+
+    #[tokio::test]
+    async fn drop_tombstones_and_undrop_restores() {
+        let ms = metastore_with_table("d", "s", "t").await;
+        let ident = TableIdent::new("d", "s", "t");
+
+        ms.delete_table(&ident, false).await.expect("drop");
+        // Hidden from resolution and listing…
+        assert!(!ms.get_table(&ident).await.unwrap().is_some());
+        assert!(ms.list_tables(&SchemaIdent::new("d".into(), "s".into())).await.unwrap().is_empty());
+        // …but tombstoned.
+        let dropped = ms
+            .list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .unwrap();
+        assert_eq!(dropped.len(), 1);
+
+        // UNDROP restores the record.
+        let restored = ms.undrop_table(&ident).await.expect("undrop");
+        assert_eq!(restored.ident, ident);
+        assert!(ms.get_table(&ident).await.unwrap().is_some());
+        assert!(ms
+            .list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .unwrap()
+            .is_empty());
+
+        // UNDROP of a live table errors (name occupied).
+        let err = ms.undrop_table(&ident).await.unwrap_err().to_string();
+        assert!(err.contains("already exists"), "got: {err}");
+
+        // UNDROP with no tombstone and no live table errors.
+        let err = ms
+            .undrop_table(&TableIdent::new("d", "s", "nope"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not dropped"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn re_drop_overwrites_tombstone_most_recent_wins() {
+        let ms = metastore_with_table("d", "s", "t").await;
+        let ident = TableIdent::new("d", "s", "t");
+
+        // Capture the first record, drop, recreate (new record), drop again.
+        let first = ms.get_table(&ident).await.unwrap().expect("table");
+        ms.delete_table(&ident, false).await.expect("drop");
+        ms.create_table(
+            &ident,
+            TableCreateRequest {
+                ident: ident.clone(),
+                properties: None,
+                format: Some(TableFormat::Iceberg),
+                location: None,
+                schema: test_schema(),
+                partition_spec: None,
+                sort_order: None,
+                stage_create: None,
+                volume_ident: Some("vol".to_string()),
+                is_temporary: Some(false),
+            },
+        )
+        .await
+        .expect("recreate");
+        let second = ms.get_table(&ident).await.unwrap().expect("table");
+        assert_ne!(first.metadata_location, second.metadata_location);
+        ms.delete_table(&ident, false).await.expect("drop");
+
+        // Only the most recent tombstone survives; UNDROP restores it.
+        let dropped = ms
+            .list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .unwrap();
+        assert_eq!(dropped.len(), 1);
+        let restored = ms.undrop_table(&ident).await.expect("undrop");
+        assert_eq!(restored.metadata_location, second.metadata_location);
+    }
+
+    #[tokio::test]
+    async fn schema_cascade_tombstones_tables() {
+        let ms = metastore_with_table("d", "s", "t").await;
+        let ident = TableIdent::new("d", "s", "t");
+        ms.delete_schema(&SchemaIdent::new("d".into(), "s".into()), true)
+            .await
+            .expect("schema drop");
+        assert!(!ms.get_table(&ident).await.unwrap().is_some());
+        let dropped = ms
+            .list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .unwrap();
+        assert_eq!(dropped.len(), 1);
+        // Schema is gone — restore still works at the metastore level.
+        ms.undrop_table(&ident).await.expect("undrop");
+        assert!(ms.get_table(&ident).await.unwrap().is_some());
+    }
 }

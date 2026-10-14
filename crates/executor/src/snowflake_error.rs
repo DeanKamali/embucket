@@ -505,6 +505,27 @@ fn datafusion_parser_error(df_parser_error: &ParserError) -> SnowflakeError {
     }
 }
 
+#[must_use]
+fn not_found_entity(message: &str) -> Option<(Entity, String)> {
+    let (kind, rest) = message.trim().split_once(' ')?;
+    let entity = match kind.to_ascii_lowercase().as_str() {
+        "table" => Entity::Table,
+        "schema" => Entity::Schema,
+        "catalog" => Entity::Database,
+        _ => return None,
+    };
+    let name = rest.strip_prefix('\'')?;
+    let end = name.rfind("' not found")?;
+    if end == 0 {
+        return None;
+    }
+    let name = &name[..end];
+    if name.is_empty() {
+        return None;
+    }
+    Some((entity, name.to_string()))
+}
+
 #[allow(clippy::too_many_lines)]
 fn datafusion_error(df_error: &DataFusionError, subtext: &[&str]) -> SnowflakeError {
     let subtext = [subtext, &["DataFusion"]].concat();
@@ -552,18 +573,34 @@ fn datafusion_error(df_error: &DataFusionError, subtext: &[&str]) -> SnowflakeEr
         .build(),
         DataFusionError::Diagnostic(diagnostic, _inner) => {
             let diagnostic = *diagnostic.clone();
-            // TODO: Should we use Plan error somehow?
-            // two errors provided: what if it contains some additional data and not just message copy?
-            // Following goes here:
-            // SQL compilation error: Object 'DATABASE.PUBLIC.ARRAY_DATA' does not exist or not authorized.
-            let diagn_error = if diagnostic.span.is_some() {
-                CompilationDiagnosticGenericSnafu { error: diagnostic }.build()
+            // Snowflake shape (design §17, M10): an object that cannot be
+            // resolved — because it is missing OR because the session's
+            // active role has no grant (deny = as-if-missing) — renders as
+            // "does not exist or not authorized". DataFusion's resolution
+            // diagnostics carry the raw "… not found" text; translate it.
+            if let Some((entity, name)) = not_found_entity(&diagnostic.message) {
+                SnowflakeError::SqlCompilation {
+                    error: EntityDoesntExistSnafu {
+                        operation_on: OperationOn::Unknown,
+                        entity_name: name,
+                        entity_type: entity,
+                    }
+                    .build(),
+                    error_code: ErrorCode::EntityNotFound(entity, OperationOn::Unknown),
+                }
             } else {
-                CompilationDiagnosticEmptySpanSnafu { error: diagnostic }.build()
-            };
-            SnowflakeError::SqlCompilation {
-                error: diagn_error,
-                error_code: ErrorCode::DataFusionSql,
+                // two errors provided: what if it contains some additional data and not just message copy?
+                // Following goes here:
+                // SQL compilation error: Object 'DATABASE.PUBLIC.ARRAY_DATA' does not exist or not authorized.
+                let diagn_error = if diagnostic.span.is_some() {
+                    CompilationDiagnosticGenericSnafu { error: diagnostic }.build()
+                } else {
+                    CompilationDiagnosticEmptySpanSnafu { error: diagnostic }.build()
+                };
+                SnowflakeError::SqlCompilation {
+                    error: diagn_error,
+                    error_code: ErrorCode::DataFusionSql,
+                }
             }
         }
         DataFusionError::Execution(error) => SnowflakeError::SqlCompilation {

@@ -648,7 +648,7 @@ impl WarehouseManager {
             Vec::new()
         };
         for replica in 0..replicas {
-            let sched_name = scheduler_replica_name(name, replica);
+            let sched_name = scheduler_replica_name(name, replica, replicas);
             let mut sched_env = container_env.clone();
             sched_env.extend(shared_env.iter().cloned());
             sched_env.sort();
@@ -665,6 +665,13 @@ impl WarehouseManager {
                         // container name / shared alias
                         "--external-host".to_string(),
                         sched_name.clone(),
+                        // Tight executor-expiry (M7.3): the shared cluster
+                        // state may carry executors from a scheduler that
+                        // died without deregistering them; with 10s
+                        // heartbeats, 30s (3 missed beats) bounds how long a
+                        // ghost executor stays schedulable.
+                        "--executor-timeout-seconds".to_string(),
+                        "30".to_string(),
                     ],
                     env: sched_env,
                     volumes: container_volumes.clone(),
@@ -761,7 +768,7 @@ impl WarehouseManager {
     async fn stop_schedulers(&self, name: &str, replicas: u16) -> Result<()> {
         let replicas = replicas.max(1);
         for i in (0..replicas).rev() {
-            let sched = scheduler_replica_name(name, i);
+            let sched = scheduler_replica_name(name, i, replicas);
             self.driver.stop(&sched).await?;
         }
         Ok(())
@@ -858,15 +865,19 @@ fn allocate_free_host_port() -> Option<u16> {
         .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
 }
 
-/// Container name of scheduler replica `replica` (M7.3): replica 0 keeps the
-/// historical name; replicas >= 1 get a `-<n>` suffix.
+/// Container name of scheduler replica `replica` (M7.3). With a single
+/// replica the historical unsuffixed name is kept. With 2+ replicas every
+/// replica gets a `-<n>` suffix — including replica 0 — so that no replica's
+/// own name collides with the shared network alias (the alias must resolve
+/// to *all* replicas for executor dialing, while a task's status-callback
+/// endpoint must resolve to *exactly* the scheduler that launched it).
 #[must_use]
-pub fn scheduler_replica_name(warehouse: &str, replica: u16) -> String {
+pub fn scheduler_replica_name(warehouse: &str, replica: u16, replicas: u16) -> String {
     let base = scheduler_container_name(warehouse);
-    if replica == 0 {
-        base
-    } else {
+    if replicas >= 2 {
         format!("{base}-{replica}")
+    } else {
+        base
     }
 }
 

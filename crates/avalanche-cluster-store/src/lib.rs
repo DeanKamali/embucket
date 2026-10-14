@@ -83,6 +83,7 @@ impl PgClusterBuilder {
             self.config_producer,
         );
         let cluster_state = PostgresClusterState::new(pool, self.refresh_interval_ms);
+        job_state.init().await?;
         cluster_state.init().await?;
         Ok(BallistaCluster::new(
             std::sync::Arc::new(cluster_state),

@@ -439,6 +439,17 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                     tls: Some(false),
                     scheduler_replicas: None,
                 })
+            } else if upper.get(i + 1).map(String::as_str) == Some("SCHEDULER_REPLICAS") {
+                Some(WarehouseStatement::AlterSet {
+                    name,
+                    size: None,
+                    auto_suspend_secs: None,
+                    auto_resume: None,
+                    statement_timeout_secs: None,
+                    storage: None,
+                    tls: None,
+                    scheduler_replicas: Some(1),
+                })
             } else {
                 None
             }
@@ -820,6 +831,7 @@ mod tests {
                 statement_timeout_secs: None,
                 storage_credentials: None,
                 tls: None,
+                scheduler_replicas: None,
                 if_not_exists: false,
             }
         );
@@ -929,6 +941,7 @@ mod tests {
                 statement_timeout_secs: None,
                 storage: Some(StorageOp::Unset),
                 tls: None,
+                scheduler_replicas: None,
             })
         );
         assert_eq!(
@@ -962,6 +975,7 @@ mod tests {
                 statement_timeout_secs: Some(0),
                 storage: None,
                 tls: None,
+                scheduler_replicas: None,
             })
         );
     }
@@ -979,8 +993,51 @@ mod tests {
                 statement_timeout_secs: None,
                 storage_credentials: None,
                 tls: None,
+                scheduler_replicas: None,
                 if_not_exists: false,
             }
+        );
+    }
+
+    #[test]
+    fn parses_scheduler_replicas() {
+        let stmt = parse(
+            "CREATE WAREHOUSE etl WITH SCHEDULER_REPLICAS = 2;",
+        )
+        .expect("should parse");
+        let WarehouseStatement::Create {
+            scheduler_replicas, ..
+        } = stmt
+        else {
+            panic!("expected Create");
+        };
+        assert_eq!(scheduler_replicas, Some(2));
+
+        assert_eq!(
+            parse("ALTER WAREHOUSE wh SET SCHEDULER_REPLICAS = 3;"),
+            Some(WarehouseStatement::AlterSet {
+                name: "WH".to_string(),
+                size: None,
+                auto_suspend_secs: None,
+                auto_resume: None,
+                statement_timeout_secs: None,
+                storage: None,
+                tls: None,
+                scheduler_replicas: Some(3),
+            })
+        );
+        assert_eq!(
+            parse("ALTER WAREHOUSE wh UNSET SCHEDULER_REPLICAS;"),
+            Some(WarehouseStatement::AlterSet {
+                name: "WH".to_string(),
+                size: None,
+                auto_suspend_secs: None,
+                auto_resume: None,
+                statement_timeout_secs: None,
+                storage: None,
+                tls: None,
+                scheduler_replicas: Some(1),
+            })
         );
     }
 
@@ -996,6 +1053,7 @@ mod tests {
                 statement_timeout_secs: None,
                 storage: None,
                 tls: None,
+                scheduler_replicas: None,
             })
         );
         assert_eq!(

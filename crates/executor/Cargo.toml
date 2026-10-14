@@ -20,6 +20,7 @@ state-store-query-test = ["state-store-query"]
 state-store-query = ["state-store"]
 
 [dependencies]
+cron = "0.15"
 avalanche-account = { path = "../avalanche-account" }
 avalanche-executor-common = { path = "../avalanche-executor-common" }
 avalanche-warehouse = { path = "../avalanche-warehouse" }

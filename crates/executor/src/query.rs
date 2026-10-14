@@ -341,6 +341,13 @@ impl UserQuery {
         {
             return result;
         }
+        // Avalanche (design §18, M11): automation DDL (streams, tasks,
+        // dynamic tables) is intercepted pre-parse — no sqlparser grammar.
+        if let Some(result) =
+            crate::automation_ddl::try_execute(&self.raw_query, &self.session).await
+        {
+            return result;
+        }
         // Avalanche (design §5): warehouse DDL is intercepted pre-parse —
         // the sqlparser fork has no WAREHOUSE statements.
         if let Some(result) =
@@ -422,8 +429,16 @@ impl UserQuery {
                         _ => self.set_tuple_variables_from_sql(&self.raw_query).await,
                     };
                 }
-                Statement::CreateTable { .. } => {
-                    return Box::pin(self.create_table_query(*s)).await;
+                Statement::CreateTable(create_table) => {
+                    let has_query = create_table.query.is_some();
+                    let result =
+                        Box::pin(self.create_table_query(Statement::CreateTable(create_table)))
+                            .await;
+                    // Stream consumption (design §18.1-1) applies to CTAS.
+                    if result.is_ok() && has_query {
+                        crate::automation_ddl::advance_consumed_streams(self).await?;
+                    }
+                    return result;
                 }
                 Statement::CreateView { .. } => {
                     return Box::pin(self.create_view(*s)).await;
@@ -470,7 +485,14 @@ impl UserQuery {
                 | Statement::Rollback { .. }
                 | Statement::Update { .. } => return self.status_response(),
                 Statement::Insert { .. } => {
-                    return Box::pin(self.execute_with_custom_plan(&self.query)).await;
+                    let result = Box::pin(self.execute_with_custom_plan(&self.query)).await;
+                    // Stream consumption (design §18.1-1): a successful DML
+                    // read advances the stream offsets to the source's
+                    // current snapshot.
+                    if result.is_ok() {
+                        crate::automation_ddl::advance_consumed_streams(self).await?;
+                    }
+                    return result;
                 }
                 Statement::ShowDatabases { .. }
                 | Statement::ShowSchemas { .. }

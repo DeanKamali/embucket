@@ -1303,7 +1303,35 @@ impl Metastore for InMemoryMetastore {
             }
             .fail();
         }
-        Self::assert_object_name_free(&state, ident)?;
+        // A dynamic table shares its ident with the underlying table
+        // created by the DT's CTAS (design §18.1-5): an existing table
+        // record is expected here and allowed. Streams, tasks, and
+        // duplicate DT records still conflict.
+        let key = Self::table_key(ident);
+        if state.streams.contains_key(&key) {
+            return metastore_error::StreamAlreadyExistsSnafu {
+                stream: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        if state.tasks.contains_key(&key) {
+            return metastore_error::TaskAlreadyExistsSnafu {
+                task: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        if state.dynamic_tables.contains_key(&key) {
+            return metastore_error::DynamicTableAlreadyExistsSnafu {
+                table: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
         let row = RwObject::new(dynamic_table);
         state
             .dynamic_tables

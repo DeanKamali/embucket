@@ -5,6 +5,7 @@ pub mod dedicated_executor;
 pub mod clone_ddl;
 pub mod error;
 pub mod error_code;
+pub mod time_travel;
 pub mod models;
 pub mod query;
 pub mod query_task_result;

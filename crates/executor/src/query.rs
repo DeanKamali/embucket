@@ -355,6 +355,9 @@ impl UserQuery {
         {
             return result;
         }
+        // Time travel (design §15, M9.2) — pre-parse AT() predicate rewrite:
+        // the sqlparser fork has no AT() grammar either.
+        crate::time_travel::rewrite(&mut self.raw_query, &self.session).await?;
         // Resume-on-query + activity tracking for the session's warehouse.
         if let Some(warehouse) = self.session.get_session_variable("warehouse") {
             self.session.warehouse.ensure_running(&warehouse).await;

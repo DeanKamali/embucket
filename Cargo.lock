@@ -197,6 +197,7 @@ version = "0.1.0"
 dependencies = [
  "api-snowflake-rest-sessions",
  "arrow 59.2.0",
+ "avalanche-account",
  "axum 0.8.9",
  "axum-server",
  "base64 0.22.1",
@@ -820,6 +821,23 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
+name = "avalanche-account"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "catalog",
+ "catalog-metastore",
+ "datafusion",
+ "datafusion-common",
+ "serde",
+ "snafu",
+ "strum",
+ "strum_macros",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "avalanche-cluster-store"
@@ -3632,6 +3650,7 @@ version = "0.1.0"
 dependencies = [
  "api-snowflake-rest",
  "api-snowflake-rest-sessions",
+ "avalanche-account",
  "axum 0.8.9",
  "build-info",
  "catalog-metastore",
@@ -3733,6 +3752,7 @@ dependencies = [
  "arrow-schema 59.2.0",
  "async-stream",
  "async-trait",
+ "avalanche-account",
  "avalanche-executor-common",
  "avalanche-warehouse",
  "aws-config",

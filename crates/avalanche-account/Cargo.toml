@@ -1,0 +1,24 @@
+[package]
+name = "avalanche-account"
+version = "0.1.0"
+edition = "2024"
+license-file = { workspace = true }
+
+[dependencies]
+async-trait = { workspace = true }
+catalog = { path = "../catalog" }
+catalog-metastore = { path = "../catalog-metastore" }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+serde = { workspace = true }
+snafu = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

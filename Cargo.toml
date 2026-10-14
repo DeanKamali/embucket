@@ -19,6 +19,7 @@ members = [
   "crates/avalanche-cluster-store",
   "crates/avalanche-cluster-store",
   "crates/avalanche-executor",
+  "crates/avalanche-account",
   "crates/build-info",
 ]
 resolver = "2"

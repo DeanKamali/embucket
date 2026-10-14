@@ -348,6 +348,13 @@ impl UserQuery {
         {
             return result;
         }
+        // Zero-copy clone DDL (design §14) — also pre-parse: the sqlparser
+        // fork has no CLONE grammar.
+        if let Some(result) =
+            crate::clone_ddl::try_execute(&self.raw_query, &self.session).await
+        {
+            return result;
+        }
         // Resume-on-query + activity tracking for the session's warehouse.
         if let Some(warehouse) = self.session.get_session_variable("warehouse") {
             self.session.warehouse.ensure_running(&warehouse).await;

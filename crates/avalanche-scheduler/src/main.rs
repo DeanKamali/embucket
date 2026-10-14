@@ -92,6 +92,34 @@ async fn inner() -> BallistaResult<()> {
         avalanche_executor_common::register_storage_in_session(state)
     }));
 
+    // Scheduler HA (M7.3, design §13.3): when `AVALANCHE_CLUSTER_PG_URL` is
+    // set, executor/job state lives in shared Postgres tables and several
+    // schedulers can serve one warehouse behind a common network alias.
+    // Without the env the process keeps ballista's in-memory backend.
+    let cluster = match env::var("AVALANCHE_CLUSTER_PG_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            let session_builder = config
+                .override_session_builder
+                .clone()
+                .expect("session builder override set above");
+            let config_producer = config
+                .override_config_producer
+                .clone()
+                .expect("config producer override set above");
+            let cluster = avalanche_cluster_store::PgClusterBuilder::new(
+                url,
+                config.scheduler_id.clone(),
+            )
+            .session_builder(session_builder)
+            .config_producer(config_producer)
+            .build()
+            .await?;
+            tracing::info!("cluster state: postgres (HA replicas)");
+            cluster
+        }
+        _ => BallistaCluster::new_from_config(&config).await?,
+    };
+
     // Mutual TLS (M7.2, design §13.2): when `AVALANCHE_TLS_DIR` is set, the
     // gRPC/REST listener serves TLS with *required* client certificates and
     // the Flight proxy's connections to executors present the client
@@ -117,14 +145,11 @@ async fn inner() -> BallistaResult<()> {
         }));
 
         let config = Arc::new(config);
-        let cluster = BallistaCluster::new_from_config(&config).await?;
         avalanche_scheduler::tls::start_server_tls(cluster, addr, config, &tls).await?;
         return Ok(());
     }
 
     let config = Arc::new(config);
-
-    let cluster = BallistaCluster::new_from_config(&config).await?;
     start_server(cluster, addr, config).await?;
 
     Ok(())

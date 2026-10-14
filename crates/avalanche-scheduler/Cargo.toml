@@ -5,6 +5,7 @@ edition = "2024"
 license-file = { workspace = true }
 
 [dependencies]
+avalanche-cluster-store = { path = "../avalanche-cluster-store" }
 avalanche-executor-common = { path = "../avalanche-executor-common" }
 ballista-core = "55.0.0"
 ballista-scheduler = "55.0.0"

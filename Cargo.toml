@@ -16,6 +16,8 @@ members = [
   "crates/avalanche-warehouse",
   "crates/avalanche-executor-common",
   "crates/avalanche-scheduler",
+  "crates/avalanche-cluster-store",
+  "crates/avalanche-cluster-store",
   "crates/avalanche-executor",
   "crates/build-info",
 ]

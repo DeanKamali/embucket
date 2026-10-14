@@ -238,16 +238,16 @@ async fn execute_task(
         )
         .await?;
     let definition = task.definition.clone();
-    let run_result = UserQuery::new(
-        Arc::clone(&session),
+    let run_result = crate::automation_ddl::run_nested(
+        &session,
         definition,
         QueryContext::new(
             Some(record.ident.database.clone()),
             Some(record.ident.schema.clone()),
             None,
         ),
+        "scheduled task",
     )
-    .execute()
     .await;
 
     let metastore = service.metastore_clone();

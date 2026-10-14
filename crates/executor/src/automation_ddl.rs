@@ -449,6 +449,36 @@ pub(crate) fn automation_error(context: &str, error: impl std::fmt::Display) -> 
     }
 }
 
+/// Runs a nested query on its own tokio task. Awaiting the nested
+/// `UserQuery::execute` inline builds a poll chain deep enough to overflow
+/// the 2 MB tokio worker stack in debug builds (found by the M11 probe on
+/// `EXECUTE TASK`); a spawned task gives the nested future a fresh stack
+/// budget since its state is heap-allocated.
+///
+/// The spawn itself lives in a non-async helper: constructed inline in an
+/// async fn, the block's future would be stored in this future's state and
+/// tie the `Send` proof into the `try_execute`/`execute` recursion cycle,
+/// which the compiler cannot resolve.
+pub(crate) async fn run_nested(
+    session: &Arc<UserSession>,
+    sql: String,
+    ctx: QueryContext,
+    context: &str,
+) -> Result<QueryResult> {
+    spawn_nested_query(Arc::clone(session), sql, ctx)
+        .await
+        .map_err(|e| automation_error(context, e))?
+        .map_err(|e| automation_error(context, e))
+}
+
+fn spawn_nested_query(
+    session: Arc<UserSession>,
+    sql: String,
+    ctx: QueryContext,
+) -> tokio::task::JoinHandle<Result<QueryResult>> {
+    tokio::spawn(async move { UserQuery::new(session, sql, ctx).execute().await })
+}
+
 fn table_ident(ident: &crate::utils::NormalizedIdent) -> TableIdent {
     let metastore_ident: catalog_metastore::TableIdent = ident.clone().into();
     metastore_ident
@@ -740,14 +770,8 @@ async fn execute(stmt: &AutomationStatement, session: &Arc<UserSession>) -> Resu
             // context (scheduled runs use the task's warehouse instead,
             // §18.1-4).
             let definition = existing.data.definition.clone();
-            let run = UserQuery::new(
-                Arc::clone(session),
-                definition,
-                QueryContext::default(),
-            )
-            .execute()
-            .await
-            .map_err(|e| automation_error("execute task", e))?;
+            let run =
+                run_nested(session, definition, QueryContext::default(), "execute task").await?;
             let updated = Task {
                 last_run_state: Some(TaskRunState::Succeeded),
                 ..existing.data.clone()
@@ -772,10 +796,7 @@ async fn execute(stmt: &AutomationStatement, session: &Arc<UserSession>) -> Resu
             // reuses registration, schema inference, and the initial load.
             let replace = if *or_replace { "OR REPLACE " } else { "" };
             let ctas = format!("CREATE {replace}TABLE {target} AS {definition}");
-            UserQuery::new(Arc::clone(session), ctas, QueryContext::default())
-                .execute()
-                .await
-                .map_err(|e| automation_error("create dynamic table", e))?;
+            run_nested(session, ctas, QueryContext::default(), "create dynamic table").await?;
             let record = DynamicTable {
                 ident: table_ident(&ident),
                 definition: definition.clone(),
@@ -803,14 +824,13 @@ async fn execute(stmt: &AutomationStatement, session: &Arc<UserSession>) -> Resu
                 .delete_dynamic_table(&table_ident(&ident))
                 .await
                 .map_err(|e| automation_error("drop dynamic table", e))?;
-            UserQuery::new(
-                Arc::clone(session),
+            run_nested(
+                session,
                 format!("DROP TABLE {target}"),
                 QueryContext::default(),
+                "drop dynamic table",
             )
-            .execute()
-            .await
-            .map_err(|e| automation_error("drop dynamic table", e))?;
+            .await?;
             crate::clone_ddl::status_row()
         }
         AutomationStatement::ShowDynamicTables => {
@@ -858,14 +878,8 @@ pub(crate) async fn refresh_dynamic_table(
         })?;
     let target = ident.to_string();
     let overwrite = format!("INSERT OVERWRITE INTO {target} {}", record.definition);
-    let result = UserQuery::new(
-        Arc::clone(session),
-        overwrite,
-        QueryContext::default(),
-    )
-    .execute()
-    .await
-    .map_err(|e| automation_error("refresh", e))?;
+    let result =
+        run_nested(session, overwrite, QueryContext::default(), "refresh").await?;
     let updated = DynamicTable {
         last_refresh_ms: Some(chrono::Utc::now().timestamp_millis()),
         ..record.data.clone()

@@ -6,8 +6,8 @@
 
 use crate::driver::{ContainerDriver, ContainerSpec};
 use crate::error::{
-    AlreadyExistsSnafu, InvalidAutoSuspendSnafu, InvalidSizeSnafu, NotFoundSnafu, Result,
-    StateStoreSnafu, TlsSnafu,
+    AlreadyExistsSnafu, ConfigSnafu, InvalidAutoSuspendSnafu, InvalidSizeSnafu, NotFoundSnafu,
+    Result, StateStoreSnafu, TlsSnafu,
 };
 use crate::metering::MeteringLedger;
 use crate::model::{Warehouse, WarehouseSize, WarehouseState};
@@ -72,6 +72,9 @@ pub struct CreateWarehouseRequest {
     /// Per-warehouse storage credentials (M7.1): injected into compute
     /// containers as env, never into plans.
     pub storage_credentials: Option<StorageCredentials>,
+    /// Scheduler replicas sharing Postgres-backed cluster state (M7.3);
+    /// 1 (default) is the plain single-scheduler warehouse.
+    pub scheduler_replicas: u16,
     /// Mutual TLS (M7.2): start compute with `AVALANCHE_TLS_DIR` and
     /// advertise the scheduler over `https://`.
     pub tls: bool,
@@ -93,6 +96,13 @@ pub struct WarehouseManager {
 }
 
 const INTERNAL_SCHEDULER_PORT: u16 = 50050;
+
+/// Env var that hands scheduler replicas their shared Postgres cluster state
+/// (M7.3): value is a `postgres://` URL rewritten for container reachability.
+pub const CLUSTER_STATE_PG_ENV: &str = "AVALANCHE_CLUSTER_PG_URL";
+
+/// Hard cap on scheduler replicas per warehouse (resource sanity).
+const MAX_SCHEDULER_REPLICAS: u16 = 4;
 
 impl WarehouseManager {
     pub fn new(
@@ -161,6 +171,14 @@ impl WarehouseManager {
         record.statement_timeout_secs = req.statement_timeout_secs;
         record.storage_credentials = req.storage_credentials.clone();
         record.tls = req.tls;
+        record.scheduler_replicas = req.scheduler_replicas.max(1);
+        if record.scheduler_replicas >= 2 && !shared_state_url_configured() {
+            return Err(ConfigSnafu {
+                message: "SCHEDULER_REPLICAS > 1 requires STATESTORE_PG_URL (or DATABASE_URL)                           on the router: replicas share executor/job state through Postgres"
+                    .to_string(),
+            }
+            .build());
+        }
         // Reserve a host port for the scheduler so host-side clients can dial
         // its gRPC endpoint. Best-effort: creation must not fail on it.
         record.scheduler_host_port = allocate_free_host_port();
@@ -261,7 +279,8 @@ impl WarehouseManager {
                         .stop(&executor_container_name(name, i))
                         .await?;
                 }
-                self.driver.stop(&scheduler_container_name(name)).await?;
+                self.stop_schedulers(name, self.record(name).await?.scheduler_replicas)
+                    .await?;
                 self.start_compute(name, size, WarehouseState::Running)
                     .await?;
             }
@@ -296,9 +315,45 @@ impl WarehouseManager {
                         .stop(&executor_container_name(name, i))
                         .await?;
                 }
-                self.driver.stop(&scheduler_container_name(name)).await?;
+                self.stop_schedulers(name, self.record(name).await?.scheduler_replicas)
+                    .await?;
                 self.start_compute(name, size, WarehouseState::Running)
                     .await?;
+            }
+        }
+        self.get(name).await
+    }
+
+    /// Set the scheduler replica count for a warehouse (M7.3). Replicas >1
+    /// requires a shared Postgres cluster state (see `create`); a running
+    /// warehouse's schedulers are restarted so the replica set takes effect.
+    ///
+    /// # Errors
+    ///
+    /// Errors when replicas > 1 but no `STATESTORE_PG_URL` is configured, or
+    /// the warehouse is unknown.
+    pub async fn set_scheduler_replicas(&self, name: &str, replicas: u16) -> Result<Warehouse> {
+        let replicas = replicas.max(1).min(MAX_SCHEDULER_REPLICAS);
+        if replicas >= 2 && !shared_state_url_configured() {
+            return Err(ConfigSnafu {
+                message: "SCHEDULER_REPLICAS > 1 requires STATESTORE_PG_URL (or DATABASE_URL)                           on the router: replicas share executor/job state through Postgres"
+                    .to_string(),
+            }
+            .build());
+        }
+        let was_running = self.state(name).await? == WarehouseState::Running;
+        let old_replicas = self.record(name).await?.scheduler_replicas;
+        let mut record = self.record(name).await?;
+        record.scheduler_replicas = replicas;
+        record.updated_at = Some(now_secs());
+        self.state_store
+            .put_warehouse(record)
+            .await
+            .context(StateStoreSnafu)?;
+        if was_running {
+            if let Some(size) = WarehouseSize::parse(&self.record(name).await?.size) {
+                self.stop_schedulers(name, old_replicas.max(replicas)).await?;
+                self.start_compute(name, size, WarehouseState::Running).await?;
             }
         }
         self.get(name).await
@@ -351,6 +406,16 @@ impl WarehouseManager {
             .find_record(name)
             .await
             .ok_or_else(|| NotFoundSnafu { name: name.to_string() }.build())?;
+        // Replicas >= 2 (M7.3): advertise the shared network alias instead of
+        // one mapped host port. The docker driver pins the alias to *every*
+        // replica's bridge IP in /etc/hosts; the router's connector iterates
+        // resolved addresses until one accepts — that iteration is the
+        // failover. (k8s: the per-warehouse Service name load-balances.)
+        if record.scheduler_replicas >= 2 {
+            let alias = scheduler_container_name(&record.name);
+            let scheme = if record.tls { "https" } else { "http" };
+            return Ok(format!("{scheme}://{alias}:{INTERNAL_SCHEDULER_PORT}"));
+        }
         // docker driver: mapped host port on loopback; k8s driver: scheduler
         // pod IP (re-resolved per call, so restarts don't leave stale URLs)
         let url = self
@@ -383,7 +448,7 @@ impl WarehouseManager {
                     .await?;
             }
         }
-        self.driver.stop(&scheduler_container_name(name)).await?;
+        self.stop_schedulers(name, record.scheduler_replicas).await?;
         self.state_store
             .delete_warehouse(name)
             .await
@@ -410,6 +475,7 @@ impl WarehouseManager {
                 .as_ref()
                 .map(StorageCredentials::summary),
             tls: record.tls,
+            scheduler_replicas: record.scheduler_replicas,
         })
     }
 
@@ -530,7 +596,7 @@ impl WarehouseManager {
         size: WarehouseSize,
         state: WarehouseState,
     ) -> Result<()> {
-        let sched_name = scheduler_container_name(name);
+        let base_sched_name = scheduler_container_name(name);
         // The scheduler's host port is fixed at creation and persisted on the
         // record, so suspend/resume cycles keep the same mapping.
         let record = self.record(name).await.ok();
@@ -557,29 +623,65 @@ impl WarehouseManager {
             (storage_env, Vec::new())
         };
         container_env.sort();
-        self.driver
-            .start(&ContainerSpec {
-                name: sched_name.clone(),
-                image: self.images.scheduler.clone(),
-                args: vec![
-                    "--bind-host".to_string(),
-                    "0.0.0.0".to_string(),
-                    "--bind-port".to_string(),
-                    INTERNAL_SCHEDULER_PORT.to_string(),
-                    // executors in the same docker network connect by
-                    // container name
-                    "--external-host".to_string(),
-                    sched_name.clone(),
-                ],
-                env: container_env.clone(),
-                volumes: container_volumes.clone(),
-                ports: scheduler_host_port
-                    .map_or_else(Vec::new, |host_port| {
-                        vec![(host_port, INTERNAL_SCHEDULER_PORT)]
-                    }),
-                network: self.network.clone(),
-            })
-            .await?;
+        // Scheduler replicas (M7.3): replica 0 keeps the historical container
+        // name and the mapped host port; replicas 1..n share the base name as
+        // a docker network alias so executors dial one name for the whole
+        // replica set, and the alias keeps resolving while one replica lives.
+        // Replicas >1 share executor/job state through Postgres (validated at
+        // create/ALTER time); the env hands each replica its URL.
+        let replicas = record
+            .as_ref()
+            .map_or(1, |r| r.scheduler_replicas.max(1));
+        let shared_env: Vec<(String, String)> = if replicas >= 2 {
+            match self.shared_state_env().await {
+                Some(env) => vec![env],
+                None => {
+                    return Err(ConfigSnafu {
+                        message: format!(
+                            "warehouse {name} has SCHEDULER_REPLICAS = {replicas} but no                              container-reachable STATESTORE_PG_URL/DATABASE_URL: replicas                              cannot share cluster state"
+                        ),
+                    }
+                    .build());
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        for replica in 0..replicas {
+            let sched_name = scheduler_replica_name(name, replica);
+            let mut sched_env = container_env.clone();
+            sched_env.extend(shared_env.iter().cloned());
+            sched_env.sort();
+            self.driver
+                .start(&ContainerSpec {
+                    name: sched_name.clone(),
+                    image: self.images.scheduler.clone(),
+                    args: vec![
+                        "--bind-host".to_string(),
+                        "0.0.0.0".to_string(),
+                        "--bind-port".to_string(),
+                        INTERNAL_SCHEDULER_PORT.to_string(),
+                        // executors in the same docker network connect by
+                        // container name / shared alias
+                        "--external-host".to_string(),
+                        sched_name.clone(),
+                    ],
+                    env: sched_env,
+                    volumes: container_volumes.clone(),
+                    ports: (replica == 0)
+                        .then(|| {
+                            scheduler_host_port.map_or_else(Vec::new, |host_port| {
+                                vec![(host_port, INTERNAL_SCHEDULER_PORT)]
+                            })
+                        })
+                        .unwrap_or_default(),
+                    network: self.network.clone(),
+                    network_aliases: (replicas >= 2)
+                        .then(|| vec![base_sched_name.clone()])
+                        .unwrap_or_default(),
+                })
+                .await?;
+        }
 
         let target = if state == WarehouseState::Running {
             size.executor_count()
@@ -592,7 +694,7 @@ impl WarehouseManager {
                 "--bind-host".to_string(),
                 "0.0.0.0".to_string(),
                 "--scheduler-host".to_string(),
-                sched_name.clone(),
+                base_sched_name.clone(),
                 "--scheduler-port".to_string(),
                 INTERNAL_SCHEDULER_PORT.to_string(),
             ];
@@ -615,6 +717,7 @@ impl WarehouseManager {
                     volumes: container_volumes.clone(),
                     ports: vec![],
                     network: self.network.clone(),
+                    network_aliases: Vec::new(),
                 })
                 .await?;
         }
@@ -646,6 +749,30 @@ impl WarehouseManager {
             tracing::warn!(warehouse = name, %err, "metering accrual failed");
         }
         self.running_since.lock().await.insert(name.to_string(), now);
+    }
+
+    /// Stop the scheduler containers `base` plus `-1..replicas` (M7.3).
+    async fn stop_schedulers(&self, name: &str, replicas: u16) -> Result<()> {
+        let replicas = replicas.max(1);
+        for i in (0..replicas).rev() {
+            let sched = scheduler_replica_name(name, i);
+            self.driver.stop(&sched).await?;
+        }
+        Ok(())
+    }
+
+    /// `AVALANCHE_CLUSTER_PG_URL` env for scheduler containers (M7.3): the
+    /// router's own state-store URL, rewritten for container reachability
+    /// (`localhost` → docker bridge gateway). `None` = not configured or the
+    /// rewrite is impossible.
+    async fn shared_state_env(&self) -> Option<(String, String)> {
+        let url = shared_state_url()?;
+        if !pg_url_host_is_localhost(&url) {
+            return Some((CLUSTER_STATE_PG_ENV.to_string(), url));
+        }
+        let gateway = self.driver.network_gateway(self.network.as_deref()).await?;
+        let rewritten = rewrite_localhost_pg_url(&url, &gateway)?;
+        Some((CLUSTER_STATE_PG_ENV.to_string(), rewritten))
     }
 
     async fn record(&self, name: &str) -> Result<WarehouseRecord> {
@@ -725,7 +852,77 @@ fn allocate_free_host_port() -> Option<u16> {
         .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
 }
 
+/// Container name of scheduler replica `replica` (M7.3): replica 0 keeps the
+/// historical name; replicas >= 1 get a `-<n>` suffix.
 #[must_use]
+pub fn scheduler_replica_name(warehouse: &str, replica: u16) -> String {
+    let base = scheduler_container_name(warehouse);
+    if replica == 0 {
+        base
+    } else {
+        format!("{base}-{replica}")
+    }
+}
+
+/// The configured shared-state Postgres URL (`STATESTORE_PG_URL`, falling
+/// back to `DATABASE_URL`), if any.
+#[must_use]
+pub fn shared_state_url() -> Option<String> {
+    std::env::var("STATESTORE_PG_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .ok()
+}
+
+/// Whether a shared-state URL is configured at all (validation gate for
+/// `SCHEDULER_REPLICAS > 1`).
+#[must_use]
+pub fn shared_state_url_configured() -> bool {
+    shared_state_url().is_some()
+}
+
+/// Host portion of a `postgres://[user[:pass]@]host[:port][/db]` URL.
+#[must_use]
+pub fn pg_url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))?;
+    let hostport = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    hostport
+        .split(['/', '?'])
+        .next()
+        .and_then(|hp| hp.split(':').next())
+        .filter(|h| !h.is_empty())
+}
+
+/// True when the URL's host must be rewritten for container reachability
+/// (loopback only resolves inside the router process).
+#[must_use]
+pub fn pg_url_host_is_localhost(url: &str) -> bool {
+    pg_url_host(url).is_some_and(|h| matches!(h, "localhost" | "127.0.0.1" | "::1"))
+}
+
+/// Rewrite a loopback host in a `postgres://` URL to `ip` (docker bridge
+/// gateway) so containers reach the shared cluster-state store.
+#[must_use]
+pub fn rewrite_localhost_pg_url(url: &str, ip: &str) -> Option<String> {
+    let host = pg_url_host(url)?;
+    if !pg_url_host_is_localhost(url) {
+        return Some(url.to_string());
+    }
+    let scheme_end = url.find("://")? + 3;
+    let (scheme, rest) = url.split_at(scheme_end);
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let tail = &rest[authority_end..];
+    let new_authority = match authority.rsplit_once('@') {
+        Some((userinfo, hostport)) => {
+            format!("{userinfo}@{}", hostport.replacen(host, ip, 1))
+        }
+        None => authority.replacen(host, ip, 1),
+    };
+    Some(format!("{scheme}{new_authority}{tail}"))
+}
+
 pub fn scheduler_container_name(warehouse: &str) -> String {
     format!("avalanche-wh-{warehouse}-scheduler")
 }

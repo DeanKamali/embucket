@@ -402,6 +402,7 @@ mod tests {
             volumes: vec![],
             ports: vec![(30001, SCHEDULER_PORT)],
             network: None,
+            network_aliases: Vec::new(),
         };
         let pod = d.pod_manifest(&spec);
         assert_eq!(pod["kind"], "Pod");
@@ -436,6 +437,7 @@ mod tests {
             volumes: vec![],
             ports: vec![],
             network: None,
+            network_aliases: Vec::new(),
         };
         let pod = d.pod_manifest(&spec);
         assert_eq!(pod["spec"]["containers"][0]["ports"], serde_json::Value::Null);

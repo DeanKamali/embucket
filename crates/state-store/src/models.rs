@@ -77,6 +77,15 @@ pub struct WarehouseRecord {
     /// `https://`; without it everything stays plaintext.
     #[serde(default)]
     pub tls: bool,
+    /// Number of scheduler replicas sharing the warehouse's cluster state
+    /// (M7.3, design §13.3). 1 = single scheduler (default, backward
+    /// compatible with pre-M7.3 records).
+    #[serde(default = "default_scheduler_replicas")]
+    pub scheduler_replicas: u16,
+}
+
+fn default_scheduler_replicas() -> u16 {
+    1
 }
 
 impl WarehouseRecord {
@@ -97,6 +106,7 @@ impl WarehouseRecord {
             statement_timeout_secs: None,
             storage_credentials: None,
             tls: false,
+            scheduler_replicas: 1,
         }
     }
 }

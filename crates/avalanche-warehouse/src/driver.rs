@@ -28,6 +28,10 @@ pub struct ContainerSpec {
     pub ports: Vec<(u16, u16)>,
     /// Docker network to attach the container to (container-name DNS).
     pub network: Option<String>,
+    /// Extra DNS names (docker `--network-alias`) this container answers to
+    /// on its network (M7.3): scheduler replicas share one alias so
+    /// executors can dial any replica by the same name.
+    pub network_aliases: Vec<String>,
 }
 
 /// Starts/stops the compute processes of a warehouse.
@@ -42,6 +46,14 @@ pub trait ContainerDriver: Send + Sync {
 
     /// True if a container with this name exists (running or stopped).
     async fn exists(&self, name: &str) -> Result<bool>;
+
+    /// Gateway IP of `network` (docker bridge), used to rewrite host-dialing
+    /// URLs (e.g. the Postgres state-store URL) for container reachability.
+    /// `None` when unsupported (fake) or unknown network.
+    async fn network_gateway(&self, network: Option<&str>) -> Option<String> {
+        let _ = network;
+        None
+    }
 
     /// Address the host-side Ballista client dials for a warehouse's
     /// scheduler. Default: docker-style mapped host port on loopback
@@ -80,33 +92,70 @@ const HOST_DNS_FILE: &str = "/etc/hosts";
 /// embedded DNS answers only *inside* the network — not on the host. Bridge
 /// IPs are host-routable, so we pin the mapping on the host ourselves.
 /// Entries carry `# avalanche-dns` so only our own lines are ever rewritten.
-fn upsert_host_dns(name: &str, ip: &str) {
+/// Name token of a hosts line (`<ip> <name> ...`), if it is one of ours.
+fn host_dns_name(line: &str) -> Option<&str> {
+    if !line.contains(HOST_DNS_MARKER) {
+        return None;
+    }
+    line.split_whitespace().nth(1)
+}
+
+/// Pin `ip` for a container's own name (unique — the line is replaced) and
+/// for each of its network aliases (M7.3). Alias lines carry the owning
+/// container name after the marker (`<ip> <alias> <marker> <container>`) so
+/// `remove_host_dns` can retract exactly this container's entries while
+/// leaving a shared alias resolvable through the other replicas.
+///
+/// A shared alias deliberately accumulates one line per live replica: the
+/// host-side router resolves the alias to all replica IPs and hyper's
+/// connector iterates them until one accepts the connection — that iteration
+/// is the failover mechanism.
+fn upsert_host_dns(name: &str, ip: &str, aliases: &[String]) {
     let Ok(existing) = std::fs::read_to_string(HOST_DNS_FILE) else {
         tracing::warn!("could not read {HOST_DNS_FILE}: container names may not resolve from the host");
         return;
     };
-    let kept: Vec<&str> = existing
+    let self_alias_tag = format!("{HOST_DNS_MARKER} {name}");
+    let mut out: Vec<String> = existing
         .lines()
-        .filter(|l| !(l.contains(name) && l.contains(HOST_DNS_MARKER)))
+        // replace our own name line and our own alias lines
+        .filter(|l| host_dns_name(l) != Some(name))
+        .filter(|l| !l.contains(&self_alias_tag))
+        .map(String::from)
         .collect();
-    let mut out = kept.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
+    // already-pinned alias entries from other replicas with the same ip
+    for alias in aliases {
+        if out
+            .iter()
+            .any(|l| host_dns_name(l) == Some(alias.as_str()) && l.starts_with(ip))
+        {
+            continue;
+        }
+        out.push(format!("{ip} {alias} {HOST_DNS_MARKER} {name}"));
     }
-    out.push_str(&format!("{ip} {name} {HOST_DNS_MARKER}\n"));
-    if let Err(err) = std::fs::write(HOST_DNS_FILE, out) {
+    let mut text = out.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&format!("{ip} {name} {HOST_DNS_MARKER}\n"));
+    if let Err(err) = std::fs::write(HOST_DNS_FILE, text) {
         tracing::warn!("could not update {HOST_DNS_FILE} for {name}: {err}");
     }
 }
 
 /// Remove our hosts-file entry for a stopped container (best-effort).
+/// Remove our hosts-file entries for a stopped container (best-effort): its
+/// own name line plus every alias line it owned (tagged with the container
+/// name). Alias lines owned by sibling replicas survive.
 fn remove_host_dns(name: &str) {
     let Ok(existing) = std::fs::read_to_string(HOST_DNS_FILE) else {
         return;
     };
+    let self_alias_tag = format!("{HOST_DNS_MARKER} {name}");
     let kept: Vec<&str> = existing
         .lines()
-        .filter(|l| !(l.contains(name) && l.contains(HOST_DNS_MARKER)))
+        .filter(|l| host_dns_name(l) != Some(name))
+        .filter(|l| !l.contains(&self_alias_tag))
         .collect();
     let mut out = kept.join("\n");
     if !out.is_empty() {
@@ -162,6 +211,23 @@ impl DockerCliDriver {
 
 #[async_trait]
 impl ContainerDriver for DockerCliDriver {
+    async fn network_gateway(&self, network: Option<&str>) -> Option<String> {
+        let net = network.or(self.network.as_deref()).unwrap_or("bridge");
+        let out = Self::run(&[
+            "network",
+            "inspect",
+            "-f",
+            "{{(index .IPAM.Config 0).Gateway}}",
+            net,
+        ])
+        .await
+        .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|g| !g.is_empty())
+    }
+
     async fn start(&self, spec: &ContainerSpec) -> Result<()> {
         // docker run --name X already exists? then ensure it is started.
         let exists = self.exists(&spec.name).await?;
@@ -171,7 +237,7 @@ impl ContainerDriver for DockerCliDriver {
                 // The container may have re-attached with a different bridge
                 // IP than the pinned hosts-file entry — refresh it.
                 if let Some(ip) = container_ip(&spec.name).await {
-                    upsert_host_dns(&spec.name, &ip);
+                    upsert_host_dns(&spec.name, &ip, &spec.network_aliases);
                 }
                 return Ok(());
             }
@@ -205,6 +271,10 @@ impl ContainerDriver for DockerCliDriver {
             args.push("-p".to_string());
             args.push(format!("{host}:{container}"));
         }
+        for alias in &spec.network_aliases {
+            args.push("--network-alias".to_string());
+            args.push(alias.clone());
+        }
         args.push(spec.image.clone());
         args.extend(spec.args.iter().cloned());
 
@@ -216,7 +286,7 @@ impl ContainerDriver for DockerCliDriver {
             // host-side dials (e.g. the router's partition fetches) resolve
             // the container DNS name that TLS certificates carry.
             if let Some(ip) = container_ip(&spec.name).await {
-                upsert_host_dns(&spec.name, &ip);
+                upsert_host_dns(&spec.name, &ip, &spec.network_aliases);
             }
             return Ok(());
         }

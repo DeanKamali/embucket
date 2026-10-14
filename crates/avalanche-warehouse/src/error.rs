@@ -31,4 +31,10 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("{message}"))]
+    Config {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }

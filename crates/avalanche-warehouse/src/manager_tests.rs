@@ -38,6 +38,7 @@ fn test_manager_with_store() -> (
 
 fn create_req(name: &str, size: WarehouseSize) -> CreateWarehouseRequest {
     CreateWarehouseRequest {
+        scheduler_replicas: 1,
         name: name.to_string(),
         size,
         auto_suspend_secs: 0,

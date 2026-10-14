@@ -157,6 +157,9 @@ pub struct Warehouse {
     /// Mutual TLS (M7.2): compute started with `AVALANCHE_TLS_DIR`, scheduler
     /// advertised over `https://`.
     pub tls: bool,
+    /// Number of scheduler replicas sharing the warehouse's cluster state
+    /// (M7.3): >1 means the warehouse survives one scheduler's death.
+    pub scheduler_replicas: u16,
 }
 
 impl Warehouse {

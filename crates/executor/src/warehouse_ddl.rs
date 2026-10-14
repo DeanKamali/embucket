@@ -34,6 +34,8 @@ pub enum WarehouseStatement {
         storage_credentials: Option<StorageCredentials>,
         /// `TLS = TRUE/FALSE` (M7.2).
         tls: Option<bool>,
+        /// `SCHEDULER_REPLICAS = n` (M7.3).
+        scheduler_replicas: Option<u16>,
         if_not_exists: bool,
     },
     AlterSet {
@@ -46,6 +48,9 @@ pub enum WarehouseStatement {
         /// `SET/UNSET TLS` (M7.2): `Some(true/false)` sets, `Some(false)` is
         /// equivalent to unset (plaintext).
         tls: Option<bool>,
+        /// `SET/UNSET SCHEDULER_REPLICAS` (M7.3): `Some(n)` sets the count;
+        /// UNSET resets to 1 (`Some(1)`).
+        scheduler_replicas: Option<u16>,
     },
     Suspend {
         name: String,
@@ -203,6 +208,7 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
         statement_timeout_secs: None,
         storage_credentials: None,
         tls: None,
+        scheduler_replicas: None,
         if_not_exists,
     };
     // option list: `WITH` keyword, then `KEY [=] VALUE` pairs
@@ -265,6 +271,18 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
                 let val = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_bool(v));
                 if let WarehouseStatement::Create { tls, .. } = &mut stmt {
                     *tls = val;
+                }
+                i = next_index(upper, i + 1);
+            }
+            "SCHEDULER_REPLICAS" => {
+                let val = value_at(tokens, upper, i + 1)
+                    .and_then(|(v, _)| parse_u64(v))
+                    .map(|v| v.min(16) as u16);
+                if let WarehouseStatement::Create {
+                    scheduler_replicas, ..
+                } = &mut stmt
+                {
+                    *scheduler_replicas = val;
                 }
                 i = next_index(upper, i + 1);
             }
@@ -408,6 +426,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                     statement_timeout_secs: None,
                     storage: Some(StorageOp::Unset),
                     tls: None,
+                    scheduler_replicas: None,
                 })
             } else if upper.get(i + 1).map(String::as_str) == Some("TLS") {
                 Some(WarehouseStatement::AlterSet {
@@ -418,6 +437,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                     statement_timeout_secs: None,
                     storage: None,
                     tls: Some(false),
+                    scheduler_replicas: None,
                 })
             } else {
                 None
@@ -431,6 +451,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
             let mut statement_timeout_secs = None;
             let mut storage = None;
             let mut tls = None;
+            let mut scheduler_replicas = None;
             while i < upper.len() {
                 match upper[i].as_str() {
                     "SIZE" | "WAREHOUSE_SIZE" => {
@@ -459,6 +480,11 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                         } else if upper.get(i + 1).map(String::as_str) == Some("TLS") {
                             tls = Some(false);
                             i += 2;
+                        } else if upper.get(i + 1).map(String::as_str)
+                            == Some("SCHEDULER_REPLICAS")
+                        {
+                            scheduler_replicas = Some(1);
+                            i += 2;
                         } else {
                             return None;
                         }
@@ -482,6 +508,12 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                         tls = value_at(tokens, upper, i + 1).and_then(|(v, _)| parse_bool(v));
                         i = next_index(upper, i + 1);
                     }
+                    "SCHEDULER_REPLICAS" => {
+                        scheduler_replicas = value_at(tokens, upper, i + 1)
+                            .and_then(|(v, _)| parse_u64(v))
+                            .map(|v| v.min(16) as u16);
+                        i = next_index(upper, i + 1);
+                    }
                     _ => return None,
                 }
             }
@@ -493,6 +525,7 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                 statement_timeout_secs,
                 storage,
                 tls,
+                scheduler_replicas,
             })
         }
         _ => None,
@@ -530,6 +563,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             statement_timeout_secs,
             storage_credentials,
             tls,
+            scheduler_replicas,
             if_not_exists,
         } => {
             if manager.get(name).await.is_ok() {
@@ -547,6 +581,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
                 statement_timeout_secs: *statement_timeout_secs,
                 storage_credentials: storage_credentials.clone(),
                 tls: tls.unwrap_or(false),
+                scheduler_replicas: scheduler_replicas.unwrap_or(1),
             };
             manager.create(req).await.map_err(warehouse_error)?;
             status_row()
@@ -559,6 +594,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             statement_timeout_secs,
             storage,
             tls,
+            scheduler_replicas,
         } => {
             manager
                 .alter(
@@ -592,6 +628,14 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             // scheduler URL scheme.
             if let Some(tls) = tls {
                 manager.set_tls(name, *tls).await.map_err(warehouse_error)?;
+            }
+            // Scheduler replicas (M7.3): restarts a running warehouse's
+            // schedulers so the replica set takes effect.
+            if let Some(replicas) = scheduler_replicas {
+                manager
+                    .set_scheduler_replicas(name, *replicas)
+                    .await
+                    .map_err(warehouse_error)?;
             }
             status_row()
         }
@@ -683,6 +727,8 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         Field::new("STORAGE", DataType::Utf8, true),
         // M7.2: mutual TLS on/off.
         Field::new("TLS", DataType::Utf8, false),
+        // M7.3: scheduler replicas sharing the warehouse's cluster state.
+        Field::new("SCHEDULER_REPLICAS", DataType::Utf8, false),
     ]));
 
     let created_on: Vec<Option<String>> = warehouses
@@ -722,6 +768,10 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         .iter()
         .map(|wh| Some(wh.tls.to_string()))
         .collect();
+    let replicas: Vec<Option<String>> = warehouses
+        .iter()
+        .map(|wh| Some(wh.scheduler_replicas.to_string()))
+        .collect();
 
     let record = RecordBatch::try_new(
         schema.clone(),
@@ -735,6 +785,7 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
             Arc::new(StringArray::from(auto_resume)),
             Arc::new(StringArray::from(storage)),
             Arc::new(StringArray::from(tls)),
+            Arc::new(StringArray::from(replicas)),
         ],
     )
     .context(ex_error::ArrowSnafu)?;

@@ -882,7 +882,7 @@ impl Metastore for InMemoryMetastore {
             })?;
 
         {
-            let mut state = self.state.write().await;
+            let state = self.state.write().await;
             if !state
                 .schemas
                 .contains_key(&Self::schema_key(&SchemaIdent::new(

@@ -37,9 +37,13 @@ use std::sync::Arc;
 const DATA_FILE_PATH_COLUMN: &str = "__data_file_path";
 
 /// Snowflake stream metadata columns.
-pub const METADATA_ACTION_COLUMN: &str = "METADATA$ACTION";
-pub const METADATA_ISUPDATE_COLUMN: &str = "METADATA$ISUPDATE";
-pub const METADATA_ROW_ID_COLUMN: &str = "METADATA$ROW_ID";
+// Metadata columns are lowercase: DataFusion normalizes unquoted
+// identifiers to lowercase, so `select metadata$action` (the common,
+// unquoted form) resolves. Quoted `"metadata$action"` matches too;
+// quoted uppercase is not supported in v1.
+pub const METADATA_ACTION_COLUMN: &str = "metadata$action";
+pub const METADATA_ISUPDATE_COLUMN: &str = "metadata$isupdate";
+pub const METADATA_ROW_ID_COLUMN: &str = "metadata$row_id";
 
 /// Builds a stream provider for `stream`, verifying the source exists and
 /// the offset snapshot is still retained (staleness, §18.1-1).
@@ -48,6 +52,29 @@ pub async fn stream_table_provider(
     iceberg_catalog: Arc<dyn iceberg_rust::catalog::Catalog>,
     stream: &RwObject<Stream>,
 ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    // NOTE: the resolved provider is cached by `CachingSchema` (catalog
+    // list), so `StreamTable::scan` re-resolves the stream record and the
+    // source's current snapshot from the metastore on every scan — the
+    // change range must be fresh per scan, not baked in at resolution
+    // time (offset advance on consume + new source commits).
+    let inner = build_inner_stream_scan(metastore, &iceberg_catalog, stream).await?;
+    Ok(Arc::new(StreamTable::new(
+        metastore.clone(),
+        iceberg_catalog,
+        stream.clone(),
+        inner,
+    )))
+}
+
+/// Builds the fork's changed-file scan for `stream`: verifies the source
+/// exists and the offset snapshot is still retained (staleness, §18.1-1),
+/// then wraps the source table in `DataFusionTable` over the snapshot
+/// range `(offset, current]` with `scan_changed_data_files(true)`.
+async fn build_inner_stream_scan(
+    metastore: &Arc<dyn Metastore>,
+    iceberg_catalog: &Arc<dyn iceberg_rust::catalog::Catalog>,
+    stream: &RwObject<Stream>,
+) -> Result<Arc<DataFusionTable>, DataFusionError> {
     let source_ident = stream.source.clone();
     let source = metastore
         .get_table(&source_ident)
@@ -94,7 +121,7 @@ pub async fn stream_table_provider(
 
     let iceberg_table = IcebergTable::new(
         source_ident.to_iceberg_ident(),
-        iceberg_catalog,
+        Arc::clone(iceberg_catalog),
         object_store,
         metadata,
     )
@@ -114,33 +141,48 @@ pub async fn stream_table_provider(
         // ROW_ID v1 is the source data-file path (§18.1-2): stable per file,
         // without requiring row-lineage first-row-ids from the writer.
         .enable_data_file_path_column(true)
+        // File row positions sharpen ROW_ID to `<path>#<pos>` when present;
+        // manifest paths are not needed by the stream projection.
+        .enable_data_file_row_position_column(true)
+        .enable_manifest_file_path_column(false)
         .build()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    let inner = Arc::new(DataFusionTable::new_with_config(
+    Ok(Arc::new(DataFusionTable::new_with_config(
         IcebergTabular::Table(iceberg_table),
         stream.offset_snapshot,
         end,
         None,
         Some(config),
-    ));
-
-    Ok(Arc::new(StreamTable::new(inner, stream.append_only)))
+    )))
 }
 
 /// Wraps the fork's changed-file scan and projects the Snowflake stream
 /// shape. `append_only` streams drop DELETE rows entirely (§18.1-2).
+///
+/// The resolved provider is cached by `CachingSchema`, so the stream
+/// record and source snapshot range are re-resolved from the metastore
+/// on **every scan**: consumption advances the stream offset, and the
+/// source keeps committing new snapshots.
 #[derive(Debug)]
 pub struct StreamTable {
-    inner: Arc<DataFusionTable>,
+    metastore: Arc<dyn Metastore>,
+    iceberg_catalog: Arc<dyn iceberg_rust::catalog::Catalog>,
+    stream: RwObject<Stream>,
     append_only: bool,
     schema: SchemaRef,
+    resolve_schema: SchemaRef,
     has_status_column: bool,
     has_file_path_column: bool,
 }
 
 impl StreamTable {
-    fn new(inner: Arc<DataFusionTable>, append_only: bool) -> Self {
+    fn new(
+        metastore: Arc<dyn Metastore>,
+        iceberg_catalog: Arc<dyn iceberg_rust::catalog::Catalog>,
+        stream: RwObject<Stream>,
+        inner: Arc<DataFusionTable>,
+    ) -> Self {
         let inner_schema = inner.schema();
         let mut fields: Vec<Field> = Vec::new();
         let mut has_status_column = false;
@@ -159,10 +201,22 @@ impl StreamTable {
             false,
         ));
         fields.push(Field::new(METADATA_ROW_ID_COLUMN, DataType::Utf8, true));
+        // Resolution schema for the projection expressions: the inner scan
+        // keeps its change columns (status/path) even though the declared
+        // stream schema drops them — `METADATA$ACTION` is derived from the
+        // status column, so exprs must resolve against the merged set.
+        let mut resolve_fields: Vec<Field> = inner_schema.fields().iter().map(|f| (**f).clone()).collect();
+        resolve_fields.push(Field::new(METADATA_ACTION_COLUMN, DataType::Utf8, false));
+        resolve_fields.push(Field::new(METADATA_ISUPDATE_COLUMN, DataType::Boolean, false));
+        resolve_fields.push(Field::new(METADATA_ROW_ID_COLUMN, DataType::Utf8, true));
+        let append_only = stream.append_only;
         Self {
-            inner,
+            metastore,
+            iceberg_catalog,
+            stream,
             append_only,
             schema: Arc::new(ArrowSchema::new(fields)),
+            resolve_schema: Arc::new(ArrowSchema::new(resolve_fields)),
             has_status_column,
             has_file_path_column,
         }
@@ -235,7 +289,31 @@ impl TableProvider for StreamTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let inner_exec = self.inner.scan(session, None, &[], None).await?;
+        // Re-resolve per scan (see struct docs): pick up the current
+        // offset (advanced by DML consumption) and the source's current
+        // snapshot (new commits since the provider was cached).
+        let stream = self
+            .metastore
+            .get_stream(&self.stream.ident)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .ok_or_else(|| {
+                DataFusionError::External(Box::new(
+                    metastore_error::StreamNotFoundSnafu {
+                        stream: self.stream.ident.table.clone(),
+                        schema: self.stream.ident.schema.clone(),
+                        db: self.stream.ident.database.clone(),
+                    }
+                    .build(),
+                ))
+            })?;
+        let inner = build_inner_stream_scan(
+            &self.metastore,
+            &self.iceberg_catalog,
+            &stream,
+        )
+        .await?;
+        let inner_exec = inner.scan(session, None, &[], None).await?;
 
         // APPEND_ONLY streams surface only added files (§18.1-2): filter on
         // the inner change-status column BEFORE the projection drops it.
@@ -257,7 +335,7 @@ impl TableProvider for StreamTable {
             .iter()
             .map(|field| {
                 let expr = self.output_expr(field.name());
-                let physical = self.physical(&expr, &self.schema)?;
+                let physical = self.physical(&expr, &self.resolve_schema)?;
                 Ok((physical, field.name().clone()))
             })
             .collect::<Result<Vec<_>, DataFusionError>>()?;

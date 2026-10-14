@@ -25,10 +25,21 @@ members = [
 resolver = "2"
 package.license-file = "LICENSE"
 
+[profile.dev]
+# Full debuginfo ballooned target/debug past 100 GB. Line tables keep
+# function names + line numbers in backtraces (gdb) at a fraction of the
+# size; variable inspection is sacrificed.
+debug = "line-tables-only"
+
+# Dependency rlibs don't need debuginfo at all — they dominate artifact
+# size and are rarely the code under inspection.
+[profile.dev.package."*"]
+debug = false
+
 [profile.test]
 incremental = true
 opt-level = 1
-debug = true
+debug = "line-tables-only"
 codegen-units = 16
 
 [profile.ci]
@@ -155,3 +166,5 @@ significant_drop_tightening = { level = "allow", priority = 2 }
 module_name_repetitions = { level = "allow", priority = 2 }
 option_if_let_else = { level = "allow", priority = 2 }
 needless_for_each = { level = "allow", priority = 2 } #  #[derive(OpenApi)]
+
+# TEMPORARY (M11 debug): local fork copy with eprintln diagnostics.

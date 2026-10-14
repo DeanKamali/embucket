@@ -3258,7 +3258,7 @@ dependencies = [
 [[package]]
 name = "datafusion_iceberg"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#1d8e669c73690ba5197a8b597123ce27b879d970"
+source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4833,7 +4833,7 @@ dependencies = [
 [[package]]
 name = "iceberg-rest-catalog"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#1d8e669c73690ba5197a8b597123ce27b879d970"
+source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -4858,7 +4858,7 @@ dependencies = [
 [[package]]
 name = "iceberg-rust"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#1d8e669c73690ba5197a8b597123ce27b879d970"
+source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "apache-avro",
  "arrow 59.2.0",
@@ -4894,7 +4894,7 @@ dependencies = [
 [[package]]
 name = "iceberg-rust-spec"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#1d8e669c73690ba5197a8b597123ce27b879d970"
+source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "apache-avro",
  "arrow-schema 59.2.0",
@@ -4922,7 +4922,7 @@ dependencies = [
 [[package]]
 name = "iceberg-s3tables-catalog"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#1d8e669c73690ba5197a8b597123ce27b879d970"
+source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -6704,7 +6704,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "petgraph",
@@ -6725,7 +6725,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6738,7 +6738,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8132,7 +8132,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

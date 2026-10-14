@@ -18,7 +18,7 @@ use crate::error::{self as ex_error, Error, Result};
 use crate::models::QueryResult;
 use crate::session::UserSession;
 use crate::time_travel::{TimePoint, parse_timestamp, resolve_snapshot};
-use catalog::catalog_list::EmbucketCatalogList;
+use avalanche_account::AuthzCatalogList;
 use catalog_metastore::models::{SchemaIdent, TableIdent};
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -359,7 +359,7 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
             // registry (upserts every metastore database, incl. the clone).
             let catalog_list: Arc<dyn datafusion::catalog::CatalogProviderList> =
                 Arc::clone(session.ctx.state().catalog_list());
-            if let Ok(list) = Arc::downcast::<EmbucketCatalogList>(catalog_list) {
+            if let Some(list) = AuthzCatalogList::unwrap(&catalog_list) {
                 list.register_catalog(&to)
                     .await
                     .map_err(|e| external_error("clone", e))?;

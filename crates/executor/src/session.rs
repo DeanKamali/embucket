@@ -10,14 +10,18 @@ use crate::datafusion::logical_analyzer::analyzer_rules;
 use crate::datafusion::logical_optimizer::split_ordered_aggregates::SplitOrderedAggregates;
 use crate::datafusion::physical_optimizer::physical_optimizer_rules;
 use crate::datafusion::query_planner::CustomQueryPlanner;
-use crate::models::{QueryContext, SessionMetadata};
+use crate::models::{QueryContext, SessionMetadata, SessionMetadataAttr};
 use crate::query::UserQuery;
 use crate::query_types::QueryId;
 use crate::running_queries::RunningQueries;
 use crate::utils::Config;
 use avalanche_warehouse::{MeteringHistoryTableFunc, WarehouseManager};
+use avalanche_account::authz::AuthzCatalogList;
+use avalanche_account::store::AccountStore;
+use avalanche_account::SessionAuthz;
 use catalog::catalog_list::{DEFAULT_CATALOG, EmbucketCatalogList};
 use catalog_metastore::Metastore;
+use datafusion::catalog::CatalogProviderList;
 #[cfg(feature = "state-store")]
 use chrono::{TimeZone, Utc};
 use dashmap::DashMap;
@@ -51,6 +55,16 @@ pub const fn to_unix(t: OffsetDateTime) -> i64 {
     t.unix_timestamp()
 }
 
+/// Map an `avalanche-account` error into the executor error surface.
+fn account_error(e: impl std::fmt::Display) -> ex_error::Error {
+    ex_error::Error::DataFusion {
+        error: Box::new(datafusion::common::DataFusionError::External(
+            format!("account: {e}").into(),
+        )),
+        location: snafu::Location::default(),
+    }
+}
+
 /// A user session bound to one in-process DataFusion `SessionContext`.
 ///
 /// Durable session state — session parameters, login context, expiry — is
@@ -81,6 +95,10 @@ pub struct UserSession {
     pub metadata: SessionMetadata,
     /// Shared warehouse manager (design §5): DDL target + resume-on-query.
     pub warehouse: Arc<WarehouseManager>,
+    /// Account-plane authorization (design §17): active role + materialized
+    /// grants. `None` for sessions without a known account user (internal
+    /// machinery) — those are not enforced.
+    pub authz: Option<Arc<SessionAuthz>>,
 }
 
 impl UserSession {
@@ -95,6 +113,7 @@ impl UserSession {
         metadata: SessionMetadata,
         #[cfg(feature = "state-store")] state_store: Arc<dyn StateStore>,
         warehouse: Arc<WarehouseManager>,
+        account: Option<Arc<dyn AccountStore>>,
     ) -> Result<Self> {
         let sql_parser_dialect = config
             .sql_parser_dialect
@@ -113,6 +132,36 @@ impl UserSession {
             Arc::new(Self::session_params(session_id, state_store.clone()).await);
         #[cfg(not(feature = "state-store"))]
         let session_params_arc = Arc::new(session_params.clone());
+
+        // Account-plane authorization (design §17, M10): materialize the
+        // session's active role and wrap the catalog list with grant
+        // enforcement. Only sessions whose login maps to a known account
+        // user get an authorization context; others (internal machinery)
+        // keep the bare catalog list.
+        let authz = match account {
+            Some(store) => {
+                let user_name = metadata.attr(SessionMetadataAttr::UserName);
+                match user_name {
+                    Some(name) => {
+                        let requested_role = session_params_arc.get_property("role");
+                        SessionAuthz::new(
+                            store,
+                            metastore.clone(),
+                            &name,
+                            requested_role.as_deref(),
+                        )
+                        .await
+                        .map_err(account_error)?
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        let catalog_list: Arc<dyn CatalogProviderList> = match &authz {
+            Some(authz) => Arc::new(AuthzCatalogList::new(catalog_list.clone(), Arc::clone(authz))),
+            None => catalog_list,
+        };
         let mut config_options = ConfigOptions::from_env().context(ex_error::DataFusionSnafu)?;
 
         // Only set minimum_parallel_output_files if environment variable wasn't set
@@ -187,6 +236,7 @@ impl UserSession {
                     + Duration::seconds(SESSION_INACTIVITY_EXPIRATION_SECONDS),
             )),
             session_params: session_params_arc,
+            authz,
             recent_queries: Arc::new(RwLock::new(VecDeque::new())),
             session_id: session_id.to_string(),
             attrs: DashMap::new(),

@@ -50,6 +50,7 @@ pub async fn create_s3_tables_df_session() -> Arc<UserSession> {
             crate::service::build_test_warehouse_manager(Arc::new(
                 state_store::InMemoryStateStore::new(),
             )),
+            None,
         )
         .await
         .expect("Failed to create user session"),

@@ -341,6 +341,13 @@ impl UserQuery {
         err
     )]
     pub async fn execute(&mut self) -> Result<QueryResult> {
+        // Avalanche (design §17, M10): account-level RBAC DDL is intercepted
+        // pre-parse (ACCOUNTADMIN-only).
+        if let Some(result) =
+            crate::account_ddl::try_execute(&self.raw_query, &self.session).await
+        {
+            return result;
+        }
         // Avalanche (design §5): warehouse DDL is intercepted pre-parse —
         // the sqlparser fork has no WAREHOUSE statements.
         if let Some(result) =
@@ -366,6 +373,9 @@ impl UserQuery {
         // the sqlparser fork has no AT() grammar either.
         crate::time_travel::rewrite(&mut self.raw_query, &self.session).await?;
         // Resume-on-query + activity tracking for the session's warehouse.
+        // Re-check the current warehouse against the active role's grants
+        // (design §17): a revoked grant invalidates the resumed warehouse.
+        crate::account_ddl::check_current_warehouse(&self.session)?;
         if let Some(warehouse) = self.session.get_session_variable("warehouse") {
             self.session.warehouse.ensure_running(&warehouse).await;
         }
@@ -609,6 +619,14 @@ impl UserQuery {
         };
         if variable.is_empty() | value.is_empty() {
             return ex_error::OnyUseWithVariablesSnafu.fail();
+        }
+        // Account-plane enforcement (design §17, M10): USE ROLE must be a
+        // role the session's user holds; USE WAREHOUSE requires a USAGE
+        // grant on the active role.
+        match variable {
+            "role" => crate::account_ddl::use_role(&self.session, &value).await?,
+            "warehouse" => crate::account_ddl::use_warehouse(&self.session, &value)?,
+            _ => {}
         }
         let params = HashMap::from([(
             variable.to_string(),

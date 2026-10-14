@@ -1,0 +1,642 @@
+//! Pre-parse interception of account-level RBAC DDL (Avalanche design §17,
+//! M10). The sqlparser fork has no `GRANT ... ON ACCOUNT OBJECT` grammar, so
+//! account statements are matched on the raw SQL before DataFusion parsing.
+//! Supported (Snowflake subset, v1):
+//!
+//! - `CREATE [IF NOT EXISTS] ROLE <name>` / `DROP ROLE <name>`
+//! - `CREATE USER <name> PASSWORD = '<pw>' [DEFAULT_ROLE = <r>] [TENANT = '<t>']`
+//! - `DROP USER <name>`
+//! - `GRANT ROLE <r> TO USER <u>` / `REVOKE ROLE <r> FROM USER <u>`
+//! - `GRANT USAGE|SELECT ON DATABASE|SCHEMA|TABLE|WAREHOUSE <name> TO ROLE <r>`
+//!   (and the symmetric `REVOKE ... FROM ROLE <r>`)
+//! - `SHOW GRANTS TO ROLE <r>`
+//!
+//! All account DDL is `ACCOUNTADMIN`-only in v1: the session must be
+//! authorized with the built-in role active. Data-plane DDL (CREATE/DROP
+//! TABLE/SCHEMA/DATABASE) is NOT enforced in v1 — grant checks happen at
+//! resolution time through the session's wrapped catalog providers.
+
+use crate::error::{self as ex_error, Error, Result};
+use crate::models::QueryResult;
+use crate::session::UserSession;
+use avalanche_account::models::{AccountObject, Grant, Privilege, User, ACCOUNTADMIN};
+use avalanche_account::store::AccountStore;
+use avalanche_account::SessionAuthz;
+use datafusion::arrow::array::{RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+use snafu::Location;
+use snafu::ResultExt;
+use std::sync::Arc;
+
+/// A parsed account DDL statement (v1 grammar).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountStatement {
+    CreateRole {
+        name: String,
+        if_not_exists: bool,
+    },
+    DropRole {
+        name: String,
+    },
+    CreateUser {
+        name: String,
+        password: String,
+        default_role: Option<String>,
+        tenant: Option<String>,
+        if_not_exists: bool,
+    },
+    DropUser {
+        name: String,
+    },
+    GrantRole {
+        role: String,
+        user: String,
+    },
+    RevokeRole {
+        role: String,
+        user: String,
+    },
+    Grant {
+        privilege: Privilege,
+        object: AccountObject,
+        role: String,
+    },
+    Revoke {
+        privilege: Privilege,
+        object: AccountObject,
+        role: String,
+    },
+    ShowGrants {
+        role: String,
+    },
+}
+
+/// Lower-case token, quotes and trailing `;` stripped.
+fn token(s: &str) -> &str {
+    s.trim_end_matches(';')
+        .trim_matches(|c| c == '"' || c == '`' || c == '\'')
+}
+
+fn normalized(session: &UserSession, name: &str) -> String {
+    session
+        .ident_normalizer
+        .normalize(datafusion::sql::sqlparser::ast::Ident::new(name))
+}
+
+fn external_error(context: &str, err: impl std::fmt::Display) -> Error {
+    Error::DataFusion {
+        error: Box::new(datafusion::common::DataFusionError::External(
+            format!("{context}: {err}").into(),
+        )),
+        location: Location::default(),
+    }
+}
+
+/// Parse `USAGE|SELECT ON <KIND> <name> TO|FROM ROLE <r>` from `tok[i..]`.
+/// `None` = malformed (fall through to the planner's syntax error).
+fn parse_on_grant(tok: &[&str], from: usize) -> Option<(Privilege, AccountObject, String)> {
+    let privilege = match tok.get(from)?.to_ascii_uppercase().as_str() {
+        "USAGE" => Privilege::Usage,
+        "SELECT" => Privilege::Select,
+        _ => return None,
+    };
+    if !tok.get(from + 1)?.eq_ignore_ascii_case("on") {
+        return None;
+    }
+    let object = match tok.get(from + 2)?.to_ascii_uppercase().as_str() {
+        "DATABASE" => AccountObject::Database((*tok.get(from + 3)?).to_string()),
+        "SCHEMA" => {
+            let parts: Vec<&str> = tok.get(from + 3)?.split('.').collect();
+            if parts.len() != 2 {
+                return None;
+            }
+            AccountObject::Schema(parts[0].to_string(), parts[1].to_string())
+        }
+        "TABLE" => {
+            let parts: Vec<&str> = tok.get(from + 3)?.split('.').collect();
+            if parts.len() != 3 {
+                return None;
+            }
+            AccountObject::Table(parts[0].to_string(), parts[1].to_string(), parts[2].to_string())
+        }
+        "WAREHOUSE" => AccountObject::Warehouse(tok.get(from + 3)?.to_string()),
+        _ => return None,
+    };
+    let direction = tok.get(from + 4)?.to_ascii_uppercase();
+    if !matches!(direction.as_str(), "TO" | "FROM") {
+        return None;
+    }
+    if !tok.get(from + 5)?.eq_ignore_ascii_case("role") {
+        return None;
+    }
+    let role = (*tok.get(from + 6)?).to_string();
+    Some((privilege, object, role))
+}
+
+/// Match the grammar prefix; `None` when this is not an account statement
+/// (falls through to the normal planner).
+#[allow(clippy::too_many_lines)]
+pub fn parse(raw: &str) -> Option<AccountStatement> {
+    let raw = raw.trim();
+    let tok: Vec<&str> = raw.split_whitespace().map(token).collect();
+    match tok.first()?.to_ascii_uppercase().as_str() {
+        "CREATE" | "DROP" => {}
+        "GRANT" | "REVOKE" => {
+            // Object grant: `GRANT|REVOKE <priv> ON <kind> <name> TO|FROM ROLE <r>`
+            if let Some((privilege, object, role)) = parse_on_grant(&tok, 1) {
+                return if tok[0].eq_ignore_ascii_case("grant") {
+                    Some(AccountStatement::Grant {
+                        privilege,
+                        object,
+                        role,
+                    })
+                } else {
+                    Some(AccountStatement::Revoke {
+                        privilege,
+                        object,
+                        role,
+                    })
+                };
+            }
+            // Role membership: `GRANT ROLE <r> TO USER <u>` /
+            // `REVOKE ROLE <r> FROM USER <u>`.
+            if tok.len() == 6
+                && tok[1].eq_ignore_ascii_case("role")
+                && tok[4].eq_ignore_ascii_case("user")
+                && tok[3].eq_ignore_ascii_case(if tok[0].eq_ignore_ascii_case("grant") {
+                    "to"
+                } else {
+                    "from"
+                })
+            {
+                let (role, user) = (tok[2].to_string(), tok[5].to_string());
+                return if tok[0].eq_ignore_ascii_case("grant") {
+                    Some(AccountStatement::GrantRole { role, user })
+                } else {
+                    Some(AccountStatement::RevokeRole { role, user })
+                };
+            }
+            return None;
+        }
+        "SHOW" => {
+            if tok.len() == 5
+                && tok[1].eq_ignore_ascii_case("grants")
+                && tok[2].eq_ignore_ascii_case("to")
+                && tok[3].eq_ignore_ascii_case("role")
+            {
+                return Some(AccountStatement::ShowGrants {
+                    role: tok[4].to_string(),
+                });
+            }
+            return None;
+        }
+        _ => return None,
+    }
+
+    let create = tok[0].eq_ignore_ascii_case("create");
+    let mut i = 1;
+    // Grammar: CREATE [IF NOT EXISTS] ROLE|USER <name> ...
+    let kind = tok.get(i)?.to_ascii_uppercase();
+    if kind != "ROLE" && kind != "USER" {
+        return None;
+    }
+    i += 1;
+    let mut if_not_exists = false;
+    if create
+        && tok.get(i).is_some_and(|t| t.eq_ignore_ascii_case("if"))
+        && tok.get(i + 1).is_some_and(|t| t.eq_ignore_ascii_case("not"))
+        && tok.get(i + 2).is_some_and(|t| t.eq_ignore_ascii_case("exists"))
+    {
+        if_not_exists = true;
+        i += 3;
+    }
+    let name = (*tok.get(i)?).to_string();
+    if create {
+        if kind == "ROLE" {
+            if tok.get(i + 1).is_some() {
+                return None; // unknown CREATE ROLE options → planner error
+            }
+            return Some(AccountStatement::CreateRole { name, if_not_exists });
+        }
+        // CREATE USER <name> [options]: key = 'value' pairs.
+        let mut password = None;
+        let mut default_role = None;
+        let mut tenant = None;
+        let mut j = i + 1;
+        while j < tok.len() {
+            let key = tok[j].to_ascii_uppercase();
+            let Some(value) = tok.get(j + 2) else {
+                return None;
+            };
+            if !tok[j + 1].eq_ignore_ascii_case("=") {
+                return None;
+            }
+            match key.as_str() {
+                "PASSWORD" => password = Some(value.to_string()),
+                "DEFAULT_ROLE" => default_role = Some(value.to_string()),
+                "TENANT" => tenant = Some(value.to_string()),
+                _ => return None, // unknown user option → planner error
+            }
+            j += 3;
+        }
+        let password = password?;
+        return Some(AccountStatement::CreateUser {
+            name,
+            password,
+            default_role,
+            tenant,
+            if_not_exists,
+        });
+    }
+    // DROP ROLE|USER <name>
+    if tok.get(i + 1).is_some() {
+        return None;
+    }
+    if kind == "ROLE" {
+        Some(AccountStatement::DropRole { name })
+    } else {
+        Some(AccountStatement::DropUser { name })
+    }
+}
+
+/// Entry point: run account DDL when the raw SQL matches; `None` = fall
+/// through to the normal planner.
+pub async fn try_execute(raw: &str, session: &UserSession) -> Option<Result<QueryResult>> {
+    let statement = parse(raw)?;
+    Some(execute(&statement, session).await)
+}
+
+/// Account DDL requires the `ACCOUNTADMIN` role to be active on this session;
+/// returns the authz context and the account store.
+fn admin_store(session: &UserSession) -> Result<(Arc<SessionAuthz>, Arc<dyn AccountStore>)> {
+    let Some(authz) = &session.authz else {
+        return Err(external_error(
+            "account",
+            "insufficient privileges to operate on account-level objects",
+        ));
+    };
+    if !authz.is_admin_now() {
+        return Err(external_error(
+            "account",
+            format!(
+                "insufficient privileges to operate on account-level objects (active role '{}')",
+                authz.active_role()
+            ),
+        ));
+    }
+    let authz = Arc::clone(authz);
+    let store = authz.store();
+    Ok((authz, store))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<QueryResult> {
+    let (_authz, store) = admin_store(session)?;
+    let norm = |name: &str| normalized(session, name);
+    match stmt {
+        AccountStatement::CreateRole { name, if_not_exists } => {
+            let name = norm(name);
+            match store.create_role(&name).await {
+                Ok(_) => crate::clone_ddl::status_row(),
+                Err(e) if e.is_role_already_exists() && *if_not_exists => {
+                    crate::clone_ddl::status_row()
+                }
+                Err(e) => Err(external_error("account", e)),
+            }
+        }
+        AccountStatement::DropRole { name } => {
+            let name = norm(name);
+            if name.eq_ignore_ascii_case(ACCOUNTADMIN) {
+                return Err(external_error(
+                    "account",
+                    format!("cannot drop the built-in role '{ACCOUNTADMIN}'"),
+                ));
+            }
+            store.drop_role(&name).await.map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::CreateUser {
+            name,
+            password,
+            default_role,
+            tenant,
+            if_not_exists,
+        } => {
+            let name = norm(name);
+            let user = User {
+                name: name.clone(),
+                login_name: name.clone(),
+                password: password.to_string(),
+                default_role: default_role.as_deref().map(|r| norm(r)),
+                tenant: tenant.clone(),
+                disabled: false,
+            };
+            match store.create_user(user).await {
+                Ok(_) => crate::clone_ddl::status_row(),
+                Err(e) if e.is_user_already_exists() && *if_not_exists => {
+                    crate::clone_ddl::status_row()
+                }
+                Err(e) => Err(external_error("account", e)),
+            }
+        }
+        AccountStatement::DropUser { name } => {
+            let name = norm(name);
+            if name.eq_ignore_ascii_case(ACCOUNTADMIN)
+                || _authz.login_name().eq_ignore_ascii_case(&name)
+            {
+                return Err(external_error(
+                    "account",
+                    format!("cannot drop user '{name}'"),
+                ));
+            }
+            store.drop_user(&name).await.map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::GrantRole { role, user } => {
+            store
+                .grant_role_to_user(&norm(user), &norm(role))
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::RevokeRole { role, user } => {
+            store
+                .revoke_role_from_user(&norm(user), &norm(role))
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::Grant {
+            privilege,
+            object,
+            role,
+        } => {
+            let (privilege, object) = normalize_grant(privilege.clone(), object, session);
+            store
+                .grant(Grant {
+                    role: norm(role),
+                    privilege,
+                    object,
+                })
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::Revoke {
+            privilege,
+            object,
+            role,
+        } => {
+            let (privilege, object) = normalize_grant(privilege.clone(), object, session);
+            store
+                .revoke(&Grant {
+                    role: norm(role),
+                    privilege,
+                    object,
+                })
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::ShowGrants { role } => {
+            let role = norm(role);
+            let grants = store
+                .role_grants(&role)
+                .await
+                .map_err(|e| external_error("account", e))?;
+            let mut schema_fields = Vec::new();
+            for (name, nullable) in [
+                ("privilege", false),
+                ("granted_on", false),
+                ("name", false),
+                ("granted_to", false),
+                ("grantee_name", false),
+            ] {
+                schema_fields.push(Field::new(name, DataType::Utf8, nullable));
+            }
+            let schema = Arc::new(ArrowSchema::new(schema_fields));
+            let mut privilege_col = Vec::new();
+            let mut granted_on_col = Vec::new();
+            let mut name_col = Vec::new();
+            let mut granted_to_col = Vec::new();
+            let mut grantee_col = Vec::new();
+            for g in grants {
+                privilege_col.push(g.privilege.to_string());
+                granted_on_col.push(g.object.kind().to_string());
+                name_col.push(g.object.to_string());
+                granted_to_col.push("ROLE".to_string());
+                grantee_col.push(role.clone());
+            }
+            if privilege_col.is_empty() {
+                // Snowflake keeps SHOW GRANTS non-empty; a role with no
+                // grants reports one row with empty strings.
+                privilege_col.push(String::new());
+                granted_on_col.push(String::new());
+                name_col.push(String::new());
+                granted_to_col.push("ROLE".to_string());
+                grantee_col.push(role.clone());
+            }
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(privilege_col)),
+                    Arc::new(StringArray::from(granted_on_col)),
+                    Arc::new(StringArray::from(name_col)),
+                    Arc::new(StringArray::from(granted_to_col)),
+                    Arc::new(StringArray::from(grantee_col)),
+                ],
+            )
+            .context(ex_error::ArrowSnafu)?;
+            Ok(QueryResult::new(vec![batch], schema))
+        }
+    }
+}
+
+/// Normalize grant object parts through the session ident normalizer.
+fn normalize_grant(
+    privilege: Privilege,
+    object: &AccountObject,
+    session: &UserSession,
+) -> (Privilege, AccountObject) {
+    let object = match object {
+        AccountObject::Database(db) => AccountObject::Database(normalized(session, db)),
+        AccountObject::Schema(db, s) => {
+            AccountObject::Schema(normalized(session, db), normalized(session, s))
+        }
+        AccountObject::Table(db, s, t) => AccountObject::Table(
+            normalized(session, db),
+            normalized(session, s),
+            normalized(session, t),
+        ),
+        AccountObject::Warehouse(wh) => AccountObject::Warehouse(normalized(session, wh)),
+    };
+    (privilege, object)
+}
+
+/// Validate `USE ROLE` against the account store (design §17): the session's
+/// user must hold the role. Errors are Snowflake-shaped.
+pub async fn use_role(session: &UserSession, role: &str) -> Result<()> {
+    let Some(authz) = &session.authz else {
+        return Ok(()); // no account context (internal session) — unchanged
+    };
+    let role = normalized(session, role);
+    authz.activate_role(&role).await.map_err(|e| {
+        external_error(
+            "use role",
+            format!("role '{role}' does not exist or not authorized ({e})"),
+        )
+    })
+}
+
+/// Validate `USE WAREHOUSE` against the active role's grants.
+pub fn use_warehouse(session: &UserSession, warehouse: &str) -> Result<()> {
+    let Some(authz) = &session.authz else {
+        return Ok(());
+    };
+    let wh = normalized(session, warehouse);
+    if authz.warehouse_usable(&wh) {
+        Ok(())
+    } else {
+        Err(external_error(
+            "use warehouse",
+            format!("warehouse '{wh}' does not exist or not authorized"),
+        ))
+    }
+}
+
+/// Ensure the session's current warehouse is still usable after rehydration
+/// (resume path in `UserQuery::execute`).
+pub fn check_current_warehouse(session: &UserSession) -> Result<()> {
+    if let Some(authz) = &session.authz {
+        if let Some(warehouse) = session.get_session_variable("warehouse") {
+            if !authz.warehouse_usable(&warehouse) {
+                return Err(external_error(
+                    "use warehouse",
+                    format!("warehouse '{warehouse}' does not exist or not authorized"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse, AccountStatement, Privilege, AccountObject};
+
+    fn parsed(sql: &str) -> AccountStatement {
+        parse(sql).unwrap_or_else(|| panic!("expected account statement: {sql}"))
+    }
+
+    #[test]
+    fn parses_create_drop_role() {
+        assert_eq!(
+            parsed("CREATE ROLE analyst"),
+            AccountStatement::CreateRole {
+                name: "analyst".into(),
+                if_not_exists: false
+            }
+        );
+        assert_eq!(
+            parsed("create role if not exists \"Analyst\";"),
+            AccountStatement::CreateRole {
+                name: "Analyst".into(),
+                if_not_exists: true
+            }
+        );
+        assert_eq!(
+            parsed("DROP ROLE analyst"),
+            AccountStatement::DropRole { name: "analyst".into() }
+        );
+        assert!(parse("CREATE ROLE").is_none());
+        assert!(parse("CREATE TABLE t (a int)").is_none());
+    }
+
+    #[test]
+    fn parses_create_user_options() {
+        assert_eq!(
+            parsed("CREATE USER u1 PASSWORD = 'pw' DEFAULT_ROLE = r1 TENANT = 'acme'"),
+            AccountStatement::CreateUser {
+                name: "u1".into(),
+                password: "pw".into(),
+                default_role: Some("r1".into()),
+                tenant: Some("acme".into()),
+                if_not_exists: false
+            }
+        );
+        assert_eq!(
+            parsed("CREATE USER IF NOT EXISTS u2 PASSWORD = 'p'"),
+            AccountStatement::CreateUser {
+                name: "u2".into(),
+                password: "p".into(),
+                default_role: None,
+                tenant: None,
+                if_not_exists: true
+            }
+        );
+        assert!(parse("CREATE USER u1").is_none());
+        assert!(parse("CREATE USER u1 PASSWORD = 'p' FOO = 'x'").is_none());
+    }
+
+    #[test]
+    fn parses_grants() {
+        assert_eq!(
+            parsed("GRANT USAGE ON DATABASE embucket TO ROLE analyst"),
+            AccountStatement::Grant {
+                privilege: Privilege::Usage,
+                object: AccountObject::Database("embucket".into()),
+                role: "analyst".into()
+            }
+        );
+        assert_eq!(
+            parsed("grant select on table db.public.t to role r1;"),
+            AccountStatement::Grant {
+                privilege: Privilege::Select,
+                object: AccountObject::Table("db".into(), "public".into(), "t".into()),
+                role: "r1".into()
+            }
+        );
+        assert_eq!(
+            parsed("REVOKE USAGE ON SCHEMA db.public FROM ROLE analyst"),
+            AccountStatement::Revoke {
+                privilege: Privilege::Usage,
+                object: AccountObject::Schema("db".into(), "public".into()),
+                role: "analyst".into()
+            }
+        );
+        assert_eq!(
+            parsed("GRANT USAGE ON WAREHOUSE wh TO ROLE analyst"),
+            AccountStatement::Grant {
+                privilege: Privilege::Usage,
+                object: AccountObject::Warehouse("wh".into()),
+                role: "analyst".into()
+            }
+        );
+        assert_eq!(
+            parsed("GRANT ROLE r1 TO USER u1"),
+            AccountStatement::GrantRole {
+                role: "r1".into(),
+                user: "u1".into()
+            }
+        );
+        assert_eq!(
+            parsed("REVOKE ROLE r1 FROM USER u1"),
+            AccountStatement::RevokeRole {
+                role: "r1".into(),
+                user: "u1".into()
+            }
+        );
+        assert!(parse("GRANT INSERT ON TABLE db.s.t TO ROLE r").is_none());
+        assert!(parse("GRANT ROLE r1 TO ROLE r2").is_none());
+    }
+
+    #[test]
+    fn parses_show_grants() {
+        assert_eq!(
+            parsed("SHOW GRANTS TO ROLE analyst"),
+            AccountStatement::ShowGrants { role: "analyst".into() }
+        );
+        assert!(parse("SHOW GRANTS").is_none());
+        assert!(parse("SHOW GRANTS TO USER u1").is_none());
+    }
+}

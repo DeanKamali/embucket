@@ -36,6 +36,7 @@ use crate::running_queries::RunningQueryId;
 use crate::session::{SESSION_INACTIVITY_EXPIRATION_SECONDS, to_unix};
 use crate::tracing::SpanTracer;
 use crate::utils::{Config, MemPoolType};
+use avalanche_account::store::AccountStore;
 use avalanche_warehouse::{
     BallistaImages, ContainerDriver, DockerCliDriver, FakeDriver, KubectlDriver, WarehouseManager,
 };
@@ -173,6 +174,8 @@ pub struct CoreExecutionService {
     state_store: Arc<dyn StateStore>,
     /// Shared warehouse manager (design §5); one per process.
     warehouse: Arc<WarehouseManager>,
+    /// Account store (design §17, M10): users/roles/grants for RBAC.
+    pub account: Option<Arc<dyn AccountStore>>,
 }
 
 /// Manager with the real Docker driver (production).
@@ -232,6 +235,7 @@ impl CoreExecutionService {
             queries: Arc::new(RunningQueriesRegistry::new()),
             warehouse: build_test_warehouse_manager(state_store.clone()),
             state_store,
+            account: None,
         })
     }
 
@@ -273,7 +277,16 @@ impl CoreExecutionService {
             warehouse,
             #[cfg(feature = "state-store")]
             state_store,
+            account: None,
         })
+    }
+
+    /// Attach an account store (design §17): enables RBAC DDL and
+    /// per-session grant enforcement.
+    #[must_use]
+    pub fn with_account(mut self, account: Arc<dyn AccountStore>) -> Self {
+        self.account = Some(account);
+        self
     }
 
     #[tracing::instrument(
@@ -429,6 +442,7 @@ impl CoreExecutionService {
                 metadata,
                 self.state_store.clone(),
                 self.warehouse.clone(),
+                self.account.clone(),
             )
             .await?,
         );
@@ -487,6 +501,7 @@ impl ExecutionService for CoreExecutionService {
                 #[cfg(feature = "state-store")]
                 self.state_store.clone(),
                 self.warehouse.clone(),
+                self.account.clone(),
             )
             .await?,
         );

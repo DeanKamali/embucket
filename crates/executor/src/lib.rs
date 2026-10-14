@@ -1,4 +1,5 @@
 pub use catalog;
+pub mod account_ddl;
 pub mod datafusion;
 #[cfg(feature = "dedicated-executor")]
 pub mod dedicated_executor;

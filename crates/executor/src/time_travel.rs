@@ -272,7 +272,7 @@ fn parse_at_spec(toks: &[(usize, &str)], at_idx: usize) -> AtSpec {
 }
 
 /// Parse a Snowflake-style timestamp literal. Naive values are treated as UTC.
-fn parse_timestamp(s: &str) -> Option<i64> {
+pub(crate) fn parse_timestamp(s: &str) -> Option<i64> {
     let s = s.trim();
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc).timestamp_millis());
@@ -336,7 +336,7 @@ fn resolve_table_parts(session: &UserSession, parts: &[String]) -> Result<TableI
 
 /// Resolve the time point to a snapshot id from the table's snapshot log:
 /// the latest commit at or before the point.
-fn resolve_snapshot(metadata: &TableMetadata, point_ms: i64) -> Option<i64> {
+pub(crate) fn resolve_snapshot(metadata: &TableMetadata, point_ms: i64) -> Option<i64> {
     metadata
         .snapshot_log
         .iter()

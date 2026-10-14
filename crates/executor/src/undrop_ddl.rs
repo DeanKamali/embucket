@@ -47,22 +47,21 @@ pub fn parse(raw: &str) -> Option<UndropStatement> {
     if tok.len() < 3 || !tok[0].eq_ignore_ascii_case("undrop") {
         return None;
     }
-    let kind = match tok[1].to_ascii_uppercase().as_str() {
-        "TABLE" => UndropKind::Table,
-        // Well-formed but unsupported — must be a bounded error, not a
-        // fall-through syntax error from the planner.
-        "SCHEMA" | "DATABASE" => {
-            return Some(UndropStatement {
-                kind: if tok[1].eq_ignore_ascii_case("schema") {
-                    UndropKind::Schema
-                } else {
-                    UndropKind::Database
-                },
-                target: Vec::new(),
-            });
-        }
-        _ => return None,
-    };
+    // Well-formed but unsupported — must be a bounded error, not a
+    // fall-through syntax error from the planner.
+    if tok[1].eq_ignore_ascii_case("schema") || tok[1].eq_ignore_ascii_case("database") {
+        return Some(UndropStatement {
+            kind: if tok[1].eq_ignore_ascii_case("schema") {
+                UndropKind::Schema
+            } else {
+                UndropKind::Database
+            },
+            target: Vec::new(),
+        });
+    }
+    if !tok[1].eq_ignore_ascii_case("table") {
+        return None;
+    }
     // Exactly one name part expected; anything else (AT(...), RESTRICT, …)
     // is bounded-unsupported rather than a confusing planner error.
     if tok.len() != 3 {

@@ -62,10 +62,9 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
     ) -> Result<RwObject<Table>>;
     async fn register_table(&self, ident: &TableIdent, table: Table) -> Result<RwObject<Table>>;
     /// Zero-copy clone (M8, design §14): creates `to` as a metadata-only
-    /// copy of `from` — same schema, snapshots and refs, same volume (so the
-    /// clone reads the source's data files), but a fresh table location and
-    /// metadata lineage. Commits to either table after the clone do not
-    /// affect the other.
+    /// copy of `from` — the clone shares the source's table location,
+    /// volume and current metadata lineage (zero data or metadata copy).
+    /// Commits to either table after the clone diverge independently.
     async fn clone_table(&self, from: &TableIdent, to: &TableIdent) -> Result<RwObject<Table>>;
 
     /// Zero-copy clone of a schema (M8, design §14): copies the schema
@@ -707,24 +706,6 @@ impl Metastore for InMemoryMetastore {
             .build()
         })?;
 
-        // Object store first: resolving it takes a state read lock, and the
-        // metadata write below must happen before the clone record exists.
-        let object_store = self
-            .table_object_store(from)
-            .await?
-            .ok_or_else(|| {
-                metastore_error::VolumeNotFoundSnafu {
-                    volume: source.data.volume_ident.clone().unwrap_or_default(),
-                }
-                .build()
-            })?;
-
-        let mut metadata = source.data.metadata.clone();
-        metadata.location = Self::default_table_location(to);
-        let metadata_location = self
-            .put_metadata(to, object_store.clone(), &metadata)
-            .await?;
-
         let mut state = self.state.write().await;
 
         if !state
@@ -750,15 +731,17 @@ impl Metastore for InMemoryMetastore {
             .fail();
         }
 
+        // v1 (design §14): the clone shares the source's table location and
+        // its current metadata lineage — zero data/metadata copy. All Iceberg
+        // paths inside the metadata are relative to the shared volume root,
+        // so the clone reads the source's manifests as-is. Commits to either
+        // table diverge at the record level (each writes its own
+        // uuid-named metadata JSON and random-id snapshots into the shared
+        // location), so writes are independent after the clone. A
+        // branch-per-clone ref model is a v2 refinement.
         let clone = Table {
             ident: to.clone(),
-            metadata,
-            metadata_location,
-            properties: source.data.properties.clone(),
-            volume_ident: source.data.volume_ident.clone(),
-            volume_location: Some(Self::default_table_location(to)),
-            is_temporary: false,
-            format: source.data.format.clone(),
+            ..source.data.clone()
         };
         let row = RwObject::new(clone);
         state.tables.insert(Self::table_key(to), row.clone());

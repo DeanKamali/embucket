@@ -121,6 +121,25 @@ impl SchemaProvider for EmbucketSchema {
     #[tracing::instrument(name = "EmbucketSchema::table", level = "debug", skip(self), err)]
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
         let ident = &TableIdent::new(&self.database.clone(), &self.schema.clone(), name);
+
+        // Streams (design §18.1-2, M11): resolved before the table lookup.
+        // A stream is not an Iceberg table — it scans its source's change
+        // feed for the snapshot range (offset, current].
+        if let Some(stream) = self
+            .metastore
+            .get_stream(ident)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        {
+            return crate::stream_table::stream_table_provider(
+                &self.metastore,
+                self.iceberg_catalog.clone(),
+                &stream,
+            )
+            .await
+            .map(Some);
+        }
+
         let object_store = self
             .metastore
             .table_object_store(ident)

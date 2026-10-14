@@ -282,4 +282,12 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Stream {stream} is stale: offset snapshot {snapshot} is no longer retained by the source table"))]
+    StreamStale {
+        stream: String,
+        snapshot: i64,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }

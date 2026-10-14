@@ -466,6 +466,15 @@ pub async fn rewrite(raw: &mut String, session: &UserSession) -> Result<()> {
                     ),
                 )
             })?;
+        if table.data.format != TableFormat::Iceberg {
+            return Err(external_error(
+                "time travel",
+                format!(
+                    "table '{}.{}.{}' is not an Iceberg table; time travel is only supported for managed Iceberg tables",
+                    ident.database, ident.schema, ident.table
+                ),
+            ));
+        }
         let point_ms = p.point.resolve_ms();
         let Some(snapshot_id) = resolve_snapshot(&table.data.metadata, point_ms) else {
             return Err(external_error(

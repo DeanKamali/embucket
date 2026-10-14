@@ -425,6 +425,19 @@ impl SchemaProvider for AuthzSchema {
             .table_visible(&self.database, &self.schema, name)
             && self.inner.table_exist(name)
     }
+
+    fn register_table(
+        &self,
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        // Data-plane DDL enforcement is v2 (design §17); delegate.
+        self.inner.register_table(name, table)
+    }
+
+    fn deregister_table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        self.inner.deregister_table(name)
+    }
 }
 
 #[cfg(test)]

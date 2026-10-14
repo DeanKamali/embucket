@@ -1,3 +1,4 @@
+use avalanche_account::AuthzCatalogList;
 use super::catalog::catalog_list::EmbucketCatalogList;
 use super::catalog::information_schema::information_schema::{
     INFORMATION_SCHEMA, InformationSchemaProvider,
@@ -31,7 +32,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, Schem
 use datafusion::arrow::datatypes::{Fields, SchemaBuilder};
 use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::catalog::TableProvider;
-use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::datasource::default_table_source::provider_as_source;
 use datafusion::datasource::file_format::FileFormat;
@@ -176,13 +177,9 @@ impl UserQuery {
 
     #[instrument(name = "UserQuery::drop_catalog", level = "debug", skip(self), err)]
     async fn drop_catalog(&self, catalog: &str, cascade: bool) -> Result<()> {
-        if let Some(catalog_list_impl) = self
-            .session
-            .ctx
-            .state()
-            .catalog_list()
-            .downcast_ref::<EmbucketCatalogList>()
-        {
+        let catalog_list: Arc<dyn CatalogProviderList> =
+            Arc::clone(self.session.ctx.state().catalog_list());
+        if let Some(catalog_list_impl) = AuthzCatalogList::unwrap(&catalog_list) {
             catalog_list_impl
                 .drop_catalog(catalog, cascade)
                 .await
@@ -193,13 +190,9 @@ impl UserQuery {
 
     #[instrument(name = "UserQuery::create_catalog", level = "debug", skip(self), err)]
     async fn create_catalog(&self, catalog: &str, volume: &str) -> Result<()> {
-        if let Some(catalog_list_impl) = self
-            .session
-            .ctx
-            .state()
-            .catalog_list()
-            .downcast_ref::<EmbucketCatalogList>()
-        {
+        let catalog_list: Arc<dyn CatalogProviderList> =
+            Arc::clone(self.session.ctx.state().catalog_list());
+        if let Some(catalog_list_impl) = AuthzCatalogList::unwrap(&catalog_list) {
             catalog_list_impl
                 .create_catalog(catalog, volume)
                 .await

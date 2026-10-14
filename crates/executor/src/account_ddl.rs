@@ -400,6 +400,12 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
         }
         AccountStatement::ShowGrants { role } => {
             let role = norm(role);
+            if store.get_role(&role).await.map_err(|e| external_error("account", e))?.is_none() {
+                return Err(external_error(
+                    "account",
+                    format!("role '{role}' does not exist"),
+                ));
+            }
             let grants = store
                 .role_grants(&role)
                 .await

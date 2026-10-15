@@ -33,6 +33,20 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Share {share} already exists"))]
+    ShareAlreadyExists {
+        share: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Share {share} does not exist"))]
+    ShareNotFound {
+        share: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("{message}"))]
     GrantNotFound {
         message: String,
@@ -66,5 +80,10 @@ impl Error {
     #[must_use]
     pub fn is_user_already_exists(&self) -> bool {
         matches!(self, Self::UserAlreadyExists { .. })
+    }
+
+    #[must_use]
+    pub fn is_share_already_exists(&self) -> bool {
+        matches!(self, Self::ShareAlreadyExists { .. })
     }
 }

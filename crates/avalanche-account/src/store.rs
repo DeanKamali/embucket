@@ -5,7 +5,9 @@
 //! follow-up (state-store trait + tables), not M10 scope.
 
 use crate::error::{self as account_error, Result};
-use crate::models::{AccountObject, Grant, Privilege, Role, User, UserRole, ACCOUNTADMIN};
+use crate::models::{
+    AccountObject, Grant, Privilege, Role, Share, ShareGrant, User, UserRole, ACCOUNTADMIN,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -31,6 +33,15 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
     async fn revoke(&self, grant: &Grant) -> Result<()>;
     async fn role_grants(&self, role: &str) -> Result<Vec<Grant>>;
 
+    /// Shares (design §21, M15.1): named grant bundles.
+    async fn create_share(&self, name: &str) -> Result<Share>;
+    async fn drop_share(&self, name: &str) -> Result<()>;
+    async fn get_share(&self, name: &str) -> Result<Option<Share>>;
+    async fn list_shares(&self) -> Result<Vec<Share>>;
+    async fn grant_to_share(&self, grant: ShareGrant) -> Result<()>;
+    async fn revoke_from_share(&self, grant: &ShareGrant) -> Result<()>;
+    async fn share_grants(&self, share: &str) -> Result<Vec<ShareGrant>>;
+
     /// Verify login credentials. `Ok(None)` = unknown login or wrong
     /// password (indistinguishable, no existence leak); `Err` is reserved
     /// for store failures. Disabled users also return `Ok(None)`.
@@ -49,6 +60,8 @@ struct StoreState {
     roles: HashMap<String, Role>,
     grants: Vec<Grant>,
     user_roles: Vec<UserRole>,
+    shares: HashMap<String, Share>,
+    share_grants: Vec<ShareGrant>,
 }
 
 /// In-memory [`AccountStore`].
@@ -264,6 +277,19 @@ impl AccountStore for InMemoryAccountStore {
             .collect())
     }
 
+    async fn share_grants(&self, share: &str) -> Result<Vec<ShareGrant>> {
+        let state = self.state.read().await;
+        if !state.shares.contains_key(&key(share)) {
+            return account_error::ShareNotFoundSnafu { share: share.to_string() }.fail();
+        }
+        Ok(state
+            .share_grants
+            .iter()
+            .filter(|g| key(&g.share) == key(share))
+            .cloned()
+            .collect())
+    }
+
     async fn authenticate(&self, login_name: &str, password: &str) -> Result<Option<User>> {
         let state = self.state.read().await;
         Ok(state
@@ -284,6 +310,78 @@ impl AccountStore for InMemoryAccountStore {
         Ok(state.grants.iter().any(|g| {
             key(&g.role) == key(role) && g.privilege == privilege && g.object == *object
         }))
+    }
+
+    async fn create_share(&self, name: &str) -> Result<Share> {
+        let mut state = self.state.write().await;
+        if state.shares.contains_key(&key(name)) {
+            return account_error::ShareAlreadyExistsSnafu { share: name.to_string() }.fail();
+        }
+        let share = Share {
+            name: name.to_string(),
+        };
+        state.shares.insert(key(name), share.clone());
+        Ok(share)
+    }
+
+    async fn drop_share(&self, name: &str) -> Result<()> {
+        let mut state = self.state.write().await;
+        if state.shares.remove(&key(name)).is_none() {
+            return account_error::ShareNotFoundSnafu { share: name.to_string() }.fail();
+        }
+        state
+            .share_grants
+            .retain(|g| !key(&g.share).eq_ignore_ascii_case(&key(name)));
+        Ok(())
+    }
+
+    async fn get_share(&self, name: &str) -> Result<Option<Share>> {
+        let state = self.state.read().await;
+        Ok(state.shares.get(&key(name)).cloned())
+    }
+
+    async fn list_shares(&self) -> Result<Vec<Share>> {
+        let state = self.state.read().await;
+        Ok(state.shares.values().cloned().collect())
+    }
+
+    async fn grant_to_share(&self, grant: ShareGrant) -> Result<()> {
+        let mut state = self.state.write().await;
+        if !state.shares.contains_key(&key(&grant.share)) {
+            return account_error::ShareNotFoundSnafu {
+                share: grant.share.clone(),
+            }
+            .fail();
+        }
+        let exists = state.share_grants.iter().any(|g| {
+            key(&g.share) == key(&grant.share)
+                && g.privilege == grant.privilege
+                && g.object == grant.object
+        });
+        if !exists {
+            state.share_grants.push(grant);
+        }
+        Ok(())
+    }
+
+    async fn revoke_from_share(&self, grant: &ShareGrant) -> Result<()> {
+        let mut state = self.state.write().await;
+        let before = state.share_grants.len();
+        state.share_grants.retain(|g| {
+            !(key(&g.share) == key(&grant.share)
+                && g.privilege == grant.privilege
+                && g.object == grant.object)
+        });
+        if state.share_grants.len() == before {
+            return account_error::GrantNotFoundSnafu {
+                message: format!(
+                    "privilege '{}' on {} '{}' is not granted to share '{}'",
+                    grant.privilege, grant.object.kind(), grant.object, grant.share
+                ),
+            }
+            .fail();
+        }
+        Ok(())
     }
 }
 
@@ -356,6 +454,46 @@ mod tests {
         // The bootstrap ACCOUNTADMIN link survives; only the analyst link goes.
         let roles = s.user_roles("embucket").await.unwrap();
         assert!(!roles.iter().any(|r| r.eq_ignore_ascii_case("analyst")));
+    }
+
+    #[tokio::test]
+    async fn shares_lifecycle() {
+        let s = store();
+        assert!(s.get_share("vendor").await.unwrap().is_none());
+        s.create_share("vendor").await.unwrap();
+        assert!(s.create_share("vendor").await.is_err());
+        assert!(s.get_share("VENDOR").await.unwrap().is_some());
+
+        let grant = ShareGrant {
+            share: "vendor".into(),
+            privilege: Privilege::Select,
+            object: AccountObject::Table("db".into(), "public".into(), "t".into()),
+        };
+        s.grant_to_share(grant.clone()).await.unwrap();
+        // Duplicate grant is idempotent.
+        s.grant_to_share(grant.clone()).await.unwrap();
+        assert_eq!(s.share_grants("vendor").await.unwrap(), vec![grant.clone()]);
+        // Grants to unknown shares fail.
+        assert!(s
+            .grant_to_share(ShareGrant {
+                share: "nope".into(),
+                privilege: Privilege::Usage,
+                object: AccountObject::Database("db".into()),
+            })
+            .await
+            .is_err());
+        assert!(s.share_grants("nope").await.is_err());
+        // Revoke works; second revoke reports not-found.
+        s.revoke_from_share(&grant).await.unwrap();
+        assert!(s.revoke_from_share(&grant).await.is_err());
+        assert_eq!(s.list_shares().await.unwrap().len(), 1);
+
+        // Drop cascades the share's grants.
+        s.grant_to_share(grant).await.unwrap();
+        s.drop_share("vendor").await.unwrap();
+        assert!(s.drop_share("vendor").await.is_err());
+        assert!(s.share_grants("vendor").await.is_err());
+        assert!(s.list_shares().await.unwrap().is_empty());
     }
 
     #[tokio::test]

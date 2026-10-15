@@ -91,3 +91,21 @@ pub struct UserRole {
     pub user: String,
     pub role: String,
 }
+
+/// A share: a named grant bundle attachable across accounts (design §21,
+/// M15). The provider grants privileges into the share; a consumer account
+/// that mounts the share (M15.2) sees exactly the granted objects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Share {
+    pub name: String,
+}
+
+/// A privilege grant to a share: `share` may exercise `privilege` on
+/// `object`. Same privilege/object vocabulary as [`Grant`] — no new
+/// enforcement path, only a new grantee kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShareGrant {
+    pub share: String,
+    pub privilege: Privilege,
+    pub object: AccountObject,
+}

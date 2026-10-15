@@ -112,6 +112,12 @@ fn lex(raw: &str) -> Vec<Token> {
             i += 1;
             continue;
         }
+        // ';' is a statement terminator — consume it, never tokenize it
+        // (tokenizing without advancing would loop forever).
+        if chars[i] == ';' {
+            i += 1;
+            continue;
+        }
         let start = i;
         let c = chars[i];
         if c == '\'' || c == '"' || c == '`' {

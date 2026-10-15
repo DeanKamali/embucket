@@ -97,13 +97,16 @@ pub struct UserRole {
 /// that mounts the share (M15.2) sees exactly the granted objects.
 ///
 /// v1 kinds: `Outbound` (provider-side, `CREATE SHARE`) and `Inbound`
-/// (consumer-side, `CREATE INBOUND SHARE`). Cross-account transport is v2
-/// (replication deferred) — an inbound share resolves against the same
-/// process's store, the "same-region trust boundary" case.
+/// (consumer-side, `CREATE INBOUND SHARE … FROM <provider_share>`). An
+/// inbound share resolves its grant list through `provider` — v1 resolves
+/// against the same process's store (the "same-region trust boundary"
+/// case); cross-account transport is v2 (replication deferred).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Share {
     pub name: String,
     pub kind: ShareKind,
+    /// The provider-side share an inbound share mounts (None for outbound).
+    pub provider: Option<String>,
 }
 
 /// Outbound = created by the provider (`CREATE SHARE`); inbound = mounted

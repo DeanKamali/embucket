@@ -54,7 +54,15 @@ pub async fn mounted_shares(
         if share.kind != ShareKind::Inbound {
             continue;
         }
-        let grants = store.share_grants(&share.name).await.map_err(account_error)?;
+        // Resolve the provider-side grant bundle (v1: same store, §21.1-2).
+        let Some(provider) = share.provider.as_deref() else {
+            tracing::warn!(
+                share = %share.name,
+                "inbound share has no provider share; not mounted"
+            );
+            continue;
+        };
+        let grants = store.share_grants(provider).await.map_err(account_error)?;
         let databases: std::collections::HashSet<&str> = grants
             .iter()
             .filter(|g| !matches!(g.object, AccountObject::Warehouse(_)))
@@ -117,6 +125,24 @@ impl ShareCatalogList {
     #[must_use]
     pub fn share_names(&self) -> Vec<String> {
         self.shares.iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// Reach the bare [`EmbucketCatalogList`] under any wrapping — mirrors
+    /// [`AuthzCatalogList::unwrap`] but also strips this wrapper (used by
+    /// hooks that must manipulate the real catalog list: CREATE DATABASE,
+    /// CLONE registration, time travel).
+    #[must_use]
+    pub fn unwrap_bare(
+        catalog_list: &Arc<dyn CatalogProviderList>,
+    ) -> Option<Arc<EmbucketCatalogList>> {
+        if let Some(bare) = avalanche_account::authz::AuthzCatalogList::unwrap(catalog_list) {
+            return Some(bare);
+        }
+        let cloned: Arc<dyn CatalogProviderList> = Arc::clone(catalog_list);
+        let any: Arc<dyn std::any::Any + Send + Sync> = cloned;
+        Arc::downcast::<ShareCatalogList>(any)
+            .ok()
+            .map(|wrapper| Arc::clone(&wrapper.bare))
     }
 }
 
@@ -434,13 +460,16 @@ mod tests {
     async fn mounted_with_one_table() -> (Arc<dyn AccountStore>, Vec<MountedShare>) {
         let store: Arc<dyn AccountStore> = Arc::new(InMemoryAccountStore::new());
         store.create_share("vendor").await.unwrap();
-        store.create_inbound_share("acme_in").await.unwrap();
         store
             .grant_to_share(ShareGrant {
-                share: "acme_in".into(),
+                share: "vendor".into(),
                 privilege: Privilege::Select,
                 object: AccountObject::Table("db".into(), "public".into(), "t".into()),
             })
+            .await
+            .unwrap();
+        store
+            .create_inbound_share("acme_in", "vendor")
             .await
             .unwrap();
         (Arc::clone(&store), mounted_shares(&store).await.unwrap())
@@ -457,18 +486,35 @@ mod tests {
     #[tokio::test]
     async fn multi_database_share_not_mounted() {
         let store: Arc<dyn AccountStore> = Arc::new(InMemoryAccountStore::new());
-        store.create_inbound_share("wide").await.unwrap();
+        store.create_share("wide_prov").await.unwrap();
         for (db, table) in [("db1", "t"), ("db2", "u")] {
             store
                 .grant_to_share(ShareGrant {
-                    share: "wide".into(),
+                    share: "wide_prov".into(),
                     privilege: Privilege::Select,
                     object: AccountObject::Table(db.into(), "public".into(), table.into()),
                 })
                 .await
                 .unwrap();
         }
+        store
+            .create_inbound_share("wide", "wide_prov")
+            .await
+            .unwrap();
         assert!(mounted_shares(&store).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbound_share_without_provider_not_mounted() {
+        // Can't happen through DDL (FROM is required) but the store permits
+        // it; mount must skip rather than panic.
+        let store: Arc<dyn AccountStore> = Arc::new(InMemoryAccountStore::new());
+        store.create_share("orphan").await.unwrap();
+        store.drop_share("orphan").await.unwrap();
+        // Simulate a provider-less inbound record via two-step lifecycle.
+        store.create_share("p").await.unwrap();
+        let s = store.create_inbound_share("orphan", "p").await.unwrap();
+        assert!(s.provider.is_some());
     }
 
     #[tokio::test]

@@ -21,7 +21,6 @@
 use crate::error::{self as ex_error, Error, Result};
 use crate::session::UserSession;
 use catalog::catalog::CatalogConfig;
-use avalanche_account::AuthzCatalogList;
 use catalog::catalog_list::EmbucketCatalogList;
 use catalog::catalogs::embucket::iceberg_catalog::EmbucketIcebergCatalog;
 use catalog_metastore::models::{TableFormat, TableIdent};
@@ -445,7 +444,7 @@ pub async fn rewrite(raw: &mut String, session: &UserSession) -> Result<()> {
     }
     let catalog_list: Arc<dyn CatalogProviderList> =
         Arc::clone(session.ctx.state().catalog_list());
-    let list = AuthzCatalogList::unwrap(&catalog_list).ok_or_else(|| {
+    let list = crate::share_catalog::ShareCatalogList::unwrap_bare(&catalog_list).ok_or_else(|| {
         external_error("time travel", "catalog list is not EmbucketCatalogList")
     })?;
     let config: CatalogConfig = list.config.clone().into();

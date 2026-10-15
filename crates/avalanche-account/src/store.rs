@@ -35,7 +35,9 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
 
     /// Shares (design §21, M15.1): named grant bundles.
     async fn create_share(&self, name: &str) -> Result<Share>;
-    async fn create_inbound_share(&self, name: &str) -> Result<Share>;
+    /// Inbound share mounting the provider-side share `provider` (M15.2).
+    /// v1 resolves `provider` in the same store.
+    async fn create_inbound_share(&self, name: &str, provider: &str) -> Result<Share>;
     async fn drop_share(&self, name: &str) -> Result<()>;
     async fn get_share(&self, name: &str) -> Result<Option<Share>>;
     async fn list_shares(&self) -> Result<Vec<Share>>;
@@ -321,19 +323,27 @@ impl AccountStore for InMemoryAccountStore {
         let share = Share {
             name: name.to_string(),
             kind: crate::models::ShareKind::Outbound,
+            provider: None,
         };
         state.shares.insert(key(name), share.clone());
         Ok(share)
     }
 
-    async fn create_inbound_share(&self, name: &str) -> Result<Share> {
+    async fn create_inbound_share(&self, name: &str, provider: &str) -> Result<Share> {
         let mut state = self.state.write().await;
         if state.shares.contains_key(&key(name)) {
             return account_error::ShareAlreadyExistsSnafu { share: name.to_string() }.fail();
         }
+        if !state.shares.contains_key(&key(provider)) {
+            return account_error::ShareNotFoundSnafu {
+                share: provider.to_string(),
+            }
+            .fail();
+        }
         let share = Share {
             name: name.to_string(),
             kind: crate::models::ShareKind::Inbound,
+            provider: Some(provider.to_string()),
         };
         state.shares.insert(key(name), share.clone());
         Ok(share)
@@ -516,19 +526,12 @@ mod tests {
         let s = store();
         s.create_share("vendor").await.unwrap();
         // Same name in either kind collides.
-        assert!(s.create_inbound_share("vendor").await.is_err());
-        let inbound = s.create_inbound_share("acme_in").await.unwrap();
+        assert!(s.create_inbound_share("vendor", "vendor").await.is_err());
+        // Provider must exist.
+        assert!(s.create_inbound_share("acme_in", "nope").await.is_err());
+        let inbound = s.create_inbound_share("acme_in", "vendor").await.unwrap();
         assert_eq!(inbound.kind, crate::models::ShareKind::Inbound);
-        // Grants work on inbound shares too (M15.2: visibility comes from
-        // the share's grant list; v1 resolves the same-process store).
-        s.grant_to_share(ShareGrant {
-            share: "acme_in".into(),
-            privilege: Privilege::Select,
-            object: AccountObject::Table("db".into(), "public".into(), "t".into()),
-        })
-        .await
-        .unwrap();
-        assert_eq!(s.share_grants("acme_in").await.unwrap().len(), 1);
+        assert_eq!(inbound.provider.as_deref(), Some("vendor"));
         let kinds: Vec<_> = s
             .list_shares()
             .await

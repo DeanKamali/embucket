@@ -78,6 +78,8 @@ pub enum AccountStatement {
     CreateShare {
         kind: ShareKind,
         name: String,
+        /// Inbound shares mount a provider-side share (M15.2 `FROM` clause).
+        provider: Option<String>,
         if_not_exists: bool,
     },
     DropShare {
@@ -287,19 +289,38 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
     let name = (*tok.get(i)?).to_string();
     if create {
         if kind == "ROLE" || kind == "SHARE" || inbound_share {
-            if tok.get(i + 1).is_some() {
+            // M15.2: inbound shares take `FROM <provider_share>`.
+            let mut provider = None;
+            if inbound_share
+                && tok
+                    .get(i + 1)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("from"))
+            {
+                provider = Some((*tok.get(i + 2)?).to_string());
+                if tok.get(i + 3).is_some() {
+                    return None;
+                }
+            } else if tok.get(i + 1).is_some() {
                 return None; // unknown CREATE ROLE/SHARE options → planner error
             }
             return if kind == "ROLE" {
                 Some(AccountStatement::CreateRole { name, if_not_exists })
+            } else if inbound_share {
+                // Malformed inbound share (missing FROM) → planner error.
+                if provider.is_none() {
+                    return None;
+                }
+                Some(AccountStatement::CreateShare {
+                    kind: ShareKind::Inbound,
+                    name,
+                    provider,
+                    if_not_exists,
+                })
             } else {
                 Some(AccountStatement::CreateShare {
-                    kind: if inbound_share {
-                        ShareKind::Inbound
-                    } else {
-                        ShareKind::Outbound
-                    },
+                    kind: ShareKind::Outbound,
                     name,
+                    provider: None,
                     if_not_exists,
                 })
             };
@@ -541,11 +562,19 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             .context(ex_error::ArrowSnafu)?;
             Ok(QueryResult::new(vec![batch], schema))
         }
-        AccountStatement::CreateShare { kind, name, if_not_exists } => {
+        AccountStatement::CreateShare { kind, name, provider, if_not_exists } => {
             let name = norm(name);
             let result = match kind {
                 ShareKind::Outbound => store.create_share(&name).await,
-                ShareKind::Inbound => store.create_inbound_share(&name).await,
+                ShareKind::Inbound => {
+                    let Some(provider) = provider else {
+                        return Err(external_error(
+                            "account",
+                            "CREATE INBOUND SHARE requires FROM <provider_share>",
+                        ));
+                    };
+                    store.create_inbound_share(&name, &norm(provider)).await
+                }
             };
             match result {
                 Ok(_) => crate::clone_ddl::status_row(),
@@ -640,10 +669,41 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
                     format!("share '{share}' does not exist"),
                 ));
             }
-            let grants = store
-                .share_grants(&share)
+            let grants = if let Some(s) = store
+                .get_share(&share)
                 .await
-                .map_err(|e| external_error("account", e))?;
+                .map_err(|e| external_error("account", e))?
+            {
+                if let (ShareKind::Inbound, Some(provider)) = (s.kind, s.provider.as_deref()) {
+                    // Inbound share: report the provider bundle it mounts.
+                    let provider = norm(provider);
+                    if store
+                        .get_share(&provider)
+                        .await
+                        .map_err(|e| external_error("account", e))?
+                        .is_none()
+                    {
+                        return Err(external_error(
+                            "account",
+                            format!("share '{provider}' does not exist"),
+                        ));
+                    }
+                    store
+                        .share_grants(&provider)
+                        .await
+                        .map_err(|e| external_error("account", e))?
+                } else {
+                    store
+                        .share_grants(&share)
+                        .await
+                        .map_err(|e| external_error("account", e))?
+                }
+            } else {
+                return Err(external_error(
+                    "account",
+                    format!("share '{share}' does not exist"),
+                ));
+            };
             let mut schema_fields = Vec::new();
             for (name, nullable) in [
                 ("privilege", false),
@@ -916,6 +976,7 @@ mod tests {
             AccountStatement::CreateShare {
                 kind: ShareKind::Outbound,
                 name: "vendor".into(),
+                provider: None,
                 if_not_exists: false
             }
         );
@@ -924,6 +985,7 @@ mod tests {
             AccountStatement::CreateShare {
                 kind: ShareKind::Outbound,
                 name: "Vendor".into(),
+                provider: None,
                 if_not_exists: false
             }
         );
@@ -939,21 +1001,26 @@ mod tests {
     #[test]
     fn parses_inbound_share_and_desc() {
         assert_eq!(
-            parsed("CREATE INBOUND SHARE acme_in"),
+            parsed("CREATE INBOUND SHARE acme_in FROM vendor"),
             AccountStatement::CreateShare {
                 kind: ShareKind::Inbound,
                 name: "acme_in".into(),
+                provider: Some("vendor".into()),
                 if_not_exists: false
             }
         );
         assert_eq!(
-            parsed("CREATE INBOUND SHARE IF NOT EXISTS \"AcmeIn\";"),
+            parsed("CREATE INBOUND SHARE IF NOT EXISTS \"AcmeIn\" FROM \"Vendor\";"),
             AccountStatement::CreateShare {
                 kind: ShareKind::Inbound,
                 name: "AcmeIn".into(),
+                provider: Some("Vendor".into()),
                 if_not_exists: true
             }
         );
+        // FROM is required for inbound shares.
+        assert!(parse("CREATE INBOUND SHARE acme_in").is_none());
+        assert!(parse("CREATE INBOUND SHARE acme_in FROM v EXTRA").is_none());
         assert!(parse("CREATE INBOUND ROLE x").is_none());
         // DROP INBOUND SHARE is an accepted alias of DROP SHARE.
         assert_eq!(

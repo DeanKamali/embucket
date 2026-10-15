@@ -1,4 +1,3 @@
-use avalanche_account::AuthzCatalogList;
 use super::catalog::catalog_list::EmbucketCatalogList;
 use super::catalog::information_schema::information_schema::{
     INFORMATION_SCHEMA, InformationSchemaProvider,
@@ -179,7 +178,7 @@ impl UserQuery {
     async fn drop_catalog(&self, catalog: &str, cascade: bool) -> Result<()> {
         let catalog_list: Arc<dyn CatalogProviderList> =
             Arc::clone(self.session.ctx.state().catalog_list());
-        if let Some(catalog_list_impl) = AuthzCatalogList::unwrap(&catalog_list) {
+        if let Some(catalog_list_impl) = crate::share_catalog::ShareCatalogList::unwrap_bare(&catalog_list) {
             catalog_list_impl
                 .drop_catalog(catalog, cascade)
                 .await
@@ -192,7 +191,7 @@ impl UserQuery {
     async fn create_catalog(&self, catalog: &str, volume: &str) -> Result<()> {
         let catalog_list: Arc<dyn CatalogProviderList> =
             Arc::clone(self.session.ctx.state().catalog_list());
-        if let Some(catalog_list_impl) = AuthzCatalogList::unwrap(&catalog_list) {
+        if let Some(catalog_list_impl) = crate::share_catalog::ShareCatalogList::unwrap_bare(&catalog_list) {
             catalog_list_impl
                 .create_catalog(catalog, volume)
                 .await

@@ -590,6 +590,30 @@ impl UserQuery {
         &mut self,
         mut subquery: Box<Query>,
     ) -> Result<QueryResult> {
+        // Result cache (design §19.1, M12): eligibility is decided before
+        // execution — known user, no time-travel AT() reads, no
+        // non-deterministic functions, all refs resolvable to tables.
+        let original_text = subquery.to_string();
+        let has_time_travel = crate::time_travel::plan(&original_text)
+            .map(|rewrites| !rewrites.is_empty())
+            .unwrap_or(false);
+        let cache_key = if has_time_travel {
+            None
+        } else {
+            crate::result_cache::cache_key(&self.session, &original_text)
+        };
+        let cache_fingerprint = if cache_key.is_some() {
+            crate::result_cache::fingerprint(&self.session, subquery.as_ref()).await
+        } else {
+            None
+        };
+        if let (Some(key), Some(fp)) = (&cache_key, cache_fingerprint)
+            && let Some(cached) = crate::result_cache::lookup(key, fp).await
+        {
+            tracing::debug!(query_id = %self.query_context.query_id, "result cache hit");
+            return Ok(cached);
+        }
+
         self.traverse_and_update_query(subquery.as_mut()).await;
         let text = subquery.to_string();
         // Avalanche (design §6.3, v1 heuristic): a top-level SELECT with a
@@ -603,12 +627,17 @@ impl UserQuery {
             Some(url) if !is_session_local_table_function(&text) => Some(url),
             _ => None,
         };
-        if let Some(scheduler_url) = scheduler_url {
-            return self
-                .execute_with_custom_plan_target(&text, Some(scheduler_url))
-                .await;
+        let result = if let Some(scheduler_url) = scheduler_url {
+            self.execute_with_custom_plan_target(&text, Some(scheduler_url))
+                .await
+        } else {
+            Box::pin(self.execute_with_custom_plan(&text)).await
+        };
+        let result = result?;
+        if let (Some(key), Some(fp)) = (&cache_key, cache_fingerprint) {
+            crate::result_cache::store(key.clone(), fp, &result);
         }
-        Box::pin(self.execute_with_custom_plan(&text)).await
+        Ok(result)
     }
 
     #[instrument(

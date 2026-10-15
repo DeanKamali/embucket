@@ -6,7 +6,6 @@ use crate::models::SessionMetadata;
 use crate::running_queries::RunningQueriesRegistry;
 use crate::service::CoreExecutionService;
 use crate::utils::Config;
-#[cfg(feature = "state-store")]
 use catalog_metastore::InMemoryMetastore;
 use catalog_metastore::{
     Database as MetastoreDatabase, Schema as MetastoreSchema, SchemaIdent as MetastoreSchemaIdent,

@@ -13,6 +13,7 @@ pub mod models;
 pub mod query;
 pub mod query_task_result;
 pub mod query_types;
+pub mod result_cache;
 pub mod running_queries;
 pub mod scheduler;
 pub mod service;

@@ -4,7 +4,6 @@ use crate::running_queries::RunningQueriesRegistry;
 use crate::service::CoreExecutionService;
 use crate::session::UserSession;
 use crate::utils::Config;
-#[cfg(feature = "state-store")]
 use catalog_metastore::InMemoryMetastore;
 use catalog_metastore::metastore_bootstrap_config::MetastoreBootstrapConfig;
 use datafusion::prelude::SessionContext;

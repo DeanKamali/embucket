@@ -10,6 +10,9 @@
 //! - `GRANT USAGE|SELECT ON DATABASE|SCHEMA|TABLE|WAREHOUSE <name> TO ROLE <r>`
 //!   (and the symmetric `REVOKE ... FROM ROLE <r>`)
 //! - `SHOW GRANTS TO ROLE <r>`
+//! - Shares (design §21, M15.1): `CREATE [IF NOT EXISTS] SHARE <name>`,
+//!   `DROP SHARE <name>`, the same `GRANT|REVOKE ... TO|FROM SHARE <s>`,
+//!   `SHOW SHARES`, `SHOW GRANTS TO SHARE <s>`
 //!
 //! All account DDL is `ACCOUNTADMIN`-only in v1: the session must be
 //! authorized with the built-in role active. Data-plane DDL (CREATE/DROP
@@ -19,7 +22,7 @@
 use crate::error::{self as ex_error, Error, Result};
 use crate::models::QueryResult;
 use crate::session::UserSession;
-use avalanche_account::models::{AccountObject, Grant, Privilege, User, ACCOUNTADMIN};
+use avalanche_account::models::{AccountObject, Grant, Privilege, ShareGrant, User, ACCOUNTADMIN};
 use avalanche_account::store::AccountStore;
 use avalanche_account::SessionAuthz;
 use datafusion::arrow::array::{RecordBatch, StringArray};
@@ -69,6 +72,27 @@ pub enum AccountStatement {
     ShowGrants {
         role: String,
     },
+    CreateShare {
+        name: String,
+        if_not_exists: bool,
+    },
+    DropShare {
+        name: String,
+    },
+    GrantShare {
+        privilege: Privilege,
+        object: AccountObject,
+        share: String,
+    },
+    RevokeShare {
+        privilege: Privilege,
+        object: AccountObject,
+        share: String,
+    },
+    ShowShares,
+    ShowGrantsShare {
+        share: String,
+    },
 }
 
 /// Lower-case token, quotes and trailing `;` stripped.
@@ -92,9 +116,10 @@ fn external_error(context: &str, err: impl std::fmt::Display) -> Error {
     }
 }
 
-/// Parse `USAGE|SELECT ON <KIND> <name> TO|FROM ROLE <r>` from `tok[i..]`.
-/// `None` = malformed (fall through to the planner's syntax error).
-fn parse_on_grant(tok: &[&str], from: usize) -> Option<(Privilege, AccountObject, String)> {
+/// Parse `USAGE|SELECT ON <KIND> <name> TO|FROM <ROLE|SHARE> <grantee>`
+/// from `tok[i..]`. `None` = malformed (fall through to the planner's
+/// syntax error).
+fn parse_on_grant(tok: &[&str], from: usize) -> Option<(Privilege, AccountObject, &'static str, String)> {
     let privilege = match tok.get(from)?.to_ascii_uppercase().as_str() {
         "USAGE" => Privilege::Usage,
         "SELECT" => Privilege::Select,
@@ -126,11 +151,13 @@ fn parse_on_grant(tok: &[&str], from: usize) -> Option<(Privilege, AccountObject
     if !matches!(direction.as_str(), "TO" | "FROM") {
         return None;
     }
-    if !tok.get(from + 5)?.eq_ignore_ascii_case("role") {
-        return None;
-    }
-    let role = (*tok.get(from + 6)?).to_string();
-    Some((privilege, object, role))
+    let grantee_kind = match tok.get(from + 5)?.to_ascii_uppercase().as_str() {
+        "ROLE" => "role",
+        "SHARE" => "share",
+        _ => return None,
+    };
+    let grantee = (*tok.get(from + 6)?).to_string();
+    Some((privilege, object, grantee_kind, grantee))
 }
 
 /// Match the grammar prefix; `None` when this is not an account statement
@@ -142,35 +169,42 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
     match tok.first()?.to_ascii_uppercase().as_str() {
         "CREATE" | "DROP" => {}
         "GRANT" | "REVOKE" => {
-            // Object grant: `GRANT|REVOKE <priv> ON <kind> <name> TO|FROM ROLE <r>`
-            if let Some((privilege, object, role)) = parse_on_grant(&tok, 1) {
-                return if tok[0].eq_ignore_ascii_case("grant") {
-                    Some(AccountStatement::Grant {
+            let is_grant = tok[0].eq_ignore_ascii_case("grant");
+            // Object grant: `GRANT|REVOKE <priv> ON <kind> <name> TO|FROM ROLE|SHARE <g>`
+            if let Some((privilege, object, grantee_kind, grantee)) = parse_on_grant(&tok, 1) {
+                return Some(match (is_grant, grantee_kind) {
+                    (true, "role") => AccountStatement::Grant {
                         privilege,
                         object,
-                        role,
-                    })
-                } else {
-                    Some(AccountStatement::Revoke {
+                        role: grantee,
+                    },
+                    (false, "role") => AccountStatement::Revoke {
                         privilege,
                         object,
-                        role,
-                    })
-                };
+                        role: grantee,
+                    },
+                    (true, "share") => AccountStatement::GrantShare {
+                        privilege,
+                        object,
+                        share: grantee,
+                    },
+                    (false, "share") => AccountStatement::RevokeShare {
+                        privilege,
+                        object,
+                        share: grantee,
+                    },
+                    _ => unreachable!("grantee_kind is 'role' or 'share'"),
+                });
             }
             // Role membership: `GRANT ROLE <r> TO USER <u>` /
             // `REVOKE ROLE <r> FROM USER <u>`.
             if tok.len() == 6
                 && tok[1].eq_ignore_ascii_case("role")
                 && tok[4].eq_ignore_ascii_case("user")
-                && tok[3].eq_ignore_ascii_case(if tok[0].eq_ignore_ascii_case("grant") {
-                    "to"
-                } else {
-                    "from"
-                })
+                && tok[3].eq_ignore_ascii_case(if is_grant { "to" } else { "from" })
             {
                 let (role, user) = (tok[2].to_string(), tok[5].to_string());
-                return if tok[0].eq_ignore_ascii_case("grant") {
+                return if is_grant {
                     Some(AccountStatement::GrantRole { role, user })
                 } else {
                     Some(AccountStatement::RevokeRole { role, user })
@@ -182,11 +216,21 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
             if tok.len() == 5
                 && tok[1].eq_ignore_ascii_case("grants")
                 && tok[2].eq_ignore_ascii_case("to")
-                && tok[3].eq_ignore_ascii_case("role")
             {
-                return Some(AccountStatement::ShowGrants {
-                    role: tok[4].to_string(),
-                });
+                if tok[3].eq_ignore_ascii_case("role") {
+                    return Some(AccountStatement::ShowGrants {
+                        role: tok[4].to_string(),
+                    });
+                }
+                if tok[3].eq_ignore_ascii_case("share") {
+                    return Some(AccountStatement::ShowGrantsShare {
+                        share: tok[4].to_string(),
+                    });
+                }
+                return None;
+            }
+            if tok.len() == 2 && tok[1].eq_ignore_ascii_case("shares") {
+                return Some(AccountStatement::ShowShares);
             }
             return None;
         }
@@ -195,9 +239,9 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
 
     let create = tok[0].eq_ignore_ascii_case("create");
     let mut i = 1;
-    // Grammar: CREATE [IF NOT EXISTS] ROLE|USER <name> ...
+    // Grammar: CREATE [IF NOT EXISTS] ROLE|USER|SHARE <name> [options]
     let kind = tok.get(i)?.to_ascii_uppercase();
-    if kind != "ROLE" && kind != "USER" {
+    if kind != "ROLE" && kind != "USER" && kind != "SHARE" {
         return None;
     }
     i += 1;
@@ -212,11 +256,15 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
     }
     let name = (*tok.get(i)?).to_string();
     if create {
-        if kind == "ROLE" {
+        if kind == "ROLE" || kind == "SHARE" {
             if tok.get(i + 1).is_some() {
-                return None; // unknown CREATE ROLE options → planner error
+                return None; // unknown CREATE ROLE/SHARE options → planner error
             }
-            return Some(AccountStatement::CreateRole { name, if_not_exists });
+            return if kind == "ROLE" {
+                Some(AccountStatement::CreateRole { name, if_not_exists })
+            } else {
+                Some(AccountStatement::CreateShare { name, if_not_exists })
+            };
         }
         // CREATE USER <name> [options]: key = 'value' pairs.
         let mut password = None;
@@ -248,14 +296,14 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
             if_not_exists,
         });
     }
-    // DROP ROLE|USER <name>
+    // DROP ROLE|USER|SHARE <name>
     if tok.get(i + 1).is_some() {
         return None;
     }
-    if kind == "ROLE" {
-        Some(AccountStatement::DropRole { name })
-    } else {
-        Some(AccountStatement::DropUser { name })
+    match kind.as_str() {
+        "ROLE" => Some(AccountStatement::DropRole { name }),
+        "USER" => Some(AccountStatement::DropUser { name }),
+        _ => Some(AccountStatement::DropShare { name }),
     }
 }
 
@@ -441,6 +489,151 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
                 name_col.push(String::new());
                 granted_to_col.push("ROLE".to_string());
                 grantee_col.push(role.clone());
+            }
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(privilege_col)),
+                    Arc::new(StringArray::from(granted_on_col)),
+                    Arc::new(StringArray::from(name_col)),
+                    Arc::new(StringArray::from(granted_to_col)),
+                    Arc::new(StringArray::from(grantee_col)),
+                ],
+            )
+            .context(ex_error::ArrowSnafu)?;
+            Ok(QueryResult::new(vec![batch], schema))
+        }
+        AccountStatement::CreateShare { name, if_not_exists } => {
+            let name = norm(name);
+            match store.create_share(&name).await {
+                Ok(_) => crate::clone_ddl::status_row(),
+                Err(e) if e.is_share_already_exists() && *if_not_exists => {
+                    crate::clone_ddl::status_row()
+                }
+                Err(e) => Err(external_error("account", e)),
+            }
+        }
+        AccountStatement::DropShare { name } => {
+            let name = norm(name);
+            store.drop_share(&name).await.map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::GrantShare {
+            privilege,
+            object,
+            share,
+        } => {
+            let (privilege, object) = normalize_grant(privilege.clone(), object, session);
+            store
+                .grant_to_share(ShareGrant {
+                    share: norm(share),
+                    privilege,
+                    object,
+                })
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::RevokeShare {
+            privilege,
+            object,
+            share,
+        } => {
+            let (privilege, object) = normalize_grant(privilege.clone(), object, session);
+            store
+                .revoke_from_share(&ShareGrant {
+                    share: norm(share),
+                    privilege,
+                    object,
+                })
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::ShowShares => {
+            let shares = store
+                .list_shares()
+                .await
+                .map_err(|e| external_error("account", e))?;
+            let mut schema_fields = Vec::new();
+            for (name, nullable) in [("created_on", false), ("name", false), ("kind", false)] {
+                schema_fields.push(Field::new(name, DataType::Utf8, nullable));
+            }
+            let schema = Arc::new(ArrowSchema::new(schema_fields));
+            let mut created_on_col = Vec::new();
+            let mut name_col = Vec::new();
+            let mut kind_col = Vec::new();
+            for s in shares {
+                // Timestamps are not tracked in the v1 in-memory store.
+                created_on_col.push(String::new());
+                name_col.push(s.name);
+                // Shares created by this account are outbound (§21.1).
+                kind_col.push("OUTBOUND".to_string());
+            }
+            if created_on_col.is_empty() {
+                created_on_col.push(String::new());
+                name_col.push(String::new());
+                kind_col.push(String::new());
+            }
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(created_on_col)),
+                    Arc::new(StringArray::from(name_col)),
+                    Arc::new(StringArray::from(kind_col)),
+                ],
+            )
+            .context(ex_error::ArrowSnafu)?;
+            Ok(QueryResult::new(vec![batch], schema))
+        }
+        AccountStatement::ShowGrantsShare { share } => {
+            let share = norm(share);
+            if store
+                .get_share(&share)
+                .await
+                .map_err(|e| external_error("account", e))?
+                .is_none()
+            {
+                return Err(external_error(
+                    "account",
+                    format!("share '{share}' does not exist"),
+                ));
+            }
+            let grants = store
+                .share_grants(&share)
+                .await
+                .map_err(|e| external_error("account", e))?;
+            let mut schema_fields = Vec::new();
+            for (name, nullable) in [
+                ("privilege", false),
+                ("granted_on", false),
+                ("name", false),
+                ("granted_to", false),
+                ("grantee_name", false),
+            ] {
+                schema_fields.push(Field::new(name, DataType::Utf8, nullable));
+            }
+            let schema = Arc::new(ArrowSchema::new(schema_fields));
+            let mut privilege_col = Vec::new();
+            let mut granted_on_col = Vec::new();
+            let mut name_col = Vec::new();
+            let mut granted_to_col = Vec::new();
+            let mut grantee_col = Vec::new();
+            for g in grants {
+                privilege_col.push(g.privilege.to_string());
+                granted_on_col.push(g.object.kind().to_string());
+                name_col.push(g.object.to_string());
+                granted_to_col.push("SHARE".to_string());
+                grantee_col.push(share.clone());
+            }
+            if privilege_col.is_empty() {
+                // Snowflake keeps SHOW GRANTS non-empty; a share with no
+                // grants reports one row with empty strings.
+                privilege_col.push(String::new());
+                granted_on_col.push(String::new());
+                name_col.push(String::new());
+                granted_to_col.push("SHARE".to_string());
+                grantee_col.push(share.clone());
             }
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
@@ -644,5 +837,73 @@ mod tests {
         );
         assert!(parse("SHOW GRANTS").is_none());
         assert!(parse("SHOW GRANTS TO USER u1").is_none());
+    }
+
+    #[test]
+    fn parses_create_drop_share() {
+        assert_eq!(
+            parsed("CREATE SHARE vendor"),
+            AccountStatement::CreateShare {
+                name: "vendor".into(),
+                if_not_exists: false
+            }
+        );
+        assert_eq!(
+            parsed("create share if not exists \"Vendor\";"),
+            AccountStatement::CreateShare {
+                name: "Vendor".into(),
+                if_not_exists: true
+            }
+        );
+        assert_eq!(
+            parsed("DROP SHARE vendor"),
+            AccountStatement::DropShare { name: "vendor".into() }
+        );
+        assert!(parse("CREATE SHARE").is_none());
+        // Unknown options fall through to the planner.
+        assert!(parse("CREATE SHARE vendor FOO = 'x'").is_none());
+    }
+
+    #[test]
+    fn parses_share_grants_and_shows() {
+        assert_eq!(
+            parsed("GRANT USAGE ON DATABASE embucket TO SHARE vendor"),
+            AccountStatement::GrantShare {
+                privilege: Privilege::Usage,
+                object: AccountObject::Database("embucket".into()),
+                share: "vendor".into()
+            }
+        );
+        assert_eq!(
+            parsed("grant select on table db.public.t to share vendor;"),
+            AccountStatement::GrantShare {
+                privilege: Privilege::Select,
+                object: AccountObject::Table("db".into(), "public".into(), "t".into()),
+                share: "vendor".into()
+            }
+        );
+        assert_eq!(
+            parsed("REVOKE USAGE ON SCHEMA db.public FROM SHARE vendor"),
+            AccountStatement::RevokeShare {
+                privilege: Privilege::Usage,
+                object: AccountObject::Schema("db".into(), "public".into()),
+                share: "vendor".into()
+            }
+        );
+        assert_eq!(
+            parsed("SHOW GRANTS TO SHARE vendor"),
+            AccountStatement::ShowGrantsShare { share: "vendor".into() }
+        );
+        assert_eq!(parsed("SHOW SHARES"), AccountStatement::ShowShares);
+        // Role grants still parse as roles, not shares.
+        assert_eq!(
+            parsed("GRANT USAGE ON DATABASE embucket TO ROLE analyst"),
+            AccountStatement::Grant {
+                privilege: Privilege::Usage,
+                object: AccountObject::Database("embucket".into()),
+                role: "analyst".into()
+            }
+        );
+        assert!(parse("SHOW SHARES ALL").is_none());
     }
 }

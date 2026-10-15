@@ -18,6 +18,7 @@ pub mod running_queries;
 pub mod scheduler;
 pub mod service;
 pub mod session;
+pub mod share_catalog;
 pub mod snowflake_error;
 pub mod tracing;
 pub mod utils;

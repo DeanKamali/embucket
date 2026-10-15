@@ -11,8 +11,9 @@
 //!   (and the symmetric `REVOKE ... FROM ROLE <r>`)
 //! - `SHOW GRANTS TO ROLE <r>`
 //! - Shares (design §21, M15.1): `CREATE [IF NOT EXISTS] SHARE <name>`,
-//!   `DROP SHARE <name>`, the same `GRANT|REVOKE ... TO|FROM SHARE <s>`,
-//!   `SHOW SHARES`, `SHOW GRANTS TO SHARE <s>`
+//!   `CREATE [IF NOT EXISTS] INBOUND SHARE <name>` (M15.2), `DROP SHARE
+//!   <name>`, the same `GRANT|REVOKE ... TO|FROM SHARE <s>`, `SHOW SHARES`,
+//!   `DESC SHARE <s>`, `SHOW GRANTS TO SHARE <s>`
 //!
 //! All account DDL is `ACCOUNTADMIN`-only in v1: the session must be
 //! authorized with the built-in role active. Data-plane DDL (CREATE/DROP
@@ -22,7 +23,9 @@
 use crate::error::{self as ex_error, Error, Result};
 use crate::models::QueryResult;
 use crate::session::UserSession;
-use avalanche_account::models::{AccountObject, Grant, Privilege, ShareGrant, User, ACCOUNTADMIN};
+use avalanche_account::models::{
+    AccountObject, Grant, Privilege, ShareGrant, ShareKind, User, ACCOUNTADMIN,
+};
 use avalanche_account::store::AccountStore;
 use avalanche_account::SessionAuthz;
 use datafusion::arrow::array::{RecordBatch, StringArray};
@@ -73,6 +76,7 @@ pub enum AccountStatement {
         role: String,
     },
     CreateShare {
+        kind: ShareKind,
         name: String,
         if_not_exists: bool,
     },
@@ -91,6 +95,9 @@ pub enum AccountStatement {
     },
     ShowShares,
     ShowGrantsShare {
+        share: String,
+    },
+    DescribeShare {
         share: String,
     },
 }
@@ -234,17 +241,40 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
             }
             return None;
         }
+        "DESC" | "DESCRIBE" => {
+            if tok.len() == 3 && tok[1].eq_ignore_ascii_case("share") {
+                return Some(AccountStatement::DescribeShare {
+                    share: tok[2].to_string(),
+                });
+            }
+            return None;
+        }
         _ => return None,
     }
 
     let create = tok[0].eq_ignore_ascii_case("create");
     let mut i = 1;
-    // Grammar: CREATE [IF NOT EXISTS] ROLE|USER|SHARE <name> [options]
-    let kind = tok.get(i)?.to_ascii_uppercase();
-    if kind != "ROLE" && kind != "USER" && kind != "SHARE" {
-        return None;
+    // M15.2: `CREATE INBOUND SHARE [IF NOT EXISTS] <name>` — INBOUND SHARE
+    // occupies the kind position (two tokens).
+    let mut inbound_share = false;
+    if tok.get(i).is_some_and(|t| t.eq_ignore_ascii_case("inbound"))
+        && tok.get(i + 1).is_some_and(|t| t.eq_ignore_ascii_case("share"))
+    {
+        inbound_share = true;
+        i += 2;
     }
-    i += 1;
+    // Grammar: CREATE [INBOUND SHARE]|ROLE|USER|SHARE <name> [options]
+    let kind = if inbound_share {
+        // `INBOUND SHARE` already consumed; the next token is the name.
+        "SHARE".to_string()
+    } else {
+        let k = tok.get(i)?.to_ascii_uppercase();
+        if k != "ROLE" && k != "USER" && k != "SHARE" {
+            return None;
+        }
+        i += 1;
+        k
+    };
     let mut if_not_exists = false;
     if create
         && tok.get(i).is_some_and(|t| t.eq_ignore_ascii_case("if"))
@@ -256,14 +286,22 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
     }
     let name = (*tok.get(i)?).to_string();
     if create {
-        if kind == "ROLE" || kind == "SHARE" {
+        if kind == "ROLE" || kind == "SHARE" || inbound_share {
             if tok.get(i + 1).is_some() {
                 return None; // unknown CREATE ROLE/SHARE options → planner error
             }
             return if kind == "ROLE" {
                 Some(AccountStatement::CreateRole { name, if_not_exists })
             } else {
-                Some(AccountStatement::CreateShare { name, if_not_exists })
+                Some(AccountStatement::CreateShare {
+                    kind: if inbound_share {
+                        ShareKind::Inbound
+                    } else {
+                        ShareKind::Outbound
+                    },
+                    name,
+                    if_not_exists,
+                })
             };
         }
         // CREATE USER <name> [options]: key = 'value' pairs.
@@ -503,9 +541,13 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             .context(ex_error::ArrowSnafu)?;
             Ok(QueryResult::new(vec![batch], schema))
         }
-        AccountStatement::CreateShare { name, if_not_exists } => {
+        AccountStatement::CreateShare { kind, name, if_not_exists } => {
             let name = norm(name);
-            match store.create_share(&name).await {
+            let result = match kind {
+                ShareKind::Outbound => store.create_share(&name).await,
+                ShareKind::Inbound => store.create_inbound_share(&name).await,
+            };
+            match result {
                 Ok(_) => crate::clone_ddl::status_row(),
                 Err(e) if e.is_share_already_exists() && *if_not_exists => {
                     crate::clone_ddl::status_row()
@@ -567,8 +609,7 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
                 // Timestamps are not tracked in the v1 in-memory store.
                 created_on_col.push(String::new());
                 name_col.push(s.name);
-                // Shares created by this account are outbound (§21.1).
-                kind_col.push("OUTBOUND".to_string());
+                kind_col.push(s.kind.to_string());
             }
             if created_on_col.is_empty() {
                 created_on_col.push(String::new());
@@ -648,6 +689,35 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             .context(ex_error::ArrowSnafu)?;
             Ok(QueryResult::new(vec![batch], schema))
         }
+        AccountStatement::DescribeShare { share } => {
+            let share = norm(share);
+            let Some(s) = store
+                .get_share(&share)
+                .await
+                .map_err(|e| external_error("account", e))?
+            else {
+                return Err(external_error(
+                    "account",
+                    format!("share '{share}' does not exist"),
+                ));
+            };
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("created_on", DataType::Utf8, false),
+                Field::new("kind", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, false),
+            ]));
+            // Timestamps are not tracked in the v1 in-memory store.
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![String::new()])),
+                    Arc::new(StringArray::from(vec![s.kind.to_string()])),
+                    Arc::new(StringArray::from(vec![s.name])),
+                ],
+            )
+            .context(ex_error::ArrowSnafu)?;
+            Ok(QueryResult::new(vec![batch], schema))
+        }
     }
 }
 
@@ -721,7 +791,7 @@ pub fn check_current_warehouse(session: &UserSession) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, AccountStatement, Privilege, AccountObject};
+    use super::{parse, AccountStatement, AccountObject, Privilege, ShareKind};
 
     fn parsed(sql: &str) -> AccountStatement {
         parse(sql).unwrap_or_else(|| panic!("expected account statement: {sql}"))
@@ -844,15 +914,17 @@ mod tests {
         assert_eq!(
             parsed("CREATE SHARE vendor"),
             AccountStatement::CreateShare {
+                kind: ShareKind::Outbound,
                 name: "vendor".into(),
                 if_not_exists: false
             }
         );
         assert_eq!(
-            parsed("create share if not exists \"Vendor\";"),
+            parsed("create share \"Vendor\";"),
             AccountStatement::CreateShare {
+                kind: ShareKind::Outbound,
                 name: "Vendor".into(),
-                if_not_exists: true
+                if_not_exists: false
             }
         );
         assert_eq!(
@@ -862,6 +934,41 @@ mod tests {
         assert!(parse("CREATE SHARE").is_none());
         // Unknown options fall through to the planner.
         assert!(parse("CREATE SHARE vendor FOO = 'x'").is_none());
+    }
+
+    #[test]
+    fn parses_inbound_share_and_desc() {
+        assert_eq!(
+            parsed("CREATE INBOUND SHARE acme_in"),
+            AccountStatement::CreateShare {
+                kind: ShareKind::Inbound,
+                name: "acme_in".into(),
+                if_not_exists: false
+            }
+        );
+        assert_eq!(
+            parsed("CREATE INBOUND SHARE IF NOT EXISTS \"AcmeIn\";"),
+            AccountStatement::CreateShare {
+                kind: ShareKind::Inbound,
+                name: "AcmeIn".into(),
+                if_not_exists: true
+            }
+        );
+        assert!(parse("CREATE INBOUND ROLE x").is_none());
+        // DROP INBOUND SHARE is an accepted alias of DROP SHARE.
+        assert_eq!(
+            parsed("DROP INBOUND SHARE x"),
+            AccountStatement::DropShare { name: "x".into() }
+        );
+        assert_eq!(
+            parsed("DESC SHARE vendor"),
+            AccountStatement::DescribeShare { share: "vendor".into() }
+        );
+        assert_eq!(
+            parsed("DESCRIBE SHARE vendor;"),
+            AccountStatement::DescribeShare { share: "vendor".into() }
+        );
+        assert!(parse("DESC TABLE t").is_none());
     }
 
     #[test]

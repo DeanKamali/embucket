@@ -99,6 +99,9 @@ pub struct UserSession {
     /// grants. `None` for sessions without a known account user (internal
     /// machinery) — those are not enforced.
     pub authz: Option<Arc<SessionAuthz>>,
+    /// Mounted inbound share names (design §21, M15.2) — snapshot at
+    /// session creation; DML against these catalogs is denied (read-only).
+    pub inbound_shares: Vec<String>,
 }
 
 impl UserSession {
@@ -138,14 +141,15 @@ impl UserSession {
         // enforcement. Only sessions whose login maps to a known account
         // user get an authorization context; others (internal machinery)
         // keep the bare catalog list.
-        let authz = match account {
+        let bare_catalog_list = Arc::clone(&catalog_list);
+        let authz = match account.as_ref() {
             Some(store) => {
                 let user_name = metadata.attr(SessionMetadataAttr::UserName);
                 match user_name {
                     Some(name) => {
                         let requested_role = session_params_arc.get_property("role");
                         SessionAuthz::new(
-                            store,
+                            Arc::clone(store),
                             metastore.clone(),
                             &name,
                             requested_role.as_deref(),
@@ -161,6 +165,26 @@ impl UserSession {
         let catalog_list: Arc<dyn CatalogProviderList> = match &authz {
             Some(authz) => Arc::new(AuthzCatalogList::new(catalog_list.clone(), Arc::clone(authz))),
             None => catalog_list,
+        };
+        // Inbound shares (design §21, M15.2): layer one read-only catalog
+        // per mounted inbound share over the session's catalog list. The
+        // mount snapshot is taken at session creation (v1; shares created
+        // later require a new session).
+        let mut inbound_shares: Vec<String> = Vec::new();
+        let catalog_list: Arc<dyn CatalogProviderList> = if let Some(store) = &account {
+            let shares = crate::share_catalog::mounted_shares(store).await?;
+            if shares.is_empty() {
+                catalog_list
+            } else {
+                inbound_shares = shares.iter().map(|s| s.name.clone()).collect();
+                Arc::new(crate::share_catalog::ShareCatalogList::new(
+                    catalog_list,
+                    bare_catalog_list,
+                    shares,
+                ))
+            }
+        } else {
+            catalog_list
         };
         let mut config_options = ConfigOptions::from_env().context(ex_error::DataFusionSnafu)?;
 
@@ -237,6 +261,7 @@ impl UserSession {
             )),
             session_params: session_params_arc,
             authz,
+            inbound_shares,
             recent_queries: Arc::new(RwLock::new(VecDeque::new())),
             session_id: session_id.to_string(),
             attrs: DashMap::new(),

@@ -383,6 +383,10 @@ impl UserQuery {
         self.query = statement.to_string();
         self.raw_statement = Some(statement.clone());
 
+        // Inbound shares (design §21, M15.2) mount read-only: deny DML
+        // whose target resolves into a mounted share catalog.
+        crate::share_catalog::deny_dml(&statement, &self.session)?;
+
         // Record the result as part of the current span.
         tracing::Span::current().record("statement", format!("{statement:#?}"));
 

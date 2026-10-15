@@ -1,7 +1,7 @@
 use crate::driver::{ContainerDriver, DockerCliDriver, FakeDriver};
 use crate::manager::{
-    BallistaImages, CreateWarehouseRequest, WarehouseManager, executor_container_name,
-    scheduler_container_name,
+    BallistaImages, CreateWarehouseRequest, WarehouseManager, executor_cluster_name,
+    executor_container_name, scheduler_cluster_name, scheduler_container_name,
 };
 use crate::model::{WarehouseSize, WarehouseState};
 use state_store::{InMemoryStateStore, StateStore as _};
@@ -39,6 +39,8 @@ fn test_manager_with_store() -> (
 fn create_req(name: &str, size: WarehouseSize) -> CreateWarehouseRequest {
     CreateWarehouseRequest {
         scheduler_replicas: 1,
+        min_clusters: 1,
+        max_clusters: 1,
         name: name.to_string(),
         size,
         auto_suspend_secs: 0,
@@ -48,6 +50,101 @@ fn create_req(name: &str, size: WarehouseSize) -> CreateWarehouseRequest {
         storage_credentials: None,
         tls: false,
     }
+}
+
+#[tokio::test]
+async fn multi_cluster_starts_fleet_and_routes() {
+    let (manager, driver) = test_manager();
+
+    let mut req = create_req("MC", WarehouseSize::Xsmall);
+    req.min_clusters = 2;
+    req.max_clusters = 4;
+    manager.create(req).await.expect("create");
+
+    // Two clusters, each its own scheduler + executor set (XSMALL = 1).
+    let sched0 = scheduler_container_name("MC");
+    let sched1 = scheduler_cluster_name("MC", 1);
+    let exec0 = executor_container_name("MC", 0);
+    let exec1 = executor_cluster_name("MC", 1, 0);
+    for name in [&sched0, &sched1, &exec0, &exec1] {
+        assert!(driver.running(name), "{name} should be running");
+    }
+    // Cluster 1's executor dials its own cluster's scheduler.
+    let specs = driver.specs();
+    let exec1_spec = specs
+        .iter()
+        .find(|s| s.name == exec1)
+        .expect("cluster 1 executor spec");
+    assert!(exec_spec_dials(&exec1_spec.args, &sched1));
+
+    // Least-loaded routing: while the first pick's lease is held (cluster 0
+    // in-flight), the second pick must land on the other cluster.
+    let (url0, lease0) = manager
+        .acquire_scheduler_url("MC")
+        .await
+        .expect("first pick");
+    assert!(url0.starts_with("http://127.0.0.1:"));
+    let (url1, lease1) = manager
+        .acquire_scheduler_url("MC")
+        .await
+        .expect("second pick");
+    assert_ne!(
+        url0, url1,
+        "second concurrent pick must route to the other cluster"
+    );
+    // After release, all counters drained — no leak.
+    drop(lease0);
+    drop(lease1);
+    // After release, all counters drained — no leak.
+    let counters: Vec<u64> = manager
+        .inflight
+        .get("MC")
+        .map(|v| v.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed) as u64).collect())
+        .unwrap_or_default();
+    assert_eq!(counters, vec![0, 0]);
+}
+
+/// The executor arg list dials `scheduler` as its `--scheduler-host`.
+fn exec_spec_dials(args: &[String], scheduler: &str) -> bool {
+    args.windows(2).any(|w| w[0] == "--scheduler-host" && w[1] == scheduler)
+}
+
+#[tokio::test]
+async fn multi_cluster_suspend_stops_every_cluster() {
+    let (manager, driver) = test_manager();
+
+    let mut req = create_req("MC2", WarehouseSize::Xsmall);
+    req.min_clusters = 2;
+    req.max_clusters = 2;
+    manager.create(req).await.expect("create");
+    manager.suspend("MC2").await.expect("suspend");
+
+    for name in [
+        executor_container_name("MC2", 0),
+        executor_cluster_name("MC2", 1, 0),
+    ] {
+        assert!(!driver.running(&name), "{name} should be stopped");
+    }
+    // Suspend keeps schedulers up (M3 semantics) for both clusters.
+    assert!(driver.running(&scheduler_container_name("MC2")));
+    assert!(driver.running(&scheduler_cluster_name("MC2", 1)));
+}
+
+#[tokio::test]
+async fn single_cluster_names_are_unchanged() {
+    let (manager, driver) = test_manager();
+    manager
+        .create(create_req("PLAIN", WarehouseSize::Xsmall))
+        .await
+        .expect("create");
+    // Cluster 0 keeps the historical names and routing.
+    assert!(driver.running(&scheduler_container_name("PLAIN")));
+    assert!(driver.running(&executor_container_name("PLAIN", 0)));
+    let (url, _lease) = manager
+        .acquire_scheduler_url("PLAIN")
+        .await
+        .expect("url");
+    assert!(url.starts_with("http://127.0.0.1:"));
 }
 
 #[tokio::test]
@@ -62,7 +159,7 @@ async fn statement_timeout_round_trips() {
 
     // ALTER clears on 0 (falls back to the global timeout)
     manager
-        .alter("TIMEOUT", None, None, None, Some(0))
+        .alter("TIMEOUT", None, None, None, Some(0), None, None)
         .await
         .expect("alter");
     let record = store.get_warehouse("TIMEOUT").await.expect("record");
@@ -173,7 +270,7 @@ async fn alter_resizes_running_pool() {
         .await
         .expect("create");
     let wh = manager
-        .alter("wh4", Some(WarehouseSize::Medium), None, None, None)
+        .alter("wh4", Some(WarehouseSize::Medium), None, None, None, None, None)
         .await
         .expect("alter");
     assert_eq!(wh.size, WarehouseSize::Medium);

@@ -623,12 +623,16 @@ impl UserQuery {
         // Session-local table functions (WAREHOUSE_METERING_HISTORY, M5)
         // read the router's in-memory metering ledger — never ship them to
         // the cluster (their MemTable plan is not Ballista-serializable).
-        let scheduler_url = match self.session.warehouse_scheduler_url().await {
-            Some(url) if !is_session_local_table_function(&text) => Some(url),
+        // M12.2: acquire a cluster lease with the URL — the in-flight slot
+        // is held for the whole distributed execution (the job lives on the
+        // picked cluster's scheduler), so the next submission routes to a
+        // less-loaded cluster. `lease` drops at scope end.
+        let lease = match self.session.warehouse_scheduler_lease().await {
+            Some((url, lease)) if !is_session_local_table_function(&text) => Some((url, lease)),
             _ => None,
         };
-        let result = if let Some(scheduler_url) = scheduler_url {
-            self.execute_with_custom_plan_target(&text, Some(scheduler_url))
+        let result = if let Some((scheduler_url, _lease)) = &lease {
+            self.execute_with_custom_plan_target(&text, Some(scheduler_url.clone()))
                 .await
         } else {
             Box::pin(self.execute_with_custom_plan(&text)).await

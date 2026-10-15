@@ -39,6 +39,12 @@ impl FakeDriver {
         self.inner.lock().expect("poisoned").ops.clone()
     }
 
+    /// Specs of every `start` call, in order (test introspection).
+    #[must_use]
+    pub fn specs(&self) -> Vec<ContainerSpec> {
+        self.inner.lock().expect("poisoned").specs.clone()
+    }
+
     #[must_use]
     pub fn started_count(&self, prefix: &str) -> usize {
         self.ops()

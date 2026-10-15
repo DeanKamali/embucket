@@ -36,6 +36,10 @@ pub enum WarehouseStatement {
         tls: Option<bool>,
         /// `SCHEDULER_REPLICAS = n` (M7.3).
         scheduler_replicas: Option<u16>,
+        /// `MIN_CLUSTERS = n` (M12.2).
+        min_clusters: Option<u16>,
+        /// `MAX_CLUSTERS = n` (M12.2, dormant in v1).
+        max_clusters: Option<u16>,
         if_not_exists: bool,
     },
     AlterSet {
@@ -51,6 +55,10 @@ pub enum WarehouseStatement {
         /// `SET/UNSET SCHEDULER_REPLICAS` (M7.3): `Some(n)` sets the count;
         /// UNSET resets to 1 (`Some(1)`).
         scheduler_replicas: Option<u16>,
+        /// `SET/UNSET MIN_CLUSTERS` (M12.2): UNSET resets to 1.
+        min_clusters: Option<u16>,
+        /// `SET/UNSET MAX_CLUSTERS` (M12.2): UNSET resets to 1.
+        max_clusters: Option<u16>,
     },
     Suspend {
         name: String,
@@ -209,6 +217,8 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
         storage_credentials: None,
         tls: None,
         scheduler_replicas: None,
+        min_clusters: None,
+        max_clusters: None,
         if_not_exists,
     };
     // option list: `WITH` keyword, then `KEY [=] VALUE` pairs
@@ -283,6 +293,24 @@ fn parse_create(tokens: &[String], upper: &[String]) -> Option<WarehouseStatemen
                 } = &mut stmt
                 {
                     *scheduler_replicas = val;
+                }
+                i = next_index(upper, i + 1);
+            }
+            "MIN_CLUSTERS" => {
+                let val = value_at(tokens, upper, i + 1)
+                    .and_then(|(v, _)| parse_u64(v))
+                    .map(|v| v.min(16) as u16);
+                if let WarehouseStatement::Create { min_clusters, .. } = &mut stmt {
+                    *min_clusters = val;
+                }
+                i = next_index(upper, i + 1);
+            }
+            "MAX_CLUSTERS" => {
+                let val = value_at(tokens, upper, i + 1)
+                    .and_then(|(v, _)| parse_u64(v))
+                    .map(|v| v.min(16) as u16);
+                if let WarehouseStatement::Create { max_clusters, .. } = &mut stmt {
+                    *max_clusters = val;
                 }
                 i = next_index(upper, i + 1);
             }
@@ -427,6 +455,8 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                     storage: Some(StorageOp::Unset),
                     tls: None,
                     scheduler_replicas: None,
+                    min_clusters: None,
+                    max_clusters: None,
                 })
             } else if upper.get(i + 1).map(String::as_str) == Some("TLS") {
                 Some(WarehouseStatement::AlterSet {
@@ -438,6 +468,8 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                     storage: None,
                     tls: Some(false),
                     scheduler_replicas: None,
+                    min_clusters: None,
+                    max_clusters: None,
                 })
             } else if upper.get(i + 1).map(String::as_str) == Some("SCHEDULER_REPLICAS") {
                 Some(WarehouseStatement::AlterSet {
@@ -449,6 +481,34 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                     storage: None,
                     tls: None,
                     scheduler_replicas: Some(1),
+                    min_clusters: None,
+                    max_clusters: None,
+                })
+            } else if upper.get(i + 1).map(String::as_str) == Some("MIN_CLUSTERS") {
+                Some(WarehouseStatement::AlterSet {
+                    name,
+                    size: None,
+                    auto_suspend_secs: None,
+                    auto_resume: None,
+                    statement_timeout_secs: None,
+                    storage: None,
+                    tls: None,
+                    scheduler_replicas: None,
+                    min_clusters: Some(1),
+                    max_clusters: None,
+                })
+            } else if upper.get(i + 1).map(String::as_str) == Some("MAX_CLUSTERS") {
+                Some(WarehouseStatement::AlterSet {
+                    name,
+                    size: None,
+                    auto_suspend_secs: None,
+                    auto_resume: None,
+                    statement_timeout_secs: None,
+                    storage: None,
+                    tls: None,
+                    scheduler_replicas: None,
+                    min_clusters: None,
+                    max_clusters: Some(1),
                 })
             } else {
                 None
@@ -463,6 +523,8 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
             let mut storage = None;
             let mut tls = None;
             let mut scheduler_replicas = None;
+            let mut min_clusters = None;
+            let mut max_clusters = None;
             while i < upper.len() {
                 match upper[i].as_str() {
                     "SIZE" | "WAREHOUSE_SIZE" => {
@@ -496,6 +558,14 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                         {
                             scheduler_replicas = Some(1);
                             i += 2;
+                        } else if upper.get(i + 1).map(String::as_str) == Some("MIN_CLUSTERS")
+                        {
+                            min_clusters = Some(1);
+                            i += 2;
+                        } else if upper.get(i + 1).map(String::as_str) == Some("MAX_CLUSTERS")
+                        {
+                            max_clusters = Some(1);
+                            i += 2;
                         } else {
                             return None;
                         }
@@ -525,6 +595,18 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                             .map(|v| v.min(16) as u16);
                         i = next_index(upper, i + 1);
                     }
+                    "MIN_CLUSTERS" => {
+                        min_clusters = value_at(tokens, upper, i + 1)
+                            .and_then(|(v, _)| parse_u64(v))
+                            .map(|v| v.min(16) as u16);
+                        i = next_index(upper, i + 1);
+                    }
+                    "MAX_CLUSTERS" => {
+                        max_clusters = value_at(tokens, upper, i + 1)
+                            .and_then(|(v, _)| parse_u64(v))
+                            .map(|v| v.min(16) as u16);
+                        i = next_index(upper, i + 1);
+                    }
                     _ => return None,
                 }
             }
@@ -537,6 +619,8 @@ fn parse_alter(tokens: &[String], upper: &[String]) -> Option<WarehouseStatement
                 storage,
                 tls,
                 scheduler_replicas,
+                min_clusters,
+                max_clusters,
             })
         }
         _ => None,
@@ -575,6 +659,8 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             storage_credentials,
             tls,
             scheduler_replicas,
+            min_clusters,
+            max_clusters,
             if_not_exists,
         } => {
             if manager.get(name).await.is_ok() {
@@ -593,6 +679,8 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
                 storage_credentials: storage_credentials.clone(),
                 tls: tls.unwrap_or(false),
                 scheduler_replicas: scheduler_replicas.unwrap_or(1),
+                min_clusters: min_clusters.unwrap_or(1),
+                max_clusters: max_clusters.unwrap_or(1),
             };
             manager.create(req).await.map_err(warehouse_error)?;
             status_row()
@@ -606,6 +694,8 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
             storage,
             tls,
             scheduler_replicas,
+            min_clusters,
+            max_clusters,
         } => {
             manager
                 .alter(
@@ -614,6 +704,8 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
                     *auto_suspend_secs,
                     *auto_resume,
                     *statement_timeout_secs,
+                    *min_clusters,
+                    *max_clusters,
                 )
                 .await
                 .map_err(warehouse_error)?;
@@ -740,6 +832,9 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         Field::new("TLS", DataType::Utf8, false),
         // M7.3: scheduler replicas sharing the warehouse's cluster state.
         Field::new("SCHEDULER_REPLICAS", DataType::Utf8, false),
+        // M12.2: multi-cluster warehouses behind the alias.
+        Field::new("MIN_CLUSTERS", DataType::Utf8, false),
+        Field::new("MAX_CLUSTERS", DataType::Utf8, false),
     ]));
 
     let created_on: Vec<Option<String>> = warehouses
@@ -783,6 +878,14 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
         .iter()
         .map(|wh| Some(wh.scheduler_replicas.to_string()))
         .collect();
+    let min_clusters: Vec<Option<String>> = warehouses
+        .iter()
+        .map(|wh| Some(wh.min_clusters.to_string()))
+        .collect();
+    let max_clusters: Vec<Option<String>> = warehouses
+        .iter()
+        .map(|wh| Some(wh.max_clusters.to_string()))
+        .collect();
 
     let record = RecordBatch::try_new(
         schema.clone(),
@@ -797,6 +900,8 @@ fn show_result(warehouses: &[avalanche_warehouse::Warehouse]) -> Result<QueryRes
             Arc::new(StringArray::from(storage)),
             Arc::new(StringArray::from(tls)),
             Arc::new(StringArray::from(replicas)),
+            Arc::new(StringArray::from(min_clusters)),
+            Arc::new(StringArray::from(max_clusters)),
         ],
     )
     .context(ex_error::ArrowSnafu)?;
@@ -832,6 +937,8 @@ mod tests {
                 storage_credentials: None,
                 tls: None,
                 scheduler_replicas: None,
+                min_clusters: None,
+                max_clusters: None,
                 if_not_exists: false,
             }
         );
@@ -942,6 +1049,8 @@ mod tests {
                 storage: Some(StorageOp::Unset),
                 tls: None,
                 scheduler_replicas: None,
+                min_clusters: None,
+                max_clusters: None,
             })
         );
         assert_eq!(
@@ -976,6 +1085,8 @@ mod tests {
                 storage: None,
                 tls: None,
                 scheduler_replicas: None,
+                min_clusters: None,
+                max_clusters: None,
             })
         );
     }
@@ -994,8 +1105,62 @@ mod tests {
                 storage_credentials: None,
                 tls: None,
                 scheduler_replicas: None,
+                min_clusters: None,
+                max_clusters: None,
                 if_not_exists: false,
             }
+        );
+    }
+
+    #[test]
+    #[test]
+    fn parses_clusters() {
+        // CREATE ... WITH MIN/MAX_CLUSTERS
+        let stmt = parse(
+            "CREATE WAREHOUSE etl WITH MIN_CLUSTERS = 2 MAX_CLUSTERS = 4;",
+        )
+        .expect("should parse");
+        let WarehouseStatement::Create {
+            min_clusters,
+            max_clusters,
+            ..
+        } = stmt
+        else {
+            panic!("expected Create");
+        };
+        assert_eq!(min_clusters, Some(2));
+        assert_eq!(max_clusters, Some(4));
+
+        // ALTER SET / UNSET
+        assert_eq!(
+            parse("ALTER WAREHOUSE wh SET MIN_CLUSTERS = 3;"),
+            Some(WarehouseStatement::AlterSet {
+                name: "WH".to_string(),
+                size: None,
+                auto_suspend_secs: None,
+                auto_resume: None,
+                statement_timeout_secs: None,
+                storage: None,
+                tls: None,
+                scheduler_replicas: None,
+                min_clusters: Some(3),
+                max_clusters: None,
+            })
+        );
+        assert_eq!(
+            parse("ALTER WAREHOUSE wh UNSET MIN_CLUSTERS;"),
+            Some(WarehouseStatement::AlterSet {
+                name: "WH".to_string(),
+                size: None,
+                auto_suspend_secs: None,
+                auto_resume: None,
+                statement_timeout_secs: None,
+                storage: None,
+                tls: None,
+                scheduler_replicas: None,
+                min_clusters: Some(1),
+                max_clusters: None,
+            })
         );
     }
 
@@ -1024,6 +1189,8 @@ mod tests {
                 storage: None,
                 tls: None,
                 scheduler_replicas: Some(3),
+                min_clusters: None,
+                max_clusters: None,
             })
         );
         assert_eq!(
@@ -1037,6 +1204,8 @@ mod tests {
                 storage: None,
                 tls: None,
                 scheduler_replicas: Some(1),
+                min_clusters: None,
+                max_clusters: None,
             })
         );
     }
@@ -1054,6 +1223,8 @@ mod tests {
                 storage: None,
                 tls: None,
                 scheduler_replicas: None,
+                min_clusters: None,
+                max_clusters: None,
             })
         );
         assert_eq!(

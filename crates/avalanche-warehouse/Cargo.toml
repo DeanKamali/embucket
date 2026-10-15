@@ -8,6 +8,7 @@ license-file = { workspace = true }
 avalanche-executor-common = { path = "../avalanche-executor-common" }
 state-store = { path = "../state-store" }
 async-trait = { workspace = true }
+dashmap = { workspace = true }
 datafusion = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

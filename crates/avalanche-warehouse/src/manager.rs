@@ -18,9 +18,12 @@ use state_store::StorageCredentials;
 use state_store::WarehouseRecord;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::info;
+
+use dashmap::DashMap;
 
 /// Ballista image coordinates used for warehouse compute.
 #[derive(Debug, Clone)]
@@ -78,6 +81,24 @@ pub struct CreateWarehouseRequest {
     /// Mutual TLS (M7.2): start compute with `AVALANCHE_TLS_DIR` and
     /// advertise the scheduler over `https://`.
     pub tls: bool,
+    /// Multi-cluster warehouses (M12.2): independent clusters behind the
+    /// alias. `max_clusters` is stored but dormant in v1.
+    pub min_clusters: u16,
+    pub max_clusters: u16,
+}
+
+/// One in-flight distributed-submission slot against a warehouse cluster
+/// (M12.2). Dropping the lease releases the slot; the URL it came with is
+/// sticky for that query (job state lives on the cluster's scheduler).
+#[derive(Debug)]
+pub struct ClusterLease {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for ClusterLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub struct WarehouseManager {
@@ -93,6 +114,11 @@ pub struct WarehouseManager {
     /// Epoch seconds when the warehouse's current RUNNING window began
     /// (last resume/create). Used to bill running time on suspend/drop.
     running_since: Mutex<HashMap<String, u64>>,
+    /// In-flight distributed submissions per warehouse per cluster (M12.2
+    /// least-loaded routing). Resized to the record's `min_clusters` on pick.
+    pub(crate) inflight: DashMap<String, Vec<Arc<AtomicUsize>>>,
+    /// Round-robin tie-break counters per warehouse.
+    rr: DashMap<String, AtomicUsize>,
 }
 
 const INTERNAL_SCHEDULER_PORT: u16 = 50050;
@@ -119,6 +145,8 @@ impl WarehouseManager {
             last_activity: Mutex::new(HashMap::new()),
             ledger: Arc::new(MeteringLedger::new(state_store)),
             running_since: Mutex::new(HashMap::new()),
+            inflight: DashMap::new(),
+            rr: DashMap::new(),
         }
     }
 
@@ -172,6 +200,10 @@ impl WarehouseManager {
         record.storage_credentials = req.storage_credentials.clone();
         record.tls = req.tls;
         record.scheduler_replicas = req.scheduler_replicas.max(1);
+        // Multi-cluster warehouses (M12.2): min ≥ 1, max ≥ min; scale-out
+        // beyond min is stored for later but dormant in v1.
+        record.min_clusters = req.min_clusters.max(1);
+        record.max_clusters = req.max_clusters.max(record.min_clusters);
         if record.scheduler_replicas >= 2 && !shared_state_url_configured() {
             return Err(ConfigSnafu {
                 message: "SCHEDULER_REPLICAS > 1 requires STATESTORE_PG_URL (or DATABASE_URL)                           on the router: replicas share executor/job state through Postgres"
@@ -205,7 +237,9 @@ impl WarehouseManager {
         self.get(&req.name).await
     }
 
-    /// `ALTER WAREHOUSE name SET ...` — size / auto-suspend / auto-resume.
+    /// `ALTER WAREHOUSE name SET ...` — size / auto-suspend / auto-resume /
+    /// cluster counts (M12.2).
+    #[allow(clippy::too_many_arguments)]
     pub async fn alter(
         &self,
         name: &str,
@@ -213,8 +247,12 @@ impl WarehouseManager {
         auto_suspend_secs: Option<u64>,
         auto_resume: Option<bool>,
         statement_timeout_secs: Option<u64>,
+        min_clusters: Option<u16>,
+        max_clusters: Option<u16>,
     ) -> Result<Warehouse> {
         let mut record = self.record(name).await?;
+        let old_min_clusters = record.min_clusters.max(1);
+        let record_size_before = record.size.clone();
         if let Some(size) = size {
             record.size = size.as_str().to_string();
         }
@@ -231,12 +269,43 @@ impl WarehouseManager {
         if let Some(secs) = statement_timeout_secs {
             record.statement_timeout_secs = (secs > 0).then_some(secs);
         }
+        // M12.2: SET MIN/MAX_CLUSTERS (UNSET arrives as Some(1) from the DDL
+        // layer). max < min folds to min — scale-out beyond min is dormant
+        // in v1, so an unreachable max is harmless, but keep the invariant.
+        if let Some(min) = min_clusters {
+            record.min_clusters = min.max(1);
+        }
+        if let Some(max) = max_clusters {
+            record.max_clusters = max.max(record.min_clusters);
+        }
         record.updated_at = Some(now_secs());
+        let new_min_clusters = record.min_clusters;
         self.state_store
             .put_warehouse(record)
             .await
             .context(StateStoreSnafu)?;
 
+        // A cluster-count change on a running warehouse re-provisions the
+        // whole fleet (same restart discipline as SET SCHEDULER_REPLICAS).
+        let record_size_after = if min_clusters.is_some() {
+            self.record(name).await?.size
+        } else {
+            record_size_before
+        };
+        if new_min_clusters != old_min_clusters
+            && self.state(name).await? == WarehouseState::Running
+        {
+            let parsed_size = WarehouseSize::parse(&record_size_after).ok_or_else(|| {
+                InvalidSizeSnafu {
+                    size: record_size_after.clone(),
+                }
+                .build()
+            })?;
+            self.stop_cluster_fleet(name, old_min_clusters, parsed_size)
+                .await?;
+            self.start_compute(name, parsed_size, WarehouseState::Running)
+                .await?;
+        }
         // A size change on a running warehouse re-provisions the executor pool.
         if let (Some(size), true) = (
             size,
@@ -264,6 +333,7 @@ impl WarehouseManager {
         let mut record = record;
         record.storage_credentials = credentials;
         record.updated_at = Some(now_secs());
+        let clusters = record.min_clusters.max(1);
         self.state_store
             .put_warehouse(record)
             .await
@@ -274,13 +344,13 @@ impl WarehouseManager {
             if let Some(size) = WarehouseSize::parse(
                 &self.record(name).await?.size,
             ) {
-                for i in 0..size.executor_count() {
-                    self.driver
-                        .stop(&executor_container_name(name, i))
-                        .await?;
-                }
-                self.stop_schedulers(name, self.record(name).await?.scheduler_replicas)
-                    .await?;
+                self.stop_cluster_executors(name, clusters, size).await?;
+                self.stop_cluster_schedulers(
+                    name,
+                    clusters,
+                    self.record(name).await?.scheduler_replicas,
+                )
+                .await?;
                 self.start_compute(name, size, WarehouseState::Running)
                     .await?;
             }
@@ -303,6 +373,8 @@ impl WarehouseManager {
         let mut record = self.record(name).await?;
         record.tls = tls;
         record.updated_at = Some(now_secs());
+        let clusters = record.min_clusters.max(1);
+        let replicas = record.scheduler_replicas;
         self.state_store
             .put_warehouse(record)
             .await
@@ -310,12 +382,8 @@ impl WarehouseManager {
         if was_running {
             // Recreate containers so the new TLS mounts take effect.
             if let Some(size) = WarehouseSize::parse(&self.record(name).await?.size) {
-                for i in 0..size.executor_count() {
-                    self.driver
-                        .stop(&executor_container_name(name, i))
-                        .await?;
-                }
-                self.stop_schedulers(name, self.record(name).await?.scheduler_replicas)
+                self.stop_cluster_executors(name, clusters, size).await?;
+                self.stop_cluster_schedulers(name, clusters, replicas)
                     .await?;
                 self.start_compute(name, size, WarehouseState::Running)
                     .await?;
@@ -346,13 +414,16 @@ impl WarehouseManager {
         let mut record = self.record(name).await?;
         record.scheduler_replicas = replicas;
         record.updated_at = Some(now_secs());
+        let clusters = record.min_clusters.max(1);
         self.state_store
             .put_warehouse(record)
             .await
             .context(StateStoreSnafu)?;
         if was_running {
             if let Some(size) = WarehouseSize::parse(&self.record(name).await?.size) {
-                self.stop_schedulers(name, old_replicas.max(replicas)).await?;
+                self.stop_cluster_executors(name, clusters, size).await?;
+                self.stop_cluster_schedulers(name, clusters, old_replicas.max(replicas))
+                    .await?;
                 self.start_compute(name, size, WarehouseState::Running).await?;
             }
         }
@@ -369,11 +440,8 @@ impl WarehouseManager {
             // Bill the running window before the executors go down (M5).
             self.accrue_running_window(&record.name, size.executor_count())
                 .await;
-            for i in 0..size.executor_count() {
-                self.driver
-                    .stop(&executor_container_name(name, i))
-                    .await?;
-            }
+            let clusters = record.min_clusters.max(1);
+            self.stop_cluster_executors(name, clusters, size).await?;
             info!(warehouse = name, "warehouse suspended (executors to 0)");
         }
         self.set_state(name, WarehouseState::Suspended).await
@@ -400,34 +468,108 @@ impl WarehouseManager {
     /// (`BallistaQueryPlanner::new(scheduler_url: String)`, which is handed to
     /// `tonic::transport::Endpoint::new` and parsed as a `Url`).
     pub async fn scheduler_url(&self, name: &str) -> Result<String> {
+        self.acquire_scheduler_url(name).await.map(|(url, _)| url)
+    }
+
+    /// Least-loaded scheduler URL for the next distributed submission
+    /// (M12.2, design §19.1.4). Single-cluster warehouses return the
+    /// historical URL untouched. For `MIN_CLUSTERS ≥ 2`, the cluster with
+    /// the fewest in-flight submissions wins; ties round-robin (Snowflake's
+    /// simplest-load policy, approximated). The returned lease holds one
+    /// in-flight slot for the duration of the query it routes — the job
+    /// state lives on that cluster's scheduler, so the URL is sticky for
+    /// the query; the *next* submission re-picks.
+    pub async fn acquire_scheduler_url(&self, name: &str) -> Result<(String, ClusterLease)> {
         // resolve the record's exact key: session variables may differ in
         // case (`USE WAREHOUSE etl` vs stored `ETL`)
         let record = self
             .find_record(name)
             .await
             .ok_or_else(|| NotFoundSnafu { name: name.to_string() }.build())?;
+        let clusters = record.min_clusters.max(1);
+        // Resize the in-flight counters (create/ALTER may have grown/shrunk
+        // the fleet). Entry API: only this warehouse's shard is locked.
+        let counters = {
+            let mut entry = self.inflight.entry(record.name.clone()).or_default();
+            entry.resize(clusters as usize, Arc::default());
+            entry.clone()
+        };
+        let cluster = if clusters == 1 {
+            0
+        } else {
+            // Fewest in-flight wins; round-robin breaks ties.
+            let mut best = 0;
+            let mut best_load = u64::MAX;
+            for (i, c) in counters.iter().enumerate().take(clusters as usize) {
+                let load = c.load(Ordering::Relaxed) as u64;
+                if load < best_load {
+                    best_load = load;
+                    best = i;
+                }
+            }
+            let rr = self
+                .rr
+                .entry(record.name.clone())
+                .or_default()
+                .fetch_add(1, Ordering::Relaxed);
+            // Among equal-load clusters, rotate deterministically.
+            let tied: Vec<usize> = counters
+                .iter()
+                .take(clusters as usize)
+                .enumerate()
+                .filter(|(_, c)| c.load(Ordering::Relaxed) as u64 == best_load)
+                .map(|(i, _)| i)
+                .collect();
+            tied[rr % tied.len()]
+        };
+        let lease = ClusterLease {
+            counter: Arc::clone(&counters[cluster]),
+        };
+        lease.counter.fetch_add(1, Ordering::Relaxed);
         // Replicas >= 2 (M7.3): advertise the shared network alias instead of
         // one mapped host port. The docker driver pins the alias to *every*
         // replica's bridge IP in /etc/hosts; the router's connector iterates
         // resolved addresses until one accepts — that iteration is the
         // failover. (k8s: the per-warehouse Service name load-balances.)
-        if record.scheduler_replicas >= 2 {
-            let alias = scheduler_container_name(&record.name);
-            let scheme = if record.tls { "https" } else { "http" };
-            return Ok(format!("{scheme}://{alias}:{INTERNAL_SCHEDULER_PORT}"));
-        }
-        // docker driver: mapped host port on loopback; k8s driver: scheduler
-        // pod IP (re-resolved per call, so restarts don't leave stale URLs)
-        let url = self
-            .driver
-            .scheduler_url(&record.name, record.scheduler_host_port)
-            .await?;
-        // TLS warehouses advertise over https (M7.2): the router keys its
-        // session TLS config off the scheme.
-        if record.tls && let Some(rest) = url.strip_prefix("http://") {
-            return Ok(format!("https://{rest}"));
-        }
-        Ok(url)
+        // With clusters (M12.2) the alias is per cluster: its executors dial
+        // their own cluster's scheduler set.
+        let scheme = if record.tls { "https" } else { "http" };
+        let url = if record.scheduler_replicas >= 2 {
+            let alias = scheduler_cluster_name(&record.name, cluster as u16);
+            format!("{scheme}://{alias}:{INTERNAL_SCHEDULER_PORT}")
+        } else if clusters >= 2 {
+            // Multi-cluster, single replica: cluster 0 keeps the historical
+            // host-port dial; clusters 1..n dial their mapped host port.
+            let port =
+                cluster_host_port(Some(&record), cluster as u16, record.scheduler_host_port)
+                    .ok_or_else(|| {
+                    ConfigSnafu {
+                        message: format!(
+                            "warehouse {} cluster {cluster} has no mapped \
+                             host port (allocation failed at start)",
+                            record.name
+                        ),
+                    }
+                    .build()
+                })?;
+            format!("{scheme}://127.0.0.1:{port}")
+        } else {
+            // docker driver: mapped host port on loopback; k8s driver:
+            // scheduler pod IP (re-resolved per call, so restarts don't
+            // leave stale URLs)
+            let url = self
+                .driver
+                .scheduler_url(&record.name, record.scheduler_host_port)
+                .await?;
+            // TLS warehouses advertise over https (M7.2): the router keys its
+            // session TLS config off the scheme.
+            if record.tls && let Some(rest) = url.strip_prefix("http://") {
+                format!("https://{rest}")
+            } else {
+                url
+            }
+        };
+        Ok((url, lease))
     }
 
     pub async fn drop_warehouse(&self, name: &str) -> Result<()> {
@@ -442,13 +584,15 @@ impl WarehouseManager {
         }
         // stop executors regardless of state; stop scheduler too (full teardown)
         if let Some(size) = WarehouseSize::parse(&record.size) {
-            for i in 0..size.executor_count() {
-                self.driver
-                    .stop(&executor_container_name(name, i))
-                    .await?;
-            }
+            self.stop_cluster_executors(name, record.min_clusters.max(1), size)
+                .await?;
         }
-        self.stop_schedulers(name, record.scheduler_replicas).await?;
+        self.stop_cluster_schedulers(
+            name,
+            record.min_clusters.max(1),
+            record.scheduler_replicas,
+        )
+        .await?;
         self.state_store
             .delete_warehouse(name)
             .await
@@ -476,6 +620,8 @@ impl WarehouseManager {
                 .map(StorageCredentials::summary),
             tls: record.tls,
             scheduler_replicas: record.scheduler_replicas,
+            min_clusters: record.min_clusters,
+            max_clusters: record.max_clusters,
         })
     }
 
@@ -596,11 +742,32 @@ impl WarehouseManager {
         size: WarehouseSize,
         state: WarehouseState,
     ) -> Result<()> {
-        let base_sched_name = scheduler_container_name(name);
         // The scheduler's host port is fixed at creation and persisted on the
         // record, so suspend/resume cycles keep the same mapping.
-        let record = self.record(name).await.ok();
+        let mut record = self.record(name).await.ok();
         let scheduler_host_port = record.as_ref().and_then(|r| r.scheduler_host_port);
+        // Multi-cluster (M12.2): independent scheduler+executor sets behind
+        // one warehouse alias. Cluster 0 keeps the historical container
+        // names, so single-cluster warehouses are byte-for-byte unchanged.
+        let clusters = record
+            .as_ref()
+            .map_or(1, |r| r.min_clusters.max(1));
+        // Best-effort host ports for clusters 1..n (cluster 0 uses the
+        // historical `scheduler_host_port`); persisted so routing stays
+        // stable across suspend/resume.
+        if let Some(rec) = &mut record
+            && clusters >= 2
+            && rec.cluster_host_ports.len() < (clusters - 1) as usize
+        {
+            while rec.cluster_host_ports.len() < (clusters - 1) as usize {
+                rec.cluster_host_ports.push(allocate_free_host_port().unwrap_or(0));
+            }
+            let to_persist = rec.clone();
+            self.state_store
+                .put_warehouse(to_persist)
+                .await
+                .context(StateStoreSnafu)?;
+        }
         // Per-warehouse storage credentials (M7.1): injected as container env
         // at start — never serialized into plans. Both scheduler and
         // executors get them (the scheduler decodes/re-plans scans).
@@ -647,47 +814,51 @@ impl WarehouseManager {
         } else {
             Vec::new()
         };
-        for replica in 0..replicas {
-            let sched_name = scheduler_replica_name(name, replica, replicas);
-            let mut sched_env = container_env.clone();
-            sched_env.extend(shared_env.iter().cloned());
-            sched_env.sort();
-            self.driver
-                .start(&ContainerSpec {
-                    name: sched_name.clone(),
-                    image: self.images.scheduler.clone(),
-                    args: vec![
-                        "--bind-host".to_string(),
-                        "0.0.0.0".to_string(),
-                        "--bind-port".to_string(),
-                        INTERNAL_SCHEDULER_PORT.to_string(),
-                        // executors in the same docker network connect by
-                        // container name / shared alias
-                        "--external-host".to_string(),
-                        sched_name.clone(),
-                        // Tight executor-expiry (M7.3): the shared cluster
-                        // state may carry executors from a scheduler that
-                        // died without deregistering them; with 10s
-                        // heartbeats, 30s (3 missed beats) bounds how long a
-                        // ghost executor stays schedulable.
-                        "--executor-timeout-seconds".to_string(),
-                        "30".to_string(),
-                    ],
-                    env: sched_env,
-                    volumes: container_volumes.clone(),
-                    ports: (replica == 0)
-                        .then(|| {
-                            scheduler_host_port.map_or_else(Vec::new, |host_port| {
-                                vec![(host_port, INTERNAL_SCHEDULER_PORT)]
+        for cluster in 0..clusters {
+            let cluster_base = scheduler_cluster_name(name, cluster);
+            for replica in 0..replicas {
+                let sched_name = scheduler_replica_name_for(&cluster_base, replica, replicas);
+                let mut sched_env = container_env.clone();
+                sched_env.extend(shared_env.iter().cloned());
+                sched_env.sort();
+                self.driver
+                    .start(&ContainerSpec {
+                        name: sched_name.clone(),
+                        image: self.images.scheduler.clone(),
+                        args: vec![
+                            "--bind-host".to_string(),
+                            "0.0.0.0".to_string(),
+                            "--bind-port".to_string(),
+                            INTERNAL_SCHEDULER_PORT.to_string(),
+                            // executors in the same docker network connect by
+                            // container name / shared alias
+                            "--external-host".to_string(),
+                            sched_name.clone(),
+                            // Tight executor-expiry (M7.3): the shared cluster
+                            // state may carry executors from a scheduler that
+                            // died without deregistering them; with 10s
+                            // heartbeats, 30s (3 missed beats) bounds how long a
+                            // ghost executor stays schedulable.
+                            "--executor-timeout-seconds".to_string(),
+                            "30".to_string(),
+                        ],
+                        env: sched_env,
+                        volumes: container_volumes.clone(),
+                        ports: (replica == 0)
+                            .then(|| {
+                                cluster_host_port(record.as_ref(), cluster, scheduler_host_port)
+                                    .map_or_else(Vec::new, |host_port| {
+                                        vec![(host_port, INTERNAL_SCHEDULER_PORT)]
+                                    })
                             })
-                        })
-                        .unwrap_or_default(),
-                    network: self.network.clone(),
-                    network_aliases: (replicas >= 2)
-                        .then(|| vec![base_sched_name.clone()])
-                        .unwrap_or_default(),
-                })
-                .await?;
+                            .unwrap_or_default(),
+                        network: self.network.clone(),
+                        network_aliases: (replicas >= 2)
+                            .then(|| vec![cluster_base.clone()])
+                            .unwrap_or_default(),
+                    })
+                    .await?;
+            }
         }
 
         let target = if state == WarehouseState::Running {
@@ -695,44 +866,47 @@ impl WarehouseManager {
         } else {
             0
         };
-        for i in 0..target {
-            let exec_name = executor_container_name(name, i);
-            let mut exec_args = vec![
-                "--bind-host".to_string(),
-                "0.0.0.0".to_string(),
-                "--scheduler-host".to_string(),
-                base_sched_name.clone(),
-                "--scheduler-port".to_string(),
-                INTERNAL_SCHEDULER_PORT.to_string(),
-                // Tight heartbeats (M7.3): the registration scheduler may die
-                // mid-life; the survivor only sees the executor again on its
-                // next heartbeat (self-registration from heartbeat metadata),
-                // so a short interval bounds the HA failover window.
-                "--executor-heartbeat-interval-seconds".to_string(),
-                "10".to_string(),
-            ];
-            // TLS warehouses (M7.2): executors advertise their container DNS
-            // name instead of the default container IP, so peers that dial
-            // their Flight endpoint verify the certificate against a SAN we
-            // can provision in advance (DNS names of the warehouse's own
-            // containers). The docker network resolves these names for
-            // scheduler-side fetches and cross-executor shuffle reads.
-            if record.as_ref().is_some_and(|r| r.tls) {
-                exec_args.push("--external-host".to_string());
-                exec_args.push(exec_name.clone());
+        for cluster in 0..clusters {
+            let cluster_base = scheduler_cluster_name(name, cluster);
+            for i in 0..target {
+                let exec_name = executor_cluster_name(name, cluster, i);
+                let mut exec_args = vec![
+                    "--bind-host".to_string(),
+                    "0.0.0.0".to_string(),
+                    "--scheduler-host".to_string(),
+                    cluster_base.clone(),
+                    "--scheduler-port".to_string(),
+                    INTERNAL_SCHEDULER_PORT.to_string(),
+                    // Tight heartbeats (M7.3): the registration scheduler may die
+                    // mid-life; the survivor only sees the executor again on its
+                    // next heartbeat (self-registration from heartbeat metadata),
+                    // so a short interval bounds the HA failover window.
+                    "--executor-heartbeat-interval-seconds".to_string(),
+                    "10".to_string(),
+                ];
+                // TLS warehouses (M7.2): executors advertise their container DNS
+                // name instead of the default container IP, so peers that dial
+                // their Flight endpoint verify the certificate against a SAN we
+                // can provision in advance (DNS names of the warehouse's own
+                // containers). The docker network resolves these names for
+                // scheduler-side fetches and cross-executor shuffle reads.
+                if record.as_ref().is_some_and(|r| r.tls) {
+                    exec_args.push("--external-host".to_string());
+                    exec_args.push(exec_name.clone());
+                }
+                self.driver
+                    .start(&ContainerSpec {
+                        name: exec_name,
+                        image: self.images.executor.clone(),
+                        args: exec_args,
+                        env: container_env.clone(),
+                        volumes: container_volumes.clone(),
+                        ports: vec![],
+                        network: self.network.clone(),
+                        network_aliases: Vec::new(),
+                    })
+                    .await?;
             }
-            self.driver
-                .start(&ContainerSpec {
-                    name: exec_name,
-                    image: self.images.executor.clone(),
-                    args: exec_args,
-                    env: container_env.clone(),
-                    volumes: container_volumes.clone(),
-                    ports: vec![],
-                    network: self.network.clone(),
-                    network_aliases: Vec::new(),
-                })
-                .await?;
         }
 
         self.set_state(name, state).await?;
@@ -764,14 +938,58 @@ impl WarehouseManager {
         self.running_since.lock().await.insert(name.to_string(), now);
     }
 
-    /// Stop the scheduler containers `base` plus `-1..replicas` (M7.3).
-    async fn stop_schedulers(&self, name: &str, replicas: u16) -> Result<()> {
-        let replicas = replicas.max(1);
-        for i in (0..replicas).rev() {
-            let sched = scheduler_replica_name(name, i, replicas);
-            self.driver.stop(&sched).await?;
+    /// Stop the executors of every cluster (M12.2). Cluster 0 keeps the
+    /// historical executor names.
+    async fn stop_cluster_executors(
+        &self,
+        name: &str,
+        clusters: u16,
+        size: WarehouseSize,
+    ) -> Result<()> {
+        for cluster in 0..clusters {
+            for i in 0..size.executor_count() {
+                self.driver
+                    .stop(&executor_cluster_name(name, cluster, i))
+                    .await?;
+            }
         }
         Ok(())
+    }
+
+    /// Stop the schedulers of every cluster × replica set (M12.2 × M7.3).
+    async fn stop_cluster_schedulers(
+        &self,
+        name: &str,
+        clusters: u16,
+        replicas: u16,
+    ) -> Result<()> {
+        let replicas = replicas.max(1);
+        for cluster in 0..clusters {
+            let base = scheduler_cluster_name(name, cluster);
+            for replica in (0..replicas).rev() {
+                self.driver
+                    .stop(&scheduler_replica_name_for(&base, replica, replicas))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Full fleet teardown for a cluster-count change on a running
+    /// warehouse (M12.2): executors + schedulers of the *old* cluster count.
+    async fn stop_cluster_fleet(
+        &self,
+        name: &str,
+        old_clusters: u16,
+        size: WarehouseSize,
+    ) -> Result<()> {
+        let replicas = self
+            .record(name)
+            .await
+            .map_or(1, |r| r.scheduler_replicas.max(1));
+        self.stop_cluster_executors(name, old_clusters, size).await?;
+        self.stop_cluster_schedulers(name, old_clusters, replicas)
+            .await
     }
 
     /// `AVALANCHE_CLUSTER_PG_URL` env for scheduler containers (M7.3): the
@@ -874,11 +1092,59 @@ fn allocate_free_host_port() -> Option<u16> {
 #[must_use]
 pub fn scheduler_replica_name(warehouse: &str, replica: u16, replicas: u16) -> String {
     let base = scheduler_container_name(warehouse);
+    scheduler_replica_name_for(&base, replica, replicas)
+}
+
+/// [`scheduler_replica_name`] generalized to an explicit cluster base name
+/// (M12.2): every cluster's scheduler set follows the same replica scheme.
+#[must_use]
+pub fn scheduler_replica_name_for(base: &str, replica: u16, replicas: u16) -> String {
     if replicas >= 2 {
         format!("{base}-{replica}")
     } else {
-        base
+        base.to_string()
     }
+}
+
+/// Base scheduler name for cluster `cluster` (M12.2). Cluster 0 keeps the
+/// historical names, so single-cluster warehouses are unchanged.
+#[must_use]
+pub fn scheduler_cluster_name(warehouse: &str, cluster: u16) -> String {
+    if cluster == 0 {
+        scheduler_container_name(warehouse)
+    } else {
+        format!("avalanche-wh-{warehouse}-c{cluster}-scheduler")
+    }
+}
+
+/// Executor container name within cluster `cluster` (M12.2).
+#[must_use]
+pub fn executor_cluster_name(warehouse: &str, cluster: u16, index: u32) -> String {
+    if cluster == 0 {
+        executor_container_name(warehouse, index)
+    } else {
+        format!("avalanche-wh-{warehouse}-c{cluster}-exec-{index}")
+    }
+}
+
+/// Mapped host port for cluster `cluster`'s scheduler: cluster 0 uses the
+/// historical per-record port; clusters 1..n index `cluster_host_ports`
+/// (0 = allocation failed at start time — the driver reports it).
+#[must_use]
+fn cluster_host_port(
+    record: Option<&WarehouseRecord>,
+    cluster: u16,
+    cluster0_port: Option<u16>,
+) -> Option<u16> {
+    if cluster == 0 {
+        return cluster0_port;
+    }
+    let record = record?;
+    record
+        .cluster_host_ports
+        .get(cluster as usize - 1)
+        .filter(|p| **p != 0)
+        .copied()
 }
 
 /// The configured shared-state Postgres URL (`STATESTORE_PG_URL`, falling

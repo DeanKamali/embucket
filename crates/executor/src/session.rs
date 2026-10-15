@@ -457,6 +457,22 @@ impl UserSession {
             .ok()
     }
 
+    /// Like [`Self::warehouse_scheduler_url`], but acquires a cluster lease
+    /// (M12.2): the in-flight slot counts against the picked cluster until
+    /// the query finishes, steering the *next* submission to a quieter one.
+    pub async fn warehouse_scheduler_lease(
+        &self,
+    ) -> Option<(String, avalanche_warehouse::manager::ClusterLease)> {
+        let warehouse = self.get_session_variable("warehouse")?;
+        self.warehouse
+            .acquire_scheduler_url(&warehouse)
+            .await
+            .map_err(|err| {
+                tracing::debug!(%err, warehouse, "no scheduler url for warehouse; running locally");
+            })
+            .ok()
+    }
+
     /// Current warehouse name from the session variable (`USE WAREHOUSE` /
     /// login), if any — used to stamp query records (M5).
     #[must_use]

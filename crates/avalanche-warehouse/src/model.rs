@@ -160,6 +160,11 @@ pub struct Warehouse {
     /// Number of scheduler replicas sharing the warehouse's cluster state
     /// (M7.3): >1 means the warehouse survives one scheduler's death.
     pub scheduler_replicas: u16,
+    /// Multi-cluster warehouses (M12.2, design §19.1): independent
+    /// scheduler+executor clusters behind one alias. `min_clusters` run;
+    /// `max_clusters` scale-out is parsed/stored but dormant in v1.
+    pub min_clusters: u16,
+    pub max_clusters: u16,
 }
 
 impl Warehouse {

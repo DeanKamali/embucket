@@ -82,9 +82,29 @@ pub struct WarehouseRecord {
     /// compatible with pre-M7.3 records).
     #[serde(default = "default_scheduler_replicas")]
     pub scheduler_replicas: u16,
+    /// Multi-cluster warehouses (M12.2, design §19.1): independent clusters
+    /// behind one warehouse alias. `max_clusters` scale-out beyond `min` is
+    /// parsed and stored but dormant in v1. Defaults keep pre-M12.2 records
+    /// single-cluster.
+    #[serde(default = "default_min_clusters")]
+    pub min_clusters: u16,
+    #[serde(default = "default_max_clusters")]
+    pub max_clusters: u16,
+    /// Mapped host ports for cluster schedulers 1..min_clusters (cluster 0
+    /// uses `scheduler_host_port`). Best-effort: entries may be missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cluster_host_ports: Vec<u16>,
 }
 
 fn default_scheduler_replicas() -> u16 {
+    1
+}
+
+fn default_min_clusters() -> u16 {
+    1
+}
+
+fn default_max_clusters() -> u16 {
     1
 }
 
@@ -107,6 +127,9 @@ impl WarehouseRecord {
             storage_credentials: None,
             tls: false,
             scheduler_replicas: 1,
+            min_clusters: 1,
+            max_clusters: 1,
+            cluster_host_ports: Vec::new(),
         }
     }
 }

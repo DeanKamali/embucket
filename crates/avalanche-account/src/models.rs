@@ -95,9 +95,30 @@ pub struct UserRole {
 /// A share: a named grant bundle attachable across accounts (design §21,
 /// M15). The provider grants privileges into the share; a consumer account
 /// that mounts the share (M15.2) sees exactly the granted objects.
+///
+/// v1 kinds: `Outbound` (provider-side, `CREATE SHARE`) and `Inbound`
+/// (consumer-side, `CREATE INBOUND SHARE`). Cross-account transport is v2
+/// (replication deferred) — an inbound share resolves against the same
+/// process's store, the "same-region trust boundary" case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Share {
     pub name: String,
+    pub kind: ShareKind,
+}
+
+/// Outbound = created by the provider (`CREATE SHARE`); inbound = mounted
+/// by the consumer (`CREATE INBOUND SHARE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[strum(serialize_all = "UPPERCASE")]
+pub enum ShareKind {
+    Outbound,
+    Inbound,
+}
+
+impl Default for ShareKind {
+    fn default() -> Self {
+        Self::Outbound
+    }
 }
 
 /// A privilege grant to a share: `share` may exercise `privilege` on

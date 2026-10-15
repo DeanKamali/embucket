@@ -35,6 +35,7 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
 
     /// Shares (design §21, M15.1): named grant bundles.
     async fn create_share(&self, name: &str) -> Result<Share>;
+    async fn create_inbound_share(&self, name: &str) -> Result<Share>;
     async fn drop_share(&self, name: &str) -> Result<()>;
     async fn get_share(&self, name: &str) -> Result<Option<Share>>;
     async fn list_shares(&self) -> Result<Vec<Share>>;
@@ -319,6 +320,20 @@ impl AccountStore for InMemoryAccountStore {
         }
         let share = Share {
             name: name.to_string(),
+            kind: crate::models::ShareKind::Outbound,
+        };
+        state.shares.insert(key(name), share.clone());
+        Ok(share)
+    }
+
+    async fn create_inbound_share(&self, name: &str) -> Result<Share> {
+        let mut state = self.state.write().await;
+        if state.shares.contains_key(&key(name)) {
+            return account_error::ShareAlreadyExistsSnafu { share: name.to_string() }.fail();
+        }
+        let share = Share {
+            name: name.to_string(),
+            kind: crate::models::ShareKind::Inbound,
         };
         state.shares.insert(key(name), share.clone());
         Ok(share)
@@ -494,6 +509,35 @@ mod tests {
         assert!(s.drop_share("vendor").await.is_err());
         assert!(s.share_grants("vendor").await.is_err());
         assert!(s.list_shares().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbound_shares_are_a_separate_kind() {
+        let s = store();
+        s.create_share("vendor").await.unwrap();
+        // Same name in either kind collides.
+        assert!(s.create_inbound_share("vendor").await.is_err());
+        let inbound = s.create_inbound_share("acme_in").await.unwrap();
+        assert_eq!(inbound.kind, crate::models::ShareKind::Inbound);
+        // Grants work on inbound shares too (M15.2: visibility comes from
+        // the share's grant list; v1 resolves the same-process store).
+        s.grant_to_share(ShareGrant {
+            share: "acme_in".into(),
+            privilege: Privilege::Select,
+            object: AccountObject::Table("db".into(), "public".into(), "t".into()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(s.share_grants("acme_in").await.unwrap().len(), 1);
+        let kinds: Vec<_> = s
+            .list_shares()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|sh| (sh.name, sh.kind))
+            .collect();
+        assert!(kinds.contains(&("vendor".to_string(), crate::models::ShareKind::Outbound)));
+        assert!(kinds.contains(&("acme_in".to_string(), crate::models::ShareKind::Inbound)));
     }
 
     #[tokio::test]

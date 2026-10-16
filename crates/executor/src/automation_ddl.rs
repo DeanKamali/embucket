@@ -535,7 +535,7 @@ fn parse_object_name(
 }
 
 /// Source's current snapshot id, flattened (`None` = table has no snapshots).
-fn current_snapshot_id(
+pub(crate) fn current_snapshot_id(
     table: &catalog_metastore::models::Table,
 ) -> Result<Option<i64>> {
     let snapshot = table
@@ -803,12 +803,75 @@ async fn execute(stmt: &AutomationStatement, session: &Arc<UserSession>) -> Resu
             let replace = if *or_replace { "OR REPLACE " } else { "" };
             let ctas = format!("CREATE {replace}TABLE {target} AS {definition}");
             run_nested(session, ctas, QueryContext::default(), "create dynamic table").await?;
+            // Incremental refresh eligibility (design §22.1-2): plain
+            // single-table GROUP BY definitions get a hidden change stream
+            // over the base, anchored at its current snapshot.
+            let (refresh_mode, base_table, stream_ident) =
+                match crate::dt_incremental::analyze_definition(definition, session) {
+                    Some(shape) => {
+                        let base_resolved = resolve(session, &shape.base_table)
+                            .map_err(|e| automation_error("create dynamic table", e))?;
+                        let base_ident = table_ident(&base_resolved);
+                        let source = metastore
+                            .get_table(&base_ident)
+                            .await
+                            .map_err(|e| automation_error("create dynamic table", e))?
+                            .ok_or_else(|| {
+                                automation_error(
+                                    "create dynamic table",
+                                    format!(
+                                        "base table '{}' does not exist",
+                                        base_ident.to_string()
+                                    ),
+                                )
+                            })?;
+                        let offset = current_snapshot_id(&source)?;
+                        // Stream name keys off the dynamic table (several
+                        // DTs may share one base).
+                        let dt_tid = table_ident(&ident);
+                        let stream_name =
+                            format!("__mv_{}_changes", dt_tid.table);
+                        let stream_ident = TableIdent {
+                            table: stream_name,
+                            schema: dt_tid.schema.clone(),
+                            database: dt_tid.database.clone(),
+                        };
+                        metastore
+                            .create_stream(
+                                &stream_ident,
+                                Stream {
+                                    ident: stream_ident.clone(),
+                                    source: base_ident.clone(),
+                                    offset_snapshot: offset,
+                                    append_only: false,
+                                    comment: Some(format!(
+                                        "hidden change stream for dynamic table {target}"
+                                    )),
+                                },
+                            )
+                            .await
+                            .map_err(|e| automation_error("create dynamic table", e))?;
+                        (
+                            catalog_metastore::models::RefreshMode::Incremental,
+                            Some(base_ident),
+                            Some(stream_ident),
+                        )
+                    }
+                    None => (
+                        catalog_metastore::models::RefreshMode::Full,
+                        None,
+                        None,
+                    ),
+                };
             let record = DynamicTable {
                 ident: table_ident(&ident),
                 definition: definition.clone(),
                 warehouse: warehouse.as_ref().map(|w| norm(w)),
                 target_lag_seconds: *target_lag_seconds,
                 last_refresh_ms: None,
+                refresh_mode,
+                base_table,
+                stream_ident,
             };
             metastore
                 .create_dynamic_table(&table_ident(&ident), record)
@@ -826,6 +889,13 @@ async fn execute(stmt: &AutomationStatement, session: &Arc<UserSession>) -> Resu
             let ident =
                 resolve(session, name).map_err(|e| automation_error("drop dynamic table", e))?;
             let target = display(&ident);
+            // Drop the hidden change stream of an incremental table first
+            // (best-effort: it may already be gone).
+            if let Ok(Some(record)) = metastore.get_dynamic_table(&table_ident(&ident)).await
+                && let Some(stream_ident) = &record.data.stream_ident
+            {
+                let _ = metastore.delete_stream(stream_ident).await;
+            }
             metastore
                 .delete_dynamic_table(&table_ident(&ident))
                 .await
@@ -882,10 +952,15 @@ pub(crate) async fn refresh_dynamic_table(
                 format!("dynamic table '{}' does not exist", ident.to_string()),
             )
         })?;
-    let target = ident.to_string();
-    let overwrite = format!("INSERT OVERWRITE INTO {target} {}", record.definition);
-    let result =
-        run_nested(session, overwrite, QueryContext::default(), "refresh").await?;
+    // Incremental mode (design §22.1-2): consume the base's change feed and
+    // commit only the affected groups' delta.
+    let result = if record.data.refresh_mode == catalog_metastore::models::RefreshMode::Incremental {
+        crate::dt_incremental::refresh_incremental(session, &record.data, &metastore).await?
+    } else {
+        let target = ident.to_string();
+        let overwrite = format!("INSERT OVERWRITE INTO {target} {}", record.data.definition);
+        run_nested(session, overwrite, QueryContext::default(), "refresh").await?
+    };
     let updated = DynamicTable {
         last_refresh_ms: Some(chrono::Utc::now().timestamp_millis()),
         ..record.data.clone()

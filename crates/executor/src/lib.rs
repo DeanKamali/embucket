@@ -6,6 +6,7 @@ pub mod datafusion;
 #[cfg(feature = "dedicated-executor")]
 pub mod dedicated_executor;
 pub mod clone_ddl;
+pub mod dt_incremental;
 pub mod error;
 pub mod error_code;
 pub mod time_travel;

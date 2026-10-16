@@ -92,4 +92,29 @@ pub struct DynamicTable {
     pub target_lag_seconds: Option<i64>,
     /// Epoch-ms of the last completed refresh.
     pub last_refresh_ms: Option<i64>,
+    /// Refresh strategy (design §22.1-2): `Incremental` refreshes consume
+    /// the base table's change feed for GROUP BY definitions; `Full` is
+    /// the M11 full-overwrite refresh.
+    #[serde(default)]
+    pub refresh_mode: RefreshMode,
+    /// Incremental mode only: the single base table the definition
+    /// aggregates over.
+    #[serde(default)]
+    pub base_table: Option<TableIdent>,
+    /// Incremental mode only: hidden change stream over `base_table`
+    /// tracking the last consumed source snapshot.
+    #[serde(default)]
+    pub stream_ident: Option<TableIdent>,
+}
+
+/// Refresh strategy for a dynamic table (design §22.1-2).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RefreshMode {
+    /// Full-overwrite refresh: one INSERT OVERWRITE commit from the whole
+    /// definition (M11 behavior).
+    #[default]
+    Full,
+    /// Incremental refresh: consume the base's change feed, recompute only
+    /// affected groups, commit once (M16.2; GROUP BY definitions only).
+    Incremental,
 }

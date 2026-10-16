@@ -7,6 +7,7 @@ use datafusion::sql::sqlparser::ast::Select;
 
 pub mod copy_into_identifiers;
 pub mod fetch_to_limit;
+pub mod flatten_correlation;
 pub mod functions_rewriter;
 pub mod inline_aliases_in_query;
 pub mod json_element;

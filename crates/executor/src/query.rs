@@ -76,9 +76,9 @@ use datafusion_physical_plan::{ExecutionPlan, collect};
 use functions::semi_structured::variant::visitors::visit_all;
 use functions::session_params::SessionProperty;
 use functions::visitors::{
-    copy_into_identifiers, fetch_to_limit, functions_rewriter, inline_aliases_in_query,
-    like_ilike_any, rlike_regexp_expr_rewriter, select_expr_aliases, table_functions,
-    table_functions_cte_relation, timestamp, top_limit,
+    copy_into_identifiers, fetch_to_limit, flatten_correlation, functions_rewriter,
+    inline_aliases_in_query, like_ilike_any, rlike_regexp_expr_rewriter, select_expr_aliases,
+    table_functions, table_functions_cte_relation, timestamp, top_limit,
     unimplemented::functions_checker::visit as unimplemented_functions_checker,
     within_group_rewriter,
 };
@@ -233,6 +233,7 @@ impl UserQuery {
             fetch_to_limit::visit(value).context(ex_error::SqlParserSnafu)?;
             table_functions::visit(value);
             timestamp::visit(value);
+            flatten_correlation::visit(value);
             table_functions_cte_relation::visit(value);
             within_group_rewriter::visit(value);
             visit_all(value);

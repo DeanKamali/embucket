@@ -6,11 +6,13 @@ license-file = { workspace = true }
 
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 catalog = { path = "../catalog" }
 catalog-metastore = { path = "../catalog-metastore" }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 snafu = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }

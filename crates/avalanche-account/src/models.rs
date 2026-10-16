@@ -97,6 +97,11 @@ pub struct UserRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginEvent {
     pub timestamp_ms: u64,
+    /// Process-local insertion sequence — gives login journal keys
+    /// stability and `list_logins` a total order across restarts
+    /// (M17.3.1). Events recorded before the field existed default to 0.
+    #[serde(default)]
+    pub sequence: u64,
     pub user_name: String,
     pub client_app_id: Option<String>,
     pub client_ip: Option<String>,

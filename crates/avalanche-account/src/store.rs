@@ -1,8 +1,8 @@
 //! Account store (design §17, M10.1): users, roles, grants.
 //!
-//! `InMemoryAccountStore` keeps process-lifetime state — consistent with the
-//! in-memory metastore. PG persistence of account records is an explicit
-//! follow-up (state-store trait + tables), not M10 scope.
+//! `InMemoryAccountStore` keeps process-lifetime state; with a journal
+//! (M17.3.1, design §23) it is also durable — every mutation is mirrored
+//! write-through and bootstrap replays the journal.
 
 use crate::error::{self as account_error, Result};
 use crate::models::{
@@ -11,7 +11,27 @@ use crate::models::{
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Process-wide account-state epoch (M17.3.1): bumped on every
+/// authorization-relevant mutation (roles, users, role/user links, grants,
+/// shares). The executor result-cache fingerprint folds this in so a
+/// GRANT/REVOKE between two identical SELECTs is never served a stale
+/// cached result (design §19.1). Login recording is deliberately excluded:
+/// it cannot change what a role may see.
+static ACCOUNT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Current account-state epoch (see [`ACCOUNT_EPOCH`]).
+#[must_use]
+pub fn account_epoch() -> u64 {
+    ACCOUNT_EPOCH.load(Ordering::Relaxed)
+}
+
+fn bump_account_epoch() {
+    ACCOUNT_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
 
 #[async_trait]
 pub trait AccountStore: std::fmt::Debug + Send + Sync {
@@ -80,12 +100,140 @@ struct StoreState {
 #[derive(Debug, Default)]
 pub struct InMemoryAccountStore {
     state: RwLock<StoreState>,
+    /// Write-through journal (M17.3.1): every mutation is mirrored to the
+    /// durable backend before the in-memory state changes; `None` for the
+    /// plain process-lifetime store.
+    journal: Option<Arc<dyn crate::journal::AccountJournal>>,
+    /// Insertion sequence for login events (stable journal keys + ordering).
+    login_seq: AtomicU64,
 }
 
 impl InMemoryAccountStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Durable store (M17.3.1, design §23): replays the journal into the
+    /// in-memory state, then serves every subsequent mutation write-through.
+    ///
+    /// # Errors
+    /// When the backend fails while loading a domain, or a replayed record
+    /// fails to deserialize.
+    pub async fn new_with_journal(
+        journal: Arc<dyn crate::journal::AccountJournal>,
+    ) -> Result<Self> {
+        let mut state = StoreState::default();
+        let mut logins: Vec<LoginEvent> = Vec::new();
+        for domain in crate::journal::domain::ALL {
+            let entries = journal.list(domain).await.map_err(|e| {
+                account_error::InvalidInputSnafu {
+                    message: format!("account journal load {domain}: {e}"),
+                }
+                .build()
+            })?;
+            for (_, value) in entries {
+                let record = crate::journal::AccountRecord::from_bytes(domain, &value)
+                    .map_err(|e| {
+                        account_error::InvalidInputSnafu {
+                            message: format!("account journal replay {domain}: {e}"),
+                        }
+                        .build()
+                    })?;
+                match record {
+                    crate::journal::AccountRecord::User(u) => {
+                        state.users.insert(key(&u.name), u);
+                    }
+                    crate::journal::AccountRecord::Role(r) => {
+                        state.roles.insert(key(&r.name), r);
+                    }
+                    crate::journal::AccountRecord::UserRole(ur) => {
+                        state.user_roles.push(ur);
+                    }
+                    crate::journal::AccountRecord::Grant(g) => state.grants.push(g),
+                    crate::journal::AccountRecord::Share(s) => {
+                        state.shares.insert(key(&s.name), s);
+                    }
+                    crate::journal::AccountRecord::ShareGrant(g) => state.share_grants.push(g),
+                    crate::journal::AccountRecord::Login(e) => logins.push(e),
+                }
+            }
+        }
+        // Oldest first: timestamp, then insertion sequence (see
+        // `AccountRecord::journal_key` for the login key layout).
+        logins.sort_by(|a, b| {
+            (a.timestamp_ms, a.sequence).cmp(&(b.timestamp_ms, b.sequence))
+        });
+        state.logins = logins;
+        Ok(Self {
+            state: RwLock::new(state),
+            journal: Some(journal),
+            login_seq: AtomicU64::new(0),
+        })
+    }
+
+    /// Idempotently seed the built-in `ACCOUNTADMIN` role and a member user
+    /// (the demo credentials become the admin login) on a store that may
+    /// already carry replayed state — the durable counterpart of
+    /// [`InMemoryAccountStore::with_admin`]. No-ops (without journal
+    /// writes) when the user already exists.
+    ///
+    /// # Errors
+    /// Forwarded from the store mutations (existence checks pass first, so
+    /// in practice only journal/backend failures surface).
+    pub async fn ensure_admin(&self, name: &str, password: &str) -> Result<()> {
+        if self.get_user(name).await?.is_some() {
+            return Ok(());
+        }
+        if self.get_role(ACCOUNTADMIN).await?.is_none() {
+            self.create_role(ACCOUNTADMIN).await?;
+        }
+        self.create_user(User {
+            name: name.to_string(),
+            login_name: name.to_string(),
+            password: password.to_string(),
+            default_role: Some(ACCOUNTADMIN.to_string()),
+            tenant: None,
+            disabled: false,
+        })
+        .await?;
+        self.grant_role_to_user(name, ACCOUNTADMIN).await
+    }
+
+    /// Mirror one record to the journal.
+    async fn journal_put(&self, record: &crate::journal::AccountRecord) -> Result<()> {
+        if let Some(j) = &self.journal {
+            let value = record.to_bytes().map_err(|e| {
+                account_error::InvalidInputSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
+            j.put(record.domain(), &record.journal_key(), value.to_vec())
+                .await
+                .map_err(|e| {
+                    account_error::InvalidInputSnafu {
+                        message: format!("account journal write: {e}"),
+                    }
+                    .build()
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Mirror one deletion to the journal (key computed from `record`).
+    async fn journal_delete(&self, record: &crate::journal::AccountRecord) -> Result<()> {
+        if let Some(j) = &self.journal {
+            j.delete(record.domain(), &record.journal_key())
+                .await
+                .map_err(|e| {
+                    account_error::InvalidInputSnafu {
+                        message: format!("account journal delete: {e}"),
+                    }
+                    .build()
+                })?;
+        }
+        Ok(())
     }
 
     /// Seed the built-in `ACCOUNTADMIN` role and a member user (the demo
@@ -115,6 +263,8 @@ impl InMemoryAccountStore {
         });
         Self {
             state: RwLock::new(state),
+            journal: None,
+            login_seq: AtomicU64::new(0),
         }
     }
 }
@@ -126,6 +276,7 @@ fn key(name: &str) -> String {
 #[async_trait]
 impl AccountStore for InMemoryAccountStore {
     async fn create_role(&self, name: &str) -> Result<Role> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         let role = Role {
             name: name.to_string(),
@@ -134,14 +285,43 @@ impl AccountStore for InMemoryAccountStore {
             return account_error::RoleAlreadyExistsSnafu { role: name.to_string() }.fail();
         }
         state.roles.insert(key(name), role.clone());
+        self.journal_put(&crate::journal::AccountRecord::Role(role.clone()))
+            .await?;
         Ok(role)
     }
 
     async fn drop_role(&self, name: &str) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if state.roles.remove(&key(name)).is_none() {
             return account_error::RoleNotFoundSnafu { role: name.to_string() }.fail();
         }
+        // Journal the cascades before mutating (keys computed from the
+        // records being removed).
+        let removed_grants: Vec<Grant> = state
+            .grants
+            .iter()
+            .filter(|g| key(&g.role).eq_ignore_ascii_case(&key(name)))
+            .cloned()
+            .collect();
+        let removed_links: Vec<UserRole> = state
+            .user_roles
+            .iter()
+            .filter(|ur| key(&ur.role).eq_ignore_ascii_case(&key(name)))
+            .cloned()
+            .collect();
+        for g in &removed_grants {
+            self.journal_delete(&crate::journal::AccountRecord::Grant(g.clone()))
+                .await?;
+        }
+        for ur in &removed_links {
+            self.journal_delete(&crate::journal::AccountRecord::UserRole(ur.clone()))
+                .await?;
+        }
+        self.journal_delete(&crate::journal::AccountRecord::Role(Role {
+            name: name.to_string(),
+        }))
+        .await?;
         state.grants.retain(|g| !key(&g.role).eq_ignore_ascii_case(&key(name)));
         state
             .user_roles
@@ -160,19 +340,42 @@ impl AccountStore for InMemoryAccountStore {
     }
 
     async fn create_user(&self, user: User) -> Result<User> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if state.users.contains_key(&key(&user.name)) {
             return account_error::UserAlreadyExistsSnafu { user: user.name.clone() }.fail();
         }
         state.users.insert(key(&user.name), user.clone());
+        self.journal_put(&crate::journal::AccountRecord::User(user.clone()))
+            .await?;
         Ok(user)
     }
 
     async fn drop_user(&self, name: &str) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if state.users.remove(&key(name)).is_none() {
             return account_error::UserNotFoundSnafu { user: name.to_string() }.fail();
         }
+        let removed_links: Vec<UserRole> = state
+            .user_roles
+            .iter()
+            .filter(|ur| key(&ur.user).eq_ignore_ascii_case(&key(name)))
+            .cloned()
+            .collect();
+        for ur in &removed_links {
+            self.journal_delete(&crate::journal::AccountRecord::UserRole(ur.clone()))
+                .await?;
+        }
+        self.journal_delete(&crate::journal::AccountRecord::User(User {
+            name: name.to_string(),
+            login_name: String::new(),
+            password: String::new(),
+            default_role: None,
+            tenant: None,
+            disabled: false,
+        }))
+        .await?;
         state
             .user_roles
             .retain(|ur| !key(&ur.user).eq_ignore_ascii_case(&key(name)));
@@ -194,6 +397,7 @@ impl AccountStore for InMemoryAccountStore {
     }
 
     async fn grant_role_to_user(&self, user: &str, role: &str) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if !state.users.contains_key(&key(user)) {
             return account_error::UserNotFoundSnafu { user: user.to_string() }.fail();
@@ -210,23 +414,35 @@ impl AccountStore for InMemoryAccountStore {
             .iter()
             .any(|ur| key(&ur.user) == key(user) && key(&ur.role) == key(role));
         if !exists {
-            state.user_roles.push(link);
+            state.user_roles.push(link.clone());
+            self.journal_put(&crate::journal::AccountRecord::UserRole(link))
+                .await?;
         }
         Ok(())
     }
 
     async fn revoke_role_from_user(&self, user: &str, role: &str) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
-        let before = state.user_roles.len();
-        state
+        let removed: Vec<UserRole> = state
             .user_roles
-            .retain(|ur| !(key(&ur.user) == key(user) && key(&ur.role) == key(role)));
-        if state.user_roles.len() == before {
+            .iter()
+            .filter(|ur| key(&ur.user) == key(user) && key(&ur.role) == key(role))
+            .cloned()
+            .collect();
+        if removed.is_empty() {
             return account_error::GrantNotFoundSnafu {
                 message: format!("role '{role}' is not granted to user '{user}'"),
             }
             .fail();
         }
+        for ur in &removed {
+            self.journal_delete(&crate::journal::AccountRecord::UserRole(ur.clone()))
+                .await?;
+        }
+        state
+            .user_roles
+            .retain(|ur| !(key(&ur.user) == key(user) && key(&ur.role) == key(role)));
         Ok(())
     }
 
@@ -241,6 +457,7 @@ impl AccountStore for InMemoryAccountStore {
     }
 
     async fn grant(&self, grant: Grant) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if !state.roles.contains_key(&key(&grant.role)) {
             return account_error::RoleNotFoundSnafu {
@@ -254,20 +471,27 @@ impl AccountStore for InMemoryAccountStore {
                 && g.object == grant.object
         });
         if !exists {
-            state.grants.push(grant);
+            state.grants.push(grant.clone());
+            self.journal_put(&crate::journal::AccountRecord::Grant(grant.clone()))
+                .await?;
         }
         Ok(())
     }
 
     async fn revoke(&self, grant: &Grant) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
-        let before = state.grants.len();
-        state.grants.retain(|g| {
-            !(key(&g.role) == key(&grant.role)
-                && g.privilege == grant.privilege
-                && g.object == grant.object)
-        });
-        if state.grants.len() == before {
+        let removed: Vec<Grant> = state
+            .grants
+            .iter()
+            .filter(|g| {
+                key(&g.role) == key(&grant.role)
+                    && g.privilege == grant.privilege
+                    && g.object == grant.object
+            })
+            .cloned()
+            .collect();
+        if removed.is_empty() {
             return account_error::GrantNotFoundSnafu {
                 message: format!(
                     "privilege '{}' on {} '{}' is not granted to role '{}'",
@@ -276,6 +500,15 @@ impl AccountStore for InMemoryAccountStore {
             }
             .fail();
         }
+        for g in &removed {
+            self.journal_delete(&crate::journal::AccountRecord::Grant(g.clone()))
+                .await?;
+        }
+        state.grants.retain(|g| {
+            !(key(&g.role) == key(&grant.role)
+                && g.privilege == grant.privilege
+                && g.object == grant.object)
+        });
         Ok(())
     }
 
@@ -313,6 +546,10 @@ impl AccountStore for InMemoryAccountStore {
     }
 
     async fn record_login(&self, event: LoginEvent) -> Result<()> {
+        let mut event = event;
+        event.sequence = self.login_seq.fetch_add(1, Ordering::Relaxed);
+        self.journal_put(&crate::journal::AccountRecord::Login(event.clone()))
+            .await?;
         self.state.write().await.logins.push(event);
         Ok(())
     }
@@ -335,6 +572,7 @@ impl AccountStore for InMemoryAccountStore {
     }
 
     async fn create_share(&self, name: &str) -> Result<Share> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if state.shares.contains_key(&key(name)) {
             return account_error::ShareAlreadyExistsSnafu { share: name.to_string() }.fail();
@@ -345,10 +583,13 @@ impl AccountStore for InMemoryAccountStore {
             provider: None,
         };
         state.shares.insert(key(name), share.clone());
+        self.journal_put(&crate::journal::AccountRecord::Share(share.clone()))
+            .await?;
         Ok(share)
     }
 
     async fn create_inbound_share(&self, name: &str, provider: &str) -> Result<Share> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if state.shares.contains_key(&key(name)) {
             return account_error::ShareAlreadyExistsSnafu { share: name.to_string() }.fail();
@@ -365,14 +606,33 @@ impl AccountStore for InMemoryAccountStore {
             provider: Some(provider.to_string()),
         };
         state.shares.insert(key(name), share.clone());
+        self.journal_put(&crate::journal::AccountRecord::Share(share.clone()))
+            .await?;
         Ok(share)
     }
 
     async fn drop_share(&self, name: &str) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if state.shares.remove(&key(name)).is_none() {
             return account_error::ShareNotFoundSnafu { share: name.to_string() }.fail();
         }
+        let removed: Vec<ShareGrant> = state
+            .share_grants
+            .iter()
+            .filter(|g| key(&g.share).eq_ignore_ascii_case(&key(name)))
+            .cloned()
+            .collect();
+        for g in &removed {
+            self.journal_delete(&crate::journal::AccountRecord::ShareGrant(g.clone()))
+                .await?;
+        }
+        self.journal_delete(&crate::journal::AccountRecord::Share(Share {
+            name: name.to_string(),
+            kind: crate::models::ShareKind::Outbound,
+            provider: None,
+        }))
+        .await?;
         state
             .share_grants
             .retain(|g| !key(&g.share).eq_ignore_ascii_case(&key(name)));
@@ -390,6 +650,7 @@ impl AccountStore for InMemoryAccountStore {
     }
 
     async fn grant_to_share(&self, grant: ShareGrant) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
         if !state.shares.contains_key(&key(&grant.share)) {
             return account_error::ShareNotFoundSnafu {
@@ -403,20 +664,27 @@ impl AccountStore for InMemoryAccountStore {
                 && g.object == grant.object
         });
         if !exists {
-            state.share_grants.push(grant);
+            state.share_grants.push(grant.clone());
+            self.journal_put(&crate::journal::AccountRecord::ShareGrant(grant.clone()))
+                .await?;
         }
         Ok(())
     }
 
     async fn revoke_from_share(&self, grant: &ShareGrant) -> Result<()> {
+        bump_account_epoch();
         let mut state = self.state.write().await;
-        let before = state.share_grants.len();
-        state.share_grants.retain(|g| {
-            !(key(&g.share) == key(&grant.share)
-                && g.privilege == grant.privilege
-                && g.object == grant.object)
-        });
-        if state.share_grants.len() == before {
+        let removed: Vec<ShareGrant> = state
+            .share_grants
+            .iter()
+            .filter(|g| {
+                key(&g.share) == key(&grant.share)
+                    && g.privilege == grant.privilege
+                    && g.object == grant.object
+            })
+            .cloned()
+            .collect();
+        if removed.is_empty() {
             return account_error::GrantNotFoundSnafu {
                 message: format!(
                     "privilege '{}' on {} '{}' is not granted to share '{}'",
@@ -425,6 +693,15 @@ impl AccountStore for InMemoryAccountStore {
             }
             .fail();
         }
+        for g in &removed {
+            self.journal_delete(&crate::journal::AccountRecord::ShareGrant(g.clone()))
+                .await?;
+        }
+        state.share_grants.retain(|g| {
+            !(key(&g.share) == key(&grant.share)
+                && g.privilege == grant.privilege
+                && g.object == grant.object)
+        });
         Ok(())
     }
 }
@@ -593,5 +870,220 @@ mod tests {
         // Unknown user/role link errors.
         assert!(s.grant_role_to_user("nobody", "r1").await.is_err());
         assert!(s.grant_role_to_user("u1", "nope").await.is_err());
+    }
+
+    // ================= journal (M17.3.1) =================
+
+    /// In-memory [`AccountJournal`] backend for tests — mimics the raw-KV
+    /// state store (domain → key → value).
+    #[derive(Default)]
+    struct MockJournal(std::sync::Mutex<HashMap<String, HashMap<String, Vec<u8>>>>);
+
+    impl std::fmt::Debug for MockJournal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("MockJournal")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::journal::AccountJournal for MockJournal {
+        async fn put(&self, domain: &str, k: &str, value: Vec<u8>) -> crate::journal::JournalResult<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .entry(domain.to_string())
+                .or_default()
+                .insert(k.to_string(), value);
+            Ok(())
+        }
+
+        async fn delete(&self, domain: &str, k: &str) -> crate::journal::JournalResult<()> {
+            if let Some(m) = self.0.lock().unwrap().get_mut(domain) {
+                m.remove(k);
+            }
+            Ok(())
+        }
+
+        async fn list(&self, domain: &str) -> crate::journal::JournalResult<Vec<(String, Vec<u8>)>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(domain)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default())
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_replay_restores_full_state() {
+        let journal = Arc::new(MockJournal::default());
+        let s = InMemoryAccountStore::new_with_journal(journal.clone())
+            .await
+            .unwrap();
+        s.ensure_admin("embucket", "embucket").await.unwrap();
+        s.create_role("analyst").await.unwrap();
+        s.create_user(User {
+            name: "u1".into(),
+            login_name: "u1".into(),
+            password: "pw".into(),
+            default_role: Some("analyst".into()),
+            tenant: Some("acme".into()),
+            disabled: false,
+        })
+        .await
+        .unwrap();
+        s.grant_role_to_user("u1", "analyst").await.unwrap();
+        s.grant(Grant {
+            role: "analyst".into(),
+            privilege: Privilege::Select,
+            object: AccountObject::Table("db".into(), "public".into(), "t".into()),
+        })
+        .await
+        .unwrap();
+        s.create_share("vendor").await.unwrap();
+        s.grant_to_share(ShareGrant {
+            share: "vendor".into(),
+            privilege: Privilege::Usage,
+            object: AccountObject::Database("db".into()),
+        })
+        .await
+        .unwrap();
+        s.record_login(LoginEvent {
+            timestamp_ms: 1_000,
+            sequence: 0,
+            user_name: "u1".into(),
+            client_app_id: None,
+            client_ip: None,
+            success: true,
+        })
+        .await
+        .unwrap();
+        s.record_login(LoginEvent {
+            timestamp_ms: 2_000,
+            sequence: 0,
+            user_name: "u1".into(),
+            client_app_id: None,
+            client_ip: None,
+            success: false,
+        })
+        .await
+        .unwrap();
+
+        // "Restart": a fresh store over the same journal.
+        let s2 = InMemoryAccountStore::new_with_journal(journal).await.unwrap();
+        assert!(s2.authenticate("embucket", "embucket").await.unwrap().is_some());
+        assert!(s2.authenticate("u1", "pw").await.unwrap().is_some());
+        assert_eq!(s2.user_roles("u1").await.unwrap(), vec!["analyst"]);
+        assert!(s2
+            .allowed(
+                "analyst",
+                Privilege::Select,
+                &AccountObject::Table("db".into(), "public".into(), "t".into())
+            )
+            .await
+            .unwrap());
+        assert_eq!(s2.share_grants("vendor").await.unwrap().len(), 1);
+        // Logins replay oldest-first.
+        let logins = s2.list_logins().await.unwrap();
+        assert_eq!(logins.len(), 2);
+        assert!(logins[0].timestamp_ms <= logins[1].timestamp_ms);
+        assert!(logins[0].success); // ts=1000 success
+        assert!(!logins[1].success); // ts=2000 failure
+    }
+
+    #[tokio::test]
+    async fn journal_replay_applies_deletes_and_cascades() {
+        let journal = Arc::new(MockJournal::default());
+        let s = InMemoryAccountStore::new_with_journal(journal.clone())
+            .await
+            .unwrap();
+        s.ensure_admin("embucket", "embucket").await.unwrap();
+        s.create_role("analyst").await.unwrap();
+        s.grant_role_to_user("embucket", "analyst").await.unwrap();
+        s.grant(Grant {
+            role: "analyst".into(),
+            privilege: Privilege::Usage,
+            object: AccountObject::Database("db".into()),
+        })
+        .await
+        .unwrap();
+        // Drop cascades; the journal must reflect the removals.
+        s.drop_role("analyst").await.unwrap();
+
+        let s2 = InMemoryAccountStore::new_with_journal(journal).await.unwrap();
+        assert!(s2.get_role("analyst").await.unwrap().is_none());
+        // The analyst link is gone; the bootstrap ACCOUNTADMIN link survives.
+        assert_eq!(
+            s2.user_roles("embucket").await.unwrap(),
+            vec![ACCOUNTADMIN.to_string()]
+        );
+        assert!(s2.role_grants("analyst").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_admin_is_idempotent_across_restarts() {
+        let journal = Arc::new(MockJournal::default());
+        let s = InMemoryAccountStore::new_with_journal(journal.clone())
+            .await
+            .unwrap();
+        s.ensure_admin("embucket", "embucket").await.unwrap();
+        // Second seed on replayed state: no error, no duplicate.
+        let s2 = InMemoryAccountStore::new_with_journal(journal).await.unwrap();
+        s2.ensure_admin("embucket", "embucket").await.unwrap();
+        assert_eq!(s2.list_users().await.unwrap().len(), 1);
+        assert_eq!(s2.list_roles().await.unwrap().len(), 1);
+        assert_eq!(s2.user_roles("embucket").await.unwrap().len(), 1);
+        // Renamed password does not overwrite: ensure_admin no-ops.
+        s2.ensure_admin("embucket", "other").await.unwrap();
+        assert!(s2.authenticate("embucket", "embucket").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn account_epoch_bumps_on_authz_mutations_only() {
+        let s = InMemoryAccountStore::new();
+        let before = super::account_epoch();
+        s.create_role("e1").await.unwrap();
+        assert!(super::account_epoch() > before, "create_role bumps");
+        s.record_login(LoginEvent {
+            timestamp_ms: 0,
+            sequence: 0,
+            user_name: "e1".into(),
+            client_app_id: None,
+            client_ip: None,
+            success: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            super::account_epoch(),
+            before + 1,
+            "record_login must not bump (no authorization effect)"
+        );
+        s.grant(Grant {
+            role: "e1".to_string(),
+            privilege: crate::models::Privilege::Select,
+            object: crate::models::AccountObject::Table(
+                "db".to_string(),
+                "s".to_string(),
+                "t".to_string(),
+            ),
+        })
+        .await
+        .unwrap();
+        let after_grant = super::account_epoch();
+        assert!(after_grant > before + 1, "grant bumps");
+        s.revoke(&Grant {
+            role: "e1".to_string(),
+            privilege: crate::models::Privilege::Select,
+            object: crate::models::AccountObject::Table(
+                "db".to_string(),
+                "s".to_string(),
+                "t".to_string(),
+            ),
+        })
+        .await
+        .unwrap();
+        assert!(super::account_epoch() > after_grant, "revoke bumps");
     }
 }

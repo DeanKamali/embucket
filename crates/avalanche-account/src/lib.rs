@@ -7,6 +7,7 @@
 
 pub mod authz;
 pub mod error;
+pub mod journal;
 pub mod models;
 pub mod store;
 

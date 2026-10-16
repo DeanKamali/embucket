@@ -827,11 +827,13 @@ name = "avalanche-account"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "catalog",
  "catalog-metastore",
  "datafusion",
  "datafusion-common",
  "serde",
+ "serde_json",
  "snafu",
  "strum",
  "strum_macros",

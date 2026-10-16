@@ -1,11 +1,12 @@
+pub mod as_array;
 pub mod as_binary;
 pub mod as_boolean;
 pub mod as_char;
 pub mod as_date;
 pub mod as_decimal;
 pub mod as_double;
-pub mod as_func;
 pub mod as_integer;
+pub mod as_object;
 pub mod as_time;
 pub mod as_timestamp;
 pub mod common;
@@ -37,6 +38,8 @@ mod tests {
                 as_timestamp::TimestampKind::Ltz,
             ))),
             as_decimal::get_udf(),
+            as_array::get_udf(),
+            as_object::get_udf(),
         ];
         for f in funcs {
             ctx.register_udf(Arc::unwrap_or_clone(f));
@@ -172,6 +175,8 @@ mod tests {
     #[tokio::test]
     async fn test_null_and_unparsable_input() {
         let ctx = ctx_with_as_funcs();
+        // An unparsable string is a string-typed VARIANT (Snowflake's implicit
+        // VARCHAR -> VARIANT cast): AS_CHAR returns it, AS_INTEGER is NULL.
         let r = eval(
             &ctx,
             r#"SELECT AS_CHAR(NULL) a, AS_INTEGER(NULL) b, AS_CHAR('not json') c, AS_INTEGER('not json') d"#,
@@ -179,11 +184,11 @@ mod tests {
         .await;
         assert_batches_eq!(
             &[
-                "+---+---+---+---+",
-                "| a | b | c | d |",
-                "+---+---+---+---+",
-                "|   |   |   |   |",
-                "+---+---+---+---+",
+                "+---+---+----------+---+",
+                "| a | b | c        | d |",
+                "+---+---+----------+---+",
+                "|   |   | not json |   |",
+                "+---+---+----------+---+",
             ],
             &r
         );

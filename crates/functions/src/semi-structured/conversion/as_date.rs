@@ -56,7 +56,12 @@ impl ScalarUDFImpl for AsDateFunc {
                     .split(['T', ' '])
                     .next()
                     .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-                    .map(|d| d.num_days_from_ce()),
+                    // Date32 = days since 1970-01-01 (not since year 1 CE).
+                    .map(|d| {
+                        d.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                                .expect("epoch is a valid date"))
+                            .num_days() as i32
+                    }),
                 _ => None,
             })
             .collect();

@@ -1,52 +1,41 @@
-//! `AS_ARRAY` / `AS_OBJECT` — typed extraction from VARIANT values.
-//!
-//! VARIANT columns are string-typed JSON (see `variant/visitors/type_rewrite.rs`).
-//! `AS_ARRAY(<variant>)` returns the value only if it holds a JSON array;
-//! `AS_OBJECT(<variant>)` only if it holds a JSON object; otherwise NULL.
-
 use crate::macros::make_udf_function;
 use crate::semi_structured::conversion::common;
-use datafusion::arrow::array::{Array, StringArray};
+use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
-use datafusion_common::ScalarValue;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use serde_json::Value;
-use std::sync::Arc;
 
+/// `AS_OBJECT` — typed extraction of a JSON object from a VARIANT.
+///
+/// Syntax: `AS_OBJECT(<variant>)`
+///
+/// Returns the object value if the VARIANT holds a JSON object, else NULL
+/// (Snowflake semantics).
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct AsFunc {
+pub struct AsObjectFunc {
     signature: Signature,
-    aliases: Vec<String>,
 }
 
-impl Default for AsFunc {
+impl Default for AsObjectFunc {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AsFunc {
+impl AsObjectFunc {
     #[must_use]
     pub fn new() -> Self {
         Self {
             signature: Signature::any(1, Volatility::Immutable),
-            aliases: vec!["as_object".to_string()],
-        }
-    }
-
-    fn accepts(&self, value: &Value) -> bool {
-        match self.name() {
-            "as_array" => matches!(value, Value::Array(_)),
-            _ => matches!(value, Value::Object(_)),
         }
     }
 }
 
-impl ScalarUDFImpl for AsFunc {
+impl ScalarUDFImpl for AsObjectFunc {
     fn name(&self) -> &'static str {
-        "as_array"
+        "as_object"
     }
 
     fn signature(&self) -> &Signature {
@@ -62,17 +51,13 @@ impl ScalarUDFImpl for AsFunc {
         let values = common::json_values(&args.args)?;
         let res: StringArray = values
             .into_iter()
-            .map(|opt| opt.filter(|v| self.accepts(v)).map(|v| v.to_string()))
+            .map(|opt| opt.filter(|v| matches!(v, Value::Object(_))).map(|v| v.to_string()))
             .collect();
         common::to_columnar_value(res, len)
     }
-
-    fn aliases(&self) -> &[String] {
-        &self.aliases
-    }
 }
 
-make_udf_function!(AsFunc);
+make_udf_function!(AsObjectFunc);
 
 #[cfg(test)]
 mod tests {
@@ -84,8 +69,8 @@ mod tests {
     #[tokio::test]
     async fn test_basic() -> DFResult<()> {
         let ctx = SessionContext::new();
-        ctx.register_udf(ScalarUDF::from(AsFunc::new()));
-        let q = "SELECT AS_ARRAY('[1,2,3]') as v;";
+        ctx.register_udf(ScalarUDF::from(AsObjectFunc::new()));
+        let q = "SELECT AS_OBJECT('{\"a\": 1}') as v;";
         let result = ctx.sql(q).await?.collect().await?;
 
         assert_batches_eq!(
@@ -93,19 +78,14 @@ mod tests {
                 "+---------+",
                 "| v       |",
                 "+---------+",
-                "| [1,2,3] |",
+                "| {\"a\":1} |",
                 "+---------+",
             ],
             &result
         );
 
-        let q = "SELECT AS_ARRAY(NULL) as v;";
-        let result = ctx.sql(q).await?.collect().await?;
-
-        assert_batches_eq!(&["+---+", "| v |", "+---+", "|   |", "+---+",], &result);
-
-        // A non-array VARIANT yields NULL (Snowflake semantics), not the input.
-        let q = "SELECT AS_ARRAY(123) as v;";
+        // A non-object VARIANT yields NULL (Snowflake semantics), not the input.
+        let q = "SELECT AS_OBJECT('[1,2,3]') as v;";
         let result = ctx.sql(q).await?.collect().await?;
 
         assert_batches_eq!(&["+---+", "| v |", "+---+", "|   |", "+---+",], &result);

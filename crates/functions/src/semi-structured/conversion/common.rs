@@ -32,7 +32,15 @@ pub fn json_values(args: &[ColumnarValue]) -> DFResult<Vec<Option<Value>>> {
         })?;
     Ok(strings
         .iter()
-        .map(|opt| opt.and_then(|s| serde_json::from_str(s).ok()))
+        // Snowflake implicitly casts a VARCHAR argument to VARIANT, so a
+        // string that isn't valid JSON is a string-typed VARIANT (e.g. the
+        // result of `col:key` on a string member, which arrives unquoted).
+        // Treat it as `Value::String(raw)`.
+        .map(|opt| {
+            opt.map(|s| {
+                serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))
+            })
+        })
         .collect())
 }
 

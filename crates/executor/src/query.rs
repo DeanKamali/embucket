@@ -2304,7 +2304,14 @@ impl UserQuery {
 
         let table_ref = match parent_type {
             ShowType::Account | ShowType::Database => {
-                let database = parts.join("");
+                // `IN ACCOUNT` parses with no parent name — resolve against the
+                // session's current database (JDBC/ODBC metadata calls use
+                // `SHOW … IN ACCOUNT`).
+                let database = if parts.is_empty() {
+                    self.current_database()
+                } else {
+                    parts.join("")
+                };
                 self.get_catalog(&database)?;
                 TableReference::full(database, String::new(), String::new())
             }

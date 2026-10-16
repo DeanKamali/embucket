@@ -439,7 +439,7 @@ pub fn parse(raw: &str) -> Option<AutomationStatement> {
 /// Entry point: run automation DDL when the raw SQL matches; `None` = fall
 /// through to the normal planner.
 pub async fn try_execute(raw: &str, session: &Arc<UserSession>) -> Option<Result<QueryResult>> {
-    let statement = parse(raw)?;
+    let statement = parse(&crate::sql_text::strip_comments(raw))?;
     // Boxed: nested DDL (dynamic-table CTAS, DROP TABLE, EXECUTE TASK)
     // re-enters the hook chain, so this async-fn cycle needs a box.
     Some(Box::pin(execute(&statement, session)).await)

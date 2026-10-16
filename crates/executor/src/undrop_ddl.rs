@@ -87,7 +87,7 @@ fn external_error(context: &str, err: impl std::fmt::Display) -> Error {
 
 /// Pre-parse hook for `UserQuery::execute`. `None` = not an undrop statement.
 pub async fn try_execute(raw_query: &str, session: &UserSession) -> Option<Result<QueryResult>> {
-    let stmt = parse(raw_query)?;
+    let stmt = parse(&crate::sql_text::strip_comments(raw_query))?;
     Some(execute(&stmt, session).await)
 }
 

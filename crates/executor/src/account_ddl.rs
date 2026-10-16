@@ -369,7 +369,7 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
 /// Entry point: run account DDL when the raw SQL matches; `None` = fall
 /// through to the normal planner.
 pub async fn try_execute(raw: &str, session: &UserSession) -> Option<Result<QueryResult>> {
-    let statement = parse(raw)?;
+    let statement = parse(&crate::sql_text::strip_comments(raw))?;
     Some(execute(&statement, session).await)
 }
 

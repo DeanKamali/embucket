@@ -772,7 +772,7 @@ pub async fn execute(stmt: &WarehouseStatement, session: &UserSession) -> Result
 
 /// Pre-parse hook for `UserQuery::execute`. `None` = not warehouse DDL.
 pub async fn try_execute(raw_query: &str, session: &UserSession) -> Option<Result<QueryResult>> {
-    let stmt = parse(raw_query)?;
+    let stmt = parse(&crate::sql_text::strip_comments(raw_query))?;
     Some(execute(&stmt, session).await)
 }
 

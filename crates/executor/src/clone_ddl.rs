@@ -64,6 +64,7 @@ fn token(s: &str) -> &str {
 
 /// Match the grammar prefix; `None` when this is not a clone statement.
 pub fn parse(raw: &str) -> Option<CloneStatement> {
+    let raw = crate::sql_text::strip_comments(raw);
     let raw = raw.trim();
     let tok: Vec<&str> = raw.split_whitespace().map(token).collect();
     if tok.len() < 5 || !tok[0].eq_ignore_ascii_case("create") {
@@ -482,6 +483,22 @@ mod tests {
         // Malformed (no source) falls through to the planner, which reports
         // the syntax error.
         assert!(parse("CREATE TABLE t2 CLONE").is_none());
+    }
+
+    #[test]
+    fn parses_with_trailing_comments() {
+        // dbt appends a `/* {...} */` tag comment to every statement.
+        let s = parsed(
+            "CREATE OR REPLACE TABLE customers_clone CLONE t1 /* {\"app\": \"dbt\"} */",
+        );
+        assert_eq!(s.target, vec!["customers_clone"]);
+        assert_eq!(s.source, vec!["t1"]);
+        assert!(s.or_replace);
+        // Leading and line comments also survive.
+        let s = parsed("/* tag */ CREATE TABLE t2 CLONE t1");
+        assert_eq!(s.target, vec!["t2"]);
+        let s = parsed("CREATE TABLE t2 CLONE t1; -- trailing");
+        assert_eq!(s.source, vec!["t1"]);
     }
 
     #[test]

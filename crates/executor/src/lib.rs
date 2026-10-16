@@ -20,6 +20,7 @@ pub mod service;
 pub mod session;
 pub mod share_catalog;
 pub mod snowflake_error;
+pub mod sql_text;
 pub mod tracing;
 pub mod utils;
 pub mod warehouse_ddl;

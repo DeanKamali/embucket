@@ -1,0 +1,15 @@
+---
+source: crates/executor/src/tests/sql/functions/table/flatten.rs
+description: "r#\"WITH base AS (\n        SELECT 1 AS id, PARSE_JSON('{\"arr\": [10]}') AS v\n        UNION ALL SELECT 2, PARSE_JSON('{\"x\": 1}')\n        UNION ALL SELECT 3, NULL)\n    SELECT id, f.value FROM base, LATERAL FLATTEN(INPUT => v:arr, IS_OUTER => true) f;\"#"
+---
+Ok(
+    [
+        "+----+-------+",
+        "| id | value |",
+        "+----+-------+",
+        "| 1  | 10    |",
+        "| 2  |       |",
+        "| 3  |       |",
+        "+----+-------+",
+    ],
+)

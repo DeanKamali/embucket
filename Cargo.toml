@@ -148,6 +148,14 @@ datafusion-macros = { git = "https://github.com/DeanKamali/datafusion.git", bran
 # fork's proto crates so all datafusion types stay unified.
 datafusion-proto = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
 datafusion-proto-common = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
+# Ballista: pin to the personal fork (branch embucket-sync-bl55.0.0 at tag
+# 55.0.0) as the landing spot for M7.4 executor-loss patches (DESIGN.md §13.4,
+# spike report /root/avalanche/reports/m7_4_ballista_executor_loss_spike.md).
+ballista-core = { git = "https://github.com/DeanKamali/datafusion-ballista.git", branch = "embucket-sync-bl55.0.0" }
+ballista-scheduler = { git = "https://github.com/DeanKamali/datafusion-ballista.git", branch = "embucket-sync-bl55.0.0" }
+ballista-executor = { git = "https://github.com/DeanKamali/datafusion-ballista.git", branch = "embucket-sync-bl55.0.0" }
+ballista-api-types = { git = "https://github.com/DeanKamali/datafusion-ballista.git", branch = "embucket-sync-bl55.0.0" }
+ballista-history = { git = "https://github.com/DeanKamali/datafusion-ballista.git", branch = "embucket-sync-bl55.0.0" }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

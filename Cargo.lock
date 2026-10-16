@@ -1505,8 +1505,7 @@ dependencies = [
 [[package]]
 name = "ballista-api-types"
 version = "55.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b97d9eea12c759eda5f828b4f0eba2b42784d96a4e7858afe5624a9522507841"
+source = "git+https://github.com/DeanKamali/datafusion-ballista.git?branch=embucket-sync-bl55.0.0#d5379965528955a4afc5f41bac0c8c409de68a7d"
 dependencies = [
  "serde",
  "utoipa 6.0.0",
@@ -1515,8 +1514,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "55.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a090511fa9b3661dbf17444ecbbf5efcd11793e140ddd7fe2fb85f2de88f561"
+source = "git+https://github.com/DeanKamali/datafusion-ballista.git?branch=embucket-sync-bl55.0.0#d5379965528955a4afc5f41bac0c8c409de68a7d"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -1548,8 +1546,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "55.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "403cdac6a4e822e6025348f4f7e43765ba0ca176ca1f225888a9eeb90b9c66ce"
+source = "git+https://github.com/DeanKamali/datafusion-ballista.git?branch=embucket-sync-bl55.0.0#d5379965528955a4afc5f41bac0c8c409de68a7d"
 dependencies = [
  "arrow 59.2.0",
  "arrow-flight",
@@ -1583,8 +1580,7 @@ dependencies = [
 [[package]]
 name = "ballista-history"
 version = "55.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "926ed4783d3b4d24fc28e899c7aef2f0127a511238320eadfc06c65ba2772bf8"
+source = "git+https://github.com/DeanKamali/datafusion-ballista.git?branch=embucket-sync-bl55.0.0#d5379965528955a4afc5f41bac0c8c409de68a7d"
 dependencies = [
  "ballista-api-types",
  "log",
@@ -1596,8 +1592,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "55.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "845bb1c2c763ae2b50ecfd9debdfe8e092d13a4fefe84c20e9262bb191a1f1e7"
+source = "git+https://github.com/DeanKamali/datafusion-ballista.git?branch=embucket-sync-bl55.0.0#d5379965528955a4afc5f41bac0c8c409de68a7d"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -6708,7 +6703,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "petgraph",
@@ -6729,7 +6724,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6742,7 +6737,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6918,7 +6913,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.45",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6956,7 +6951,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]

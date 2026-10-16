@@ -66,6 +66,7 @@ pub fn register_udfs(
     system::register_udfs(registry)?;
     session::register_session_context_udfs(registry)?;
     window::register_udwfs(registry)?;
+    table::flatten::rows::register_udfs(registry)?;
     Ok(())
 }
 

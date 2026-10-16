@@ -255,13 +255,18 @@ fn get_named_args(args: &[(Expr, Option<String>)]) -> DFResult<FlattenArgs> {
         }
     }
 
-    // is_outer
-    if let Some(Expr::Literal(ScalarValue::Boolean(Some(v)), _)) = get_arg(args, "is_outer") {
+    // is_outer — Snowflake names the flag `OUTER`; accept `IS_OUTER` too.
+    if let Some(Expr::Literal(ScalarValue::Boolean(Some(v)), _)) =
+        get_arg(args, "is_outer").or_else(|| get_arg(args, "outer"))
+    {
         is_outer = v;
     }
 
-    // is_recursive
-    if let Some(Expr::Literal(ScalarValue::Boolean(Some(v)), _)) = get_arg(args, "is_recursive") {
+    // is_recursive — Snowflake names the flag `RECURSIVE`; accept
+    // `IS_RECURSIVE` too.
+    if let Some(Expr::Literal(ScalarValue::Boolean(Some(v)), _)) =
+        get_arg(args, "is_recursive").or_else(|| get_arg(args, "recursive"))
+    {
         is_recursive = v;
     }
 

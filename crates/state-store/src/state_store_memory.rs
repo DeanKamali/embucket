@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Generic KV for `put_raw`/`list_raw` (catalog journal, …).
+type RawKv = HashMap<String, HashMap<String, Vec<u8>>>;
+
 /// Process-memory backed [`StateStore`].
 #[derive(Clone, Default, Debug)]
 pub struct InMemoryStateStore {
@@ -21,7 +24,7 @@ pub struct InMemoryStateStore {
     warehouses: Arc<RwLock<HashMap<String, WarehouseRecord>>>,
     metering: Arc<RwLock<HashMap<String, WarehouseMeteringRecord>>>,
     /// Generic KV for `put_raw`/`list_raw` (catalog journal, …).
-    raw_kv: Arc<RwLock<HashMap<String, HashMap<String, Vec<u8>>>>>,
+    raw_kv: Arc<RwLock<RawKv>>,
 }
 
 impl InMemoryStateStore {

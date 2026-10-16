@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use datafusion::datasource::sink::DataSinkExec;
 use datafusion::error::Result as DFResult;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -55,6 +56,15 @@ impl PhysicalOptimizerRule for RemoveExecAboveEmpty {
             // Skip EmptyExec itself and do not replace aggregate operations with EmptyExec because they should
             // still return results even on empty tables (e.g., COUNT(*) should return 0)
             if plan.is::<EmptyExec>() || contains_aggregates(&plan) {
+                return Ok(Transformed::no(plan));
+            }
+
+            // A write sink must never be eliminated: `INSERT OVERWRITE …
+            // <empty select>` is how TRUNCATE-equivalent deletes/updates
+            // commit (the overwrite removes the target's data files even
+            // when zero rows are written). Replacing the sink with
+            // EmptyExec silently dropped the write (M16.4).
+            if plan.is::<DataSinkExec>() {
                 return Ok(Transformed::no(plan));
             }
 

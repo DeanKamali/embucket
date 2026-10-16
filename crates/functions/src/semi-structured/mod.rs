@@ -58,6 +58,23 @@ pub fn register_udfs(registry: &mut dyn FunctionRegistry) -> Result<()> {
         arrays_to_object::get_udf(),
         arrays_zip::get_udf(),
         conversion::as_func::get_udf(),
+        conversion::as_char::get_udf(),
+        conversion::as_integer::get_udf(),
+        conversion::as_double::get_udf(),
+        conversion::as_boolean::get_udf(),
+        conversion::as_binary::get_udf(),
+        conversion::as_date::get_udf(),
+        conversion::as_time::get_udf(),
+        Arc::new(ScalarUDF::from(conversion::as_timestamp::AsTimestampFunc::new(
+            conversion::as_timestamp::TimestampKind::Ntz,
+        ))),
+        Arc::new(ScalarUDF::from(conversion::as_timestamp::AsTimestampFunc::new(
+            conversion::as_timestamp::TimestampKind::Ltz,
+        ))),
+        Arc::new(ScalarUDF::from(conversion::as_timestamp::AsTimestampFunc::new(
+            conversion::as_timestamp::TimestampKind::Tz,
+        ))),
+        conversion::as_decimal::get_udf(),
         get_path::get_udf(),
         array::is_array::get_udf(),
         Arc::new(ScalarUDF::from(IsTypeofFunc::new(is_typeof::Kind::Array))),

@@ -4,6 +4,8 @@
 pub(crate) mod cli;
 #[cfg(feature = "state-store")]
 pub(crate) mod catalog_journal;
+#[cfg(feature = "state-store")]
+pub(crate) mod account_journal;
 pub(crate) mod helpers;
 pub(crate) mod layers;
 
@@ -145,8 +147,21 @@ async fn async_main(
         .unwrap_or_else(|| "json".to_string());
     // Account store (design §17, M10): the demo credentials bootstrap the
     // built-in ACCOUNTADMIN identity, so all pre-M10 behavior is unchanged.
+    // With the state-store feature the store is durable (M17.3.1): account
+    // records are journalled write-through and replayed on bootstrap.
     let demo_user = opts.auth_demo_user.clone().unwrap();
     let demo_password = opts.auth_demo_password.clone().unwrap();
+    #[cfg(feature = "state-store")]
+    let account_store: Arc<dyn AccountStore> = {
+        let store: Arc<dyn state_store::StateStore> =
+            Arc::new(state_store::PostgresStateStore::new_from_env().await?);
+        let journal = Arc::new(account_journal::AccountStateStoreJournal::new(store));
+        let s = avalanche_account::store::InMemoryAccountStore::new_with_journal(journal).await?;
+        s.ensure_admin(&demo_user, &demo_password).await?;
+        tracing::info!("Account store built with write-through journal (replayed)");
+        Arc::new(s)
+    };
+    #[cfg(not(feature = "state-store"))]
     let account_store: Arc<dyn AccountStore> =
         Arc::new(avalanche_account::store::InMemoryAccountStore::new().with_admin(
             &demo_user,

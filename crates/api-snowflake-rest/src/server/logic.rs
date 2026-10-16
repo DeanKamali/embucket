@@ -31,6 +31,7 @@ async fn record_login(
 ) {
     let event = LoginEvent {
         timestamp_ms: current_epoch_ms(),
+        sequence: 0,
         user_name: login_name.to_string(),
         client_app_id,
         client_ip,

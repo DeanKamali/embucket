@@ -105,6 +105,11 @@ pub struct UserSession {
     /// Mounted inbound share names (design §21, M15.2) — snapshot at
     /// session creation; DML against these catalogs is denied (read-only).
     pub inbound_shares: Vec<String>,
+    /// Explicit-transaction state (design §22.1-1, M16.1): buffered writes
+    /// for `BEGIN`…`COMMIT`/`ROLLBACK`. Deliberately *not* persisted —
+    /// an uncommitted transaction is lost on restart, matching crash
+    /// semantics.
+    pub txn: std::sync::Mutex<Option<crate::transaction::TxnState>>,
 }
 
 impl UserSession {
@@ -292,6 +297,7 @@ impl UserSession {
             session_params: session_params_arc,
             authz,
             inbound_shares,
+            txn: std::sync::Mutex::new(None),
             recent_queries: Arc::new(RwLock::new(VecDeque::new())),
             session_id: session_id.to_string(),
             attrs: DashMap::new(),

@@ -533,8 +533,34 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Cannot begin a transaction inside another transaction"))]
+    TransactionAlreadyActive {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Transaction is aborted, statements rolled back"))]
+    TransactionAborted {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Statement requires a source query inside explicit transaction: {statement}"))]
+    TransactionInsertNoSource {
+        statement: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Unexpected subquery result"))]
     UnexpectedSubqueryResult {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("INSERT column list references unknown column: {column}"))]
+    TransactionInsertUnknownColumn {
+        column: String,
         #[snafu(implicit)]
         location: Location,
     },

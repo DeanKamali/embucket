@@ -31,6 +31,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, Schem
 use datafusion::arrow::datatypes::{Fields, SchemaBuilder};
 use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::catalog::TableProvider;
+use datafusion::datasource::MemTable;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::datasource::default_table_source::provider_as_source;
@@ -391,6 +392,21 @@ impl UserQuery {
         tracing::Span::current().record("statement", format!("{statement:#?}"));
 
         self.update_stats_query_type(&statement);
+
+        // Session transactions (design §22.1-1, M16.1): BEGIN/COMMIT/
+        // ROLLBACK handling, then the transaction guard for every other
+        // statement (aborted errors, DDL auto-commit, buffered INSERT,
+        // unsupported DML).
+        if let Some(result) =
+            crate::transaction::try_txn_statement(&statement, self).await?
+        {
+            return Ok(result);
+        }
+        if let Some(result) =
+            crate::transaction::pre_statement_hook(&statement, self).await?
+        {
+            return Ok(result);
+        }
 
         // TODO: Code should be organized in a better way
         // 1. Single place to parse SQL strings into AST
@@ -2821,6 +2837,43 @@ impl UserQuery {
             Some(url) => self.execute_logical_plan_on_warehouse(plan, url).await,
             None => self.execute_logical_plan(plan).await,
         }
+    }
+
+    /// Replay one transaction buffer (design §22.1-1, M16.1): append
+    /// `batches` to `table` through a single `DmlStatement` so the table
+    /// advances exactly one Iceberg snapshot. The MemTable source is
+    /// scanned via `provider_as_source` (no catalog registration — the
+    /// Embucket schema provider rejects it), and the input is cast to the
+    /// target schema with the same helper the SQL INSERT planner uses.
+    pub(crate) async fn replay_txn_insert(
+        &self,
+        table: TableReference,
+        target: Arc<dyn datafusion::catalog::TableProvider>,
+        batches: Vec<datafusion::arrow::array::RecordBatch>,
+    ) -> Result<()> {
+        let schema = target.schema();
+        let mem = MemTable::try_new(Arc::clone(&schema), vec![batches])
+            .context(ex_error::DataFusionSnafu)?;
+        let scan = datafusion::logical_expr::LogicalPlanBuilder::scan(
+            TableReference::bare("__txn_buffer"),
+            provider_as_source(Arc::new(mem)),
+            None,
+        )
+        .context(ex_error::DataFusionSnafu)?
+        .build()
+        .context(ex_error::DataFusionSnafu)?;
+        let insert_plan = LogicalPlan::Dml(DmlStatement::new(
+            table,
+            provider_as_source(target),
+            WriteOp::Insert(InsertOp::Append),
+            Arc::new(cast_input_to_target_schema(Arc::new(scan), &schema)?),
+        ));
+        self.execute_logical_plan_with_custom_rules(
+            insert_plan,
+            runtime_physical_optimizer_rules(schema),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn execute_scalar_query(&self, query_str: &str) -> Result<ScalarValue> {

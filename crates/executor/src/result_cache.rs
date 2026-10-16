@@ -10,16 +10,19 @@
 //!
 //! Eligibility (all enforced before any cache traffic): top-level SELECT
 //! over the wire from a known account user; no time-travel `AT()` reads;
-//! no non-deterministic functions; every referenced object resolves to a
-//! real table (views, streams, TVFs, CTE-only queries are skipped in v1).
+//! no non-deterministic functions; no table functions (their results vary
+//! between identical calls with no source commit — fingerprinting cannot
+//! detect that, M17.2 fix); every referenced object resolves to a real
+//! table (views, streams, CTE-only queries are skipped in v1).
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
+use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use datafusion::sql::sqlparser::ast::{
-    visit_expressions, visit_relations, Expr, ObjectName, Query,
+    visit_expressions, visit_relations, Expr, ObjectName, Query, TableFactor, Visit, Visitor,
 };
 use dashmap::DashMap;
 
@@ -106,6 +109,42 @@ pub fn has_non_deterministic_function(query: &Query) -> bool {
     found
 }
 
+/// Table functions resolve outside the metastore (`TABLE(QUERY_HISTORY())`,
+/// `LATERAL FLATTEN(...)`, metering/usage TVFs, `RESULT_SCAN`, …): their
+/// results can change between identical calls with no source-table commit
+/// in between, so a snapshot fingerprint over referenced tables cannot
+/// detect staleness. Queries naming any table function are therefore never
+/// cached — the same rule the non-deterministic function list applies.
+/// (The eligibility doc's "TVFs are skipped in v1" intent, enforced
+/// structurally: `TABLE(...)`/`FLATTEN` are not `ObjectName` relations, so
+/// relation resolution alone never sees them.)
+#[derive(Debug, Default)]
+struct TableFunctionFinder {
+    found: bool,
+}
+
+impl Visitor for TableFunctionFinder {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
+        if matches!(
+            table_factor,
+            TableFactor::TableFunction { .. } | TableFactor::Function { .. }
+        ) {
+            self.found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+#[must_use]
+pub fn has_table_function(query: &Query) -> bool {
+    let mut finder = TableFunctionFinder::default();
+    let _ = query.visit(&mut finder);
+    finder.found
+}
+
 /// Stable cache key for an eligible query, `None` when not eligible.
 /// The user name is part of the key (a cached result must never cross
 /// users — grants can differ); role and object state are covered by the
@@ -126,7 +165,7 @@ pub fn cache_key(session: &UserSession, sql: &str) -> Option<String> {
 /// "do not cache" (an unresolvable reference: stream, view, TVF, CTE-only
 /// name, or unknown object).
 pub async fn fingerprint(session: &Arc<UserSession>, query: &Query) -> Option<u64> {
-    if has_non_deterministic_function(query) {
+    if has_non_deterministic_function(query) || has_table_function(query) {
         return None;
     }
     // CTE aliases are not metastore objects — exclude them from resolution.
@@ -323,6 +362,27 @@ mod tests {
         assert!(!has_non_deterministic_function(&parse_query(
             "SELECT SUM(id) FROM t"
         )));
+    }
+
+    #[test]
+    fn table_function_queries_are_not_cacheable() {
+        // Regression (M17.2 acceptance): identical repeated lookups over
+        // QUERY_HISTORY() were served stale results because `TABLE(...)`
+        // is not an ObjectName relation — the snapshot fingerprint saw no
+        // refs and stayed constant. TVF queries must be ineligible.
+        assert!(has_table_function(&parse_query(
+            "SELECT query_id FROM TABLE(QUERY_HISTORY()) WHERE query_text LIKE 'x%'"
+        )));
+        assert!(has_table_function(&parse_query(
+            "SELECT * FROM LATERAL FLATTEN(input => '[1]') f"
+        )));
+        assert!(has_table_function(&parse_query(
+            "SELECT * FROM TABLE(WAREHOUSE_METERING_HISTORY())"
+        )));
+        assert!(!has_table_function(&parse_query(
+            "SELECT COUNT(*) FROM t1 JOIN t2 ON t1.id = t2.id"
+        )));
+        assert!(!has_table_function(&parse_query("SELECT 1")));
     }
 
     #[tokio::test]

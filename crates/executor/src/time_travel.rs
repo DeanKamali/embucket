@@ -15,8 +15,10 @@
 //! snapshot, i.e. full as-of state — verified against `iceberg-rust
 //! Table::manifests`, no fork change needed).
 //!
-//! v1 limits: reads; `STATEMENT`/`STREAM` keys unsupported; local sessions
-//! only (no warehouse) because the temp table lives in the router's catalog.
+//! v1 limits: reads; local sessions only (no warehouse) because the temp
+//! table lives in the router's catalog. M17.2.1 adds statement-level keys:
+//! `AT(STATEMENT => 'id')` / `BEFORE(STATEMENT => 'id')` resolve through the
+//! persisted query history (query record start/end timestamps).
 
 use crate::error::{self as ex_error, Error, Result};
 use crate::session::UserSession;
@@ -43,20 +45,23 @@ const TT_SCHEMA: &str = "__s";
 static TT_SCHEMA_PROVIDER: OnceLock<Arc<MemorySchemaProvider>> = OnceLock::new();
 static TT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A time-travel point: absolute timestamp (ms since epoch) or seconds back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A time-travel point: absolute timestamp (ms since epoch), seconds back,
+/// or a statement id (resolved through query history — M17.2.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimePoint {
     TimestampMs(i64),
+    /// `BEFORE(TIMESTAMP => ...)` — state strictly before the given ms.
+    BeforeTimestampMs(i64),
     OffsetSecs(i64),
+    /// `AT(STATEMENT => 'id')` — state as of the statement's completion.
+    StatementEnd(String),
+    /// `BEFORE(STATEMENT => 'id')` — state before the statement ran.
+    StatementStart(String),
 }
 
-impl TimePoint {
-    fn resolve_ms(&self) -> i64 {
-        match self {
-            Self::TimestampMs(ms) => *ms,
-            Self::OffsetSecs(secs) => Utc::now().timestamp_millis() - secs * 1000,
-        }
-    }
+/// `BEFORE(TIMESTAMP => ...)` — state strictly before the given ms.
+fn before_ms(ms: i64) -> i64 {
+    ms.saturating_sub(1)
 }
 
 /// A located `AT(...)` predicate: byte range to replace (reference + optional
@@ -146,21 +151,33 @@ pub fn plan(sql: &str) -> Result<Vec<PlannedRewrite>> {
                 && w2 != ")"
                 && toks
                     .get(j + 1)
-                    .is_some_and(|(_, t3)| word(strip_at_paren(t3)) == "at")
+                    .is_some_and(|(_, t3)| {
+                        strip_kw_paren(t3).is_some()
+                            || matches!(word(strip_trailing_punct(t3)).as_str(), "at" | "before")
+                    })
             {
                 alias_suffix = format!(" {t2}");
                 j += 1;
             }
         }
-        // Expect AT( … ).
-        let Some(&(at_start, at_tok)) = toks.get(j) else {
+        // Expect AT( … ) or BEFORE( … ) — attached (`AT(`) or spaced (`AT (`).
+        let Some(&(_, at_tok)) = toks.get(j) else {
             break;
         };
-        if word(strip_at_paren(at_tok)) != "at" {
-            i += 1;
-            continue;
-        }
-        match parse_at_spec(&toks, j) {
+        let before = if let Some((kw, _)) = strip_kw_paren(at_tok) {
+            kw == "before"
+        } else {
+            let w = word(strip_trailing_punct(at_tok));
+            if (w == "at" || w == "before")
+                && toks.get(j + 1).is_some_and(|(_, t)| t.starts_with('('))
+            {
+                w == "before"
+            } else {
+                i += 1;
+                continue;
+            }
+        };
+        match parse_at_spec(&toks, j, before) {
             Some(Ok((point, end))) => {
                 plans.push(PlannedRewrite {
                     start: rstart,
@@ -169,7 +186,6 @@ pub fn plan(sql: &str) -> Result<Vec<PlannedRewrite>> {
                     alias_suffix,
                     point,
                 });
-                let _ = at_start;
                 i = toks.iter().position(|(s, _)| *s >= end).unwrap_or(toks.len());
             }
             // Malformed spec — let the planner report the syntax error.
@@ -182,32 +198,32 @@ pub fn plan(sql: &str) -> Result<Vec<PlannedRewrite>> {
     Ok(plans)
 }
 
-/// If the token is `AT(` return just `AT`, else the token unchanged.
-fn strip_at_paren(tok: &str) -> &str {
-    if tok.len() > 2
-        && tok.as_bytes()[..2].eq_ignore_ascii_case(b"at")
-        && tok[2..].starts_with('(')
-    {
-        &tok[..2]
-    } else {
-        tok
+/// If the token is `<KW>(` with KW ∈ {AT, BEFORE}, return the keyword and
+/// the text after the opening paren. Else None.
+fn strip_kw_paren(tok: &str) -> Option<(&'static str, &str)> {
+    for (kw, len) in [("at", 2), ("before", 6)] {
+        if tok.len() > len + 1
+            && tok[..len].eq_ignore_ascii_case(kw)
+            && tok.as_bytes()[len] == b'('
+        {
+            return Some((kw, &tok[len + 1..]));
+        }
     }
+    None
 }
 
 type AtSpec = Option<std::result::Result<(TimePoint, usize), Error>>;
 
-/// Scan the `AT(...)` spec starting at token index `at_idx`.
+/// Scan the `AT(...)` / `BEFORE(...)` spec starting at token index `at_idx`.
 ///
 /// - `Some(Ok((point, byte_end_of_closing_paren)))` — a parseable spec
 /// - `Some(Err(...))` — a well-formed spec with an unsupported key
 /// - `None` — malformed (caller falls through to the planner)
-fn parse_at_spec(toks: &[(usize, &str)], at_idx: usize) -> AtSpec {
+fn parse_at_spec(toks: &[(usize, &str)], at_idx: usize, before: bool) -> AtSpec {
     let (_, at_tok) = toks[at_idx];
     let mut k = at_idx + 1;
     let mut spec: Vec<String> = Vec::new();
-    if at_tok.len() > 2 && at_tok[..2].eq_ignore_ascii_case("at") && at_tok[2..].starts_with('(') {
-        // `AT(TIMESTAMP` — the remainder is the first spec token.
-        let rest = &at_tok[3..];
+    if let Some((_, rest)) = strip_kw_paren(at_tok) {
         if !rest.is_empty() {
             spec.push(rest.to_string());
         }
@@ -243,7 +259,11 @@ fn parse_at_spec(toks: &[(usize, &str)], at_idx: usize) -> AtSpec {
                             format!("unparseable TIMESTAMP '{value}' (expected e.g. '2026-10-14 10:00:00')"),
                         )));
                     };
-                    TimePoint::TimestampMs(ms)
+                    if before {
+                        TimePoint::BeforeTimestampMs(ms)
+                    } else {
+                        TimePoint::TimestampMs(ms)
+                    }
                 }
                 "OFFSET" => {
                     let Ok(secs) = value.trim().parse::<i64>() else {
@@ -254,10 +274,26 @@ fn parse_at_spec(toks: &[(usize, &str)], at_idx: usize) -> AtSpec {
                     };
                     TimePoint::OffsetSecs(secs)
                 }
+                "STATEMENT" => {
+                    let id = value.trim().trim_matches('\'').to_string();
+                    if id.is_empty() {
+                        return Some(Err(external_error(
+                            "time travel",
+                            "STATEMENT requires a query id",
+                        )));
+                    }
+                    if before {
+                        TimePoint::StatementStart(id)
+                    } else {
+                        TimePoint::StatementEnd(id)
+                    }
+                }
                 other => {
                     return Some(Err(external_error(
                         "time travel",
-                        format!("unsupported AT() key '{other}' (v1 supports TIMESTAMP and OFFSET)"),
+                        format!(
+                            "unsupported AT() key '{other}' (supported: TIMESTAMP, OFFSET, STATEMENT)"
+                        ),
                     )));
                 }
             };
@@ -422,6 +458,52 @@ async fn as_of_provider(
     )))
 }
 
+/// Resolve `AT(STATEMENT => 'id')` / `BEFORE(STATEMENT => 'id')` to the
+/// referenced statement's completion / start time (M17.2.1). Statement time
+/// travel rides on persisted query history: under the `state-store-query`
+/// feature every query record carries its start/end timestamps.
+///
+/// # Errors
+/// When query persistence is not built in, the statement is unknown, or it
+/// has not completed yet.
+async fn statement_point_ms(session: &UserSession, id: &str, before: bool) -> Result<i64> {
+    #[cfg(feature = "state-store")]
+    {
+        let query = session
+            .state_store()
+            .get_query(id)
+            .await
+            .map_err(|e| {
+                external_error(
+                    "time travel",
+                    format!(
+                        "statement '{id}' not found in query history ({e}); \
+                         STATEMENT time travel needs the state-store-query feature and a completed statement"
+                    ),
+                )
+            })?;
+        if before {
+            Ok(query.start_time.timestamp_millis())
+        } else {
+            let Some(end) = query.end_time else {
+                return Err(external_error(
+                    "time travel",
+                    format!("statement '{id}' has not completed; AT(STATEMENT) needs a completed statement"),
+                ));
+            };
+            Ok(end.timestamp_millis())
+        }
+    }
+    #[cfg(not(feature = "state-store"))]
+    {
+        let _ = (session, id, before);
+        Err(external_error(
+            "time travel",
+            "STATEMENT time travel requires query persistence (build with state-store-query)",
+        ))
+    }
+}
+
 /// Pre-parse hook for `UserQuery::execute`: rewrites every
 /// `FROM|JOIN <ref> [AS <alias>] AT(...)` in place. No-op when the query has
 /// no time-travel predicates.
@@ -476,7 +558,15 @@ pub async fn rewrite(raw: &mut String, session: &UserSession) -> Result<()> {
                 ),
             ));
         }
-        let point_ms = p.point.resolve_ms();
+        let point_ms = match p.point {
+            TimePoint::TimestampMs(ms) => ms,
+            TimePoint::BeforeTimestampMs(ms) => before_ms(ms),
+            TimePoint::OffsetSecs(secs) => Utc::now().timestamp_millis() - secs * 1000,
+            TimePoint::StatementEnd(ref id) => statement_point_ms(session, id, false).await?,
+            TimePoint::StatementStart(ref id) => {
+                before_ms(statement_point_ms(session, id, true).await?)
+            }
+        };
         let Some(snapshot_id) = resolve_snapshot(&table.data.metadata, point_ms) else {
             return Err(external_error(
                 "time travel",
@@ -589,9 +679,30 @@ mod tests {
     }
 
     #[test]
+    fn statement_key_plans_now() {
+        // M17.2.1: STATEMENT resolves at rewrite() time, not plan() time.
+        let plans = planned("SELECT * FROM t1 AT(STATEMENT => 'abc') ");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].point,
+            TimePoint::StatementEnd("abc".to_string())
+        );
+        let plans = planned("SELECT * FROM t1 BEFORE(STATEMENT => 'abc')");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].point,
+            TimePoint::StatementStart("abc".to_string())
+        );
+        // BEFORE(TIMESTAMP) is strictly-before.
+        let plans = planned("SELECT * FROM t1 BEFORE(TIMESTAMP => '2026-10-14 10:00:00')");
+        assert_eq!(plans.len(), 1);
+        assert!(matches!(plans[0].point, TimePoint::BeforeTimestampMs(_)));
+    }
+
+    #[test]
     fn unsupported_key_is_bounded_error() {
-        let err = plan("SELECT * FROM t1 AT(STATEMENT => 'x')").unwrap_err();
-        assert!(err.to_string().contains("unsupported AT() key 'STATEMENT'"));
+        let err = plan("SELECT * FROM t1 AT(STREAM => 'x')").unwrap_err();
+        assert!(err.to_string().contains("unsupported AT() key 'STREAM'"));
     }
 
     #[test]

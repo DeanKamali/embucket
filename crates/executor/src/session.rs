@@ -498,6 +498,13 @@ impl UserSession {
         None
     }
 
+    /// Shared state store handle (statement-level time travel M17.2.1).
+    #[cfg(feature = "state-store")]
+    #[must_use]
+    pub fn state_store(&self) -> Arc<dyn StateStore> {
+        Arc::clone(&self.state_store)
+    }
+
     /// Ballista scheduler URL for the session's current warehouse, when the
     /// warehouse exposes a host-reachable scheduler port (design §6.3).
     /// `None` means the query runs locally.

@@ -253,8 +253,17 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
                 Some(AtSpec::Point(point)) => {
                     let point_ms = match point {
                         TimePoint::TimestampMs(ms) => *ms,
+                        TimePoint::BeforeTimestampMs(ms) => ms.saturating_sub(1),
                         TimePoint::OffsetSecs(secs) => {
                             chrono::Utc::now().timestamp_millis() - secs * 1000
+                        }
+                        // Statement-keyed clones resolve through query
+                        // history — v2 (M17.2.1 covers reads only).
+                        TimePoint::StatementEnd(_) | TimePoint::StatementStart(_) => {
+                            return Err(external_error(
+                                "clone",
+                                "AT(STATEMENT)/BEFORE(STATEMENT) clone is not supported yet (TIMESTAMP and OFFSET only)",
+                            ));
                         }
                     };
                     let table = metastore

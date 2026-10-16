@@ -461,12 +461,13 @@ async fn as_of_provider(
 /// Resolve `AT(STATEMENT => 'id')` / `BEFORE(STATEMENT => 'id')` to the
 /// referenced statement's completion / start time (M17.2.1). Statement time
 /// travel rides on persisted query history: under the `state-store-query`
-/// feature every query record carries its start/end timestamps.
+/// feature every query record carries its start/end timestamps. Also used by
+/// `clone_ddl` for as-of-statement clones (M17.2.2).
 ///
 /// # Errors
 /// When query persistence is not built in, the statement is unknown, or it
 /// has not completed yet.
-async fn statement_point_ms(session: &UserSession, id: &str, before: bool) -> Result<i64> {
+pub(crate) async fn statement_point_ms(session: &UserSession, id: &str, before: bool) -> Result<i64> {
     #[cfg(feature = "state-store")]
     {
         let query = session

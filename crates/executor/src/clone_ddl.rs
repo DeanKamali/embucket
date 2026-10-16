@@ -12,7 +12,10 @@
 //! v1 notes: names are case-folded through the session's ident normalizer
 //! (quote-style is not preserved in pre-parse); a `DATABASE` clone keeps the
 //! source's volume; every contained table is cloned against the source's
-//! current metadata at clone time (consistent-refs set).
+//! current metadata at clone time (consistent-refs set). M17.2.2 adds
+//! as-of clones (`AT(...)`/`BEFORE(...)`, TIMESTAMP/OFFSET/STATEMENT keys)
+//! for all three kinds — containers clone each contained table's state at
+//! the point (see `Metastore::clone_schema_as_of`).
 
 use crate::error::{self as ex_error, Error, Result};
 use crate::models::QueryResult;
@@ -38,7 +41,7 @@ pub enum CloneKind {
 pub enum AtSpec {
     /// Resolvable time point (TIMESTAMP/OFFSET).
     Point(TimePoint),
-    /// Well-formed but unsupported key (BEFORE, STATEMENT, …) — bounded
+    /// Well-formed but unsupported key — bounded
     /// error at execution time rather than a fall-through syntax error.
     Unsupported(String),
 }
@@ -52,7 +55,8 @@ pub struct CloneStatement {
     pub source: Vec<String>,
     pub if_not_exists: bool,
     pub or_replace: bool,
-    /// Trailing `AT(...)` time-travel spec (v1: TABLE clones only).
+    /// Trailing `AT(...)`/`BEFORE(...)` time-travel spec (M17.2.2: all clone
+    /// kinds; TIMESTAMP/OFFSET/STATEMENT keys).
     pub at: Option<AtSpec>,
 }
 
@@ -105,7 +109,7 @@ pub fn parse(raw: &str) -> Option<CloneStatement> {
     let source: Option<Vec<String>> = tok
         .get(i + 1)
         .map(|t| t.split('.').map(str::to_string).collect());
-    // Optional trailing time-travel spec: `AT(...)` / `BEFORE(...)`.
+    // Trailing `AT(...)`/`BEFORE(...)` spec: `AT(...)` / `BEFORE(...)`.
     let at = match tok.get(i + 2) {
         None => None,
         Some(t) if is_at_or_before(t) => Some(parse_at_tail(&tok[i + 2..])?),
@@ -140,15 +144,13 @@ fn is_at_or_before(tok: &str) -> bool {
 
 /// Parse the `AT(TIMESTAMP => '<ts>' | OFFSET => <secs>)` / `BEFORE(...)`
 /// tail following the source name. `None` = malformed → planner syntax error.
+/// M17.2.2: STATEMENT keys and BEFORE(TIMESTAMP/OFFSET) resolve at execution
+/// time (table, schema and database clones alike).
 fn parse_at_tail(t: &[&str]) -> Option<AtSpec> {
     let joined = t.join(" ");
-    if joined.eq_ignore_ascii_case("before")
-        || joined
-            .get(..7)
-            .is_some_and(|p| p.eq_ignore_ascii_case("before("))
-    {
-        return Some(AtSpec::Unsupported("BEFORE".to_string()));
-    }
+    let before = joined
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("before"));
     let open = joined.find('(')?;
     let close = joined.rfind(')')?;
     if !joined[close + 1..].trim().is_empty() {
@@ -159,10 +161,26 @@ fn parse_at_tail(t: &[&str]) -> Option<AtSpec> {
     let key = key.trim().to_ascii_uppercase();
     let value = value.trim().trim_matches('\'');
     match key.as_str() {
-        "TIMESTAMP" => Some(AtSpec::Point(TimePoint::TimestampMs(
-            parse_timestamp(value)?,
-        ))),
+        "TIMESTAMP" => {
+            let ms = parse_timestamp(value)?;
+            Some(AtSpec::Point(if before {
+                TimePoint::BeforeTimestampMs(ms)
+            } else {
+                TimePoint::TimestampMs(ms)
+            }))
+        }
         "OFFSET" => Some(AtSpec::Point(TimePoint::OffsetSecs(value.parse().ok()?))),
+        "STATEMENT" => {
+            let id = value.trim().to_string();
+            if id.is_empty() {
+                return Some(AtSpec::Unsupported(key));
+            }
+            Some(AtSpec::Point(if before {
+                TimePoint::StatementStart(id)
+            } else {
+                TimePoint::StatementEnd(id)
+            }))
+        }
         other => Some(AtSpec::Unsupported(other.to_string())),
     }
 }
@@ -211,13 +229,17 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
     let target = resolve_name(&db, &schema, &norm(&stmt.target), stmt.kind)?;
     let source = resolve_name(&db, &schema, &norm(&stmt.source), stmt.kind)?;
 
-    // AT(...) is a TABLE-only feature in v1 (M9.4).
-    if stmt.at.is_some() && stmt.kind != CloneKind::Table {
-        return Err(external_error(
-            "clone",
-            "CLONE ... AT() is only supported for TABLE clones in v1",
-        ));
-    }
+    // Resolve the time point to epoch-ms (statement keys through query history).
+    let point = match &stmt.at {
+        Some(AtSpec::Unsupported(key)) => {
+            return Err(external_error(
+                "clone",
+                format!("AT({key}) is not supported (TIMESTAMP, OFFSET and STATEMENT are)"),
+            ));
+        }
+        Some(AtSpec::Point(point)) => Some(point_ms(session, point).await?),
+        None => None,
+    };
 
     match stmt.kind {
         CloneKind::Table => {
@@ -243,29 +265,8 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
                     .await
                     .map_err(|e| external_error("clone", e))?;
             }
-            match &stmt.at {
-                Some(AtSpec::Unsupported(key)) => {
-                    return Err(external_error(
-                        "clone",
-                        format!("AT({key}) is not supported in v1 (TIMESTAMP and OFFSET only)"),
-                    ));
-                }
-                Some(AtSpec::Point(point)) => {
-                    let point_ms = match point {
-                        TimePoint::TimestampMs(ms) => *ms,
-                        TimePoint::BeforeTimestampMs(ms) => ms.saturating_sub(1),
-                        TimePoint::OffsetSecs(secs) => {
-                            chrono::Utc::now().timestamp_millis() - secs * 1000
-                        }
-                        // Statement-keyed clones resolve through query
-                        // history — v2 (M17.2.1 covers reads only).
-                        TimePoint::StatementEnd(_) | TimePoint::StatementStart(_) => {
-                            return Err(external_error(
-                                "clone",
-                                "AT(STATEMENT)/BEFORE(STATEMENT) clone is not supported yet (TIMESTAMP and OFFSET only)",
-                            ));
-                        }
-                    };
+            match point {
+                Some(point_ms) => {
                     let table = metastore
                         .get_table(&from)
                         .await
@@ -331,10 +332,23 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
                     .await
                     .map_err(|e| external_error("clone", e))?;
             }
-            metastore
-                .clone_schema(&from, &to)
-                .await
-                .map_err(|e| external_error("clone", e))?;
+            match point {
+                // As-of container clone (M17.2.2): every contained table's
+                // state at the point (tables created after / dropped before
+                // it are excluded).
+                Some(point_ms) => {
+                    metastore
+                        .clone_schema_as_of(&from, &to, point_ms)
+                        .await
+                        .map_err(|e| external_error("clone", e))?;
+                }
+                None => {
+                    metastore
+                        .clone_schema(&from, &to)
+                        .await
+                        .map_err(|e| external_error("clone", e))?;
+                }
+            }
         }
         CloneKind::Database => {
             let to = one_part(&target, "database")?;
@@ -360,10 +374,20 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
                     .await
                     .map_err(|e| external_error("clone", e))?;
             }
-            metastore
-                .clone_database(&from, &to)
-                .await
-                .map_err(|e| external_error("clone", e))?;
+            match point {
+                Some(point_ms) => {
+                    metastore
+                        .clone_database_as_of(&from, &to, point_ms)
+                        .await
+                        .map_err(|e| external_error("clone", e))?;
+                }
+                None => {
+                    metastore
+                        .clone_database(&from, &to)
+                        .await
+                        .map_err(|e| external_error("clone", e))?;
+                }
+            }
             // Make the new database queryable in this session's catalog
             // registry (upserts every metastore database, incl. the clone).
             let catalog_list: Arc<dyn datafusion::catalog::CatalogProviderList> =
@@ -376,6 +400,25 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
         }
     }
     status_row()
+}
+
+/// Resolve a clone's time point to epoch-ms. Statement keys resolve through
+/// the persisted query history (M17.2.1); BEFORE variants are strictly-before
+/// (1 ms subtraction), mirroring read-side time travel.
+async fn point_ms(session: &UserSession, point: &TimePoint) -> Result<i64> {
+    Ok(match point {
+        TimePoint::TimestampMs(ms) => *ms,
+        TimePoint::BeforeTimestampMs(ms) => ms.saturating_sub(1),
+        TimePoint::OffsetSecs(secs) => chrono::Utc::now().timestamp_millis() - secs * 1000,
+        TimePoint::StatementEnd(id) => {
+            crate::time_travel::statement_point_ms(session, id, false).await?
+        }
+        TimePoint::StatementStart(id) => {
+            crate::time_travel::statement_point_ms(session, id, true)
+                .await?
+                .saturating_sub(1)
+        }
+    })
 }
 
 /// Resolve possibly-qualified name parts against the session context.
@@ -529,13 +572,36 @@ mod tests {
         assert_eq!(s.source, vec!["d", "s", "t1"]);
         assert_eq!(s.at, Some(AtSpec::Point(TimePoint::OffsetSecs(60))));
         // Unsupported keys are bounded, not fall-through.
-        let s = parsed("CREATE TABLE t2 CLONE t1 AT(STATEMENT => 'x')");
+        let s = parsed("CREATE TABLE t2 CLONE t1 AT(STREAM => 'x')");
         assert_eq!(
             s.at,
-            Some(AtSpec::Unsupported("STATEMENT".to_string()))
+            Some(AtSpec::Unsupported("STREAM".to_string()))
         );
-        let s = parsed("CREATE TABLE t2 CLONE t1 BEFORE(STATEMENT => 'x')");
-        assert_eq!(s.at, Some(AtSpec::Unsupported("BEFORE".to_string())));
+        // M17.2.2: STATEMENT keys and BEFORE(TIMESTAMP) parse to points.
+        let s = parsed("CREATE TABLE t2 CLONE t1 AT(STATEMENT => 'abc')");
+        assert_eq!(
+            s.at,
+            Some(AtSpec::Point(TimePoint::StatementEnd("abc".to_string())))
+        );
+        let s = parsed("CREATE TABLE t2 CLONE t1 BEFORE(STATEMENT => 'abc')");
+        assert_eq!(
+            s.at,
+            Some(AtSpec::Point(TimePoint::StatementStart(
+                "abc".to_string()
+            )))
+        );
+        let s = parsed("CREATE TABLE t2 CLONE t1 BEFORE(TIMESTAMP => '2026-10-14 10:00:00')");
+        assert!(matches!(s.at, Some(AtSpec::Point(TimePoint::BeforeTimestampMs(_)))));
+        // As-of container clones parse (M17.2.2).
+        let s = parsed("CREATE SCHEMA s2 CLONE s1 AT(OFFSET => 60)");
+        assert_eq!(s.kind, CloneKind::Schema);
+        assert!(matches!(s.at, Some(AtSpec::Point(TimePoint::OffsetSecs(60)))));
+        let s = parsed("CREATE DATABASE db2 CLONE db1 AT(STATEMENT => 'abc')");
+        assert_eq!(s.kind, CloneKind::Database);
+        assert!(matches!(
+            s.at,
+            Some(AtSpec::Point(TimePoint::StatementEnd(_)))
+        ));
         // No AT → None.
         let s = parsed("CREATE TABLE t2 CLONE t1");
         assert_eq!(s.at, None);

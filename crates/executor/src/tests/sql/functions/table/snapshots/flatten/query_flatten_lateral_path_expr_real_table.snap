@@ -1,0 +1,16 @@
+---
+source: crates/executor/src/tests/sql/functions/table/flatten.rs
+description: "\"SELECT v, f.value FROM m163_ft, LATERAL FLATTEN(INPUT => v:arr) f\""
+info: "Setup queries: CREATE TABLE m163_ft AS SELECT PARSE_JSON('{\"arr\": [10, 20, 30]}') AS v"
+---
+Ok(
+    [
+        "+--------------------+-------+",
+        "| v                  | value |",
+        "+--------------------+-------+",
+        "| {\"arr\":[10,20,30]} | 10    |",
+        "| {\"arr\":[10,20,30]} | 20    |",
+        "| {\"arr\":[10,20,30]} | 30    |",
+        "+--------------------+-------+",
+    ],
+)

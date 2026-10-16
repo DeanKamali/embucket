@@ -387,8 +387,14 @@ async fn evaluate_expr_or_plan(
                 &exec_props,
                 &datafusion_expr::physical_planning_context::PhysicalPlanningContext::default(),
             )?;
-            let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
-            let result = phys_expr.evaluate(&batch)?;
+            // Evaluate against a one-row batch (not an empty one): UDFs that
+            // return array-typed results sized by the input batch would
+            // otherwise yield an empty array and FLATTEN would produce no rows.
+            let one_row = RecordBatch::try_from_iter(vec![(
+                "_dummy",
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+            )])?;
+            let result = phys_expr.evaluate(&one_row)?;
 
             let array = match result {
                 ColumnarValue::Scalar(scalar) => scalar.to_array()?,

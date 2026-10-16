@@ -51,6 +51,10 @@ use std::ops::ControlFlow;
 pub struct TableFuncInlineCte {
     ctes: HashMap<String, Query>,
     current_from_tables: Vec<TableFactor>,
+    // Stack of from-tables per query level, restored in `post_visit_query` so
+    // a table factor in an outer query sees its own level's FROM tables
+    // (sqlparser visits `WITH` CTEs before the query body).
+    from_tables_stack: Vec<Vec<TableFactor>>,
 }
 
 impl VisitorMut for TableFuncInlineCte {
@@ -60,10 +64,19 @@ impl VisitorMut for TableFuncInlineCte {
         // Recursively collect all CTEs
         self.collect_ctes_from_query(query);
 
+        self.from_tables_stack
+            .push(std::mem::take(&mut self.current_from_tables));
         if let SetExpr::Select(select) = &*query.body {
             self.current_from_tables = select.from.iter().map(|f| f.relation.clone()).collect();
         } else {
             self.current_from_tables.clear();
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<()> {
+        if let Some(parent) = self.from_tables_stack.pop() {
+            self.current_from_tables = parent;
         }
         ControlFlow::Continue(())
     }
@@ -198,6 +211,13 @@ impl TableFuncInlineCte {
                     other => other,
                 };
                 Expr::Function(func)
+            }
+            // `v:arr` is still a JSON access at this stage (the json/variant
+            // visitors run later); recurse into its base value so a correlated
+            // column inside it gets inlined as well.
+            Expr::JsonAccess { value, path } => {
+                let value = Box::new(self.replace_expr(*value));
+                Expr::JsonAccess { value, path }
             }
             Expr::Identifier(ident) => {
                 let column = &ident.value;

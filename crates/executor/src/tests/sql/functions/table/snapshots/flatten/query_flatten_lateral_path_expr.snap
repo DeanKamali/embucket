@@ -1,0 +1,15 @@
+---
+source: crates/executor/src/tests/sql/functions/table/flatten.rs
+description: "r#\"WITH base AS (SELECT PARSE_JSON('{\"arr\": [10, 20, 30]}') AS v)\n    SELECT v, f.value FROM base, LATERAL FLATTEN(INPUT => v:arr) f;\"#"
+---
+Ok(
+    [
+        "+--------------------+-------+",
+        "| v                  | value |",
+        "+--------------------+-------+",
+        "| {\"arr\":[10,20,30]} | 10    |",
+        "| {\"arr\":[10,20,30]} | 20    |",
+        "| {\"arr\":[10,20,30]} | 30    |",
+        "+--------------------+-------+",
+    ],
+)

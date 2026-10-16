@@ -1,0 +1,17 @@
+---
+source: crates/executor/src/tests/sql/functions/table/flatten.rs
+description: "r#\"WITH base AS (SELECT '{\"arr\": [10, 20, 30]}' AS v)\n    SELECT v, f.value FROM base, LATERAL FLATTEN(INPUT => upper(v)) f;\"#"
+---
+Ok(
+    [
+        "+-----------------------+-------+",
+        "| v                     | value |",
+        "+-----------------------+-------+",
+        "| {\"arr\": [10, 20, 30]} | [     |",
+        "|                       |   10, |",
+        "|                       |   20, |",
+        "|                       |   30  |",
+        "|                       | ]     |",
+        "+-----------------------+-------+",
+    ],
+)

@@ -69,3 +69,28 @@ test_query!(
           ('{"name":  {"first": "Jane", "last": "Doe"}}') v;"#],
     snapshot_path = "flatten"
 );
+
+test_query!(
+    flatten_join_upper_expr,
+    "SELECT column1, f.* FROM json_tbl, LATERAL FLATTEN(INPUT => upper(column1)) f",
+    setup_queries = [r#"CREATE TABLE json_tbl AS  SELECT * FROM values
+          ('{"name":  {"first": "John", "last": "Smith"}}') v;"#],
+    snapshot_path = "flatten"
+);
+test_query!(
+    flatten_join_qualified_variant_element,
+    "SELECT column1, f.* FROM json_tbl, LATERAL FLATTEN(INPUT => variant_element(json_tbl.column1, '$.name', true)) f",
+    setup_queries = [r#"CREATE TABLE json_tbl AS  SELECT * FROM values
+          ('{"name":  {"first": "John", "last": "Smith"}}') v;"#],
+    snapshot_path = "flatten"
+);
+// M16.3 regression: LATERAL FLATTEN with an expression (not a bare column)
+// referencing the outer table — requires correlated args to survive planning.
+test_query!(
+    flatten_join_variant_element_expr,
+    "SELECT column1, f.* FROM json_tbl, LATERAL FLATTEN(INPUT => variant_element(column1, '$.name', true)) f",
+    setup_queries = [r#"CREATE TABLE json_tbl AS  SELECT * FROM values
+          ('{"name":  {"first": "John", "last": "Smith"}}'),
+          ('{"name":  {"first": "Jane", "last": "Doe"}}') v;"#],
+    snapshot_path = "flatten"
+);

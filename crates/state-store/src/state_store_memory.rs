@@ -20,6 +20,8 @@ pub struct InMemoryStateStore {
     queries_by_request_id: Arc<RwLock<HashMap<String, String>>>,
     warehouses: Arc<RwLock<HashMap<String, WarehouseRecord>>>,
     metering: Arc<RwLock<HashMap<String, WarehouseMeteringRecord>>>,
+    /// Generic KV for `put_raw`/`list_raw` (catalog journal, …).
+    raw_kv: Arc<RwLock<HashMap<String, HashMap<String, Vec<u8>>>>>,
 }
 
 impl InMemoryStateStore {
@@ -163,6 +165,38 @@ impl StateStore for InMemoryStateStore {
             .collect();
         records.sort_by_key(|record| (record.start_time, record.warehouse.clone()));
         Ok(records)
+    }
+
+    async fn put_raw(&self, domain: &str, key: &str, value: Vec<u8>) -> Result<()> {
+        self.raw_kv
+            .write()
+            .await
+            .entry(domain.to_string())
+            .or_default()
+            .insert(key.to_string(), value);
+        Ok(())
+    }
+
+    async fn delete_raw(&self, domain: &str, key: &str) -> Result<()> {
+        if let Some(bucket) = self.raw_kv.write().await.get_mut(domain) {
+            bucket.remove(key);
+        }
+        Ok(())
+    }
+
+    async fn list_raw(&self, domain: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(self
+            .raw_kv
+            .read()
+            .await
+            .get(domain)
+            .map(|bucket| {
+                bucket
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 

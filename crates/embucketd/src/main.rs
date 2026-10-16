@@ -2,6 +2,8 @@
 // until following issue will be fixed https://github.com/juhaku/utoipa/issues/1420
 #![allow(clippy::needless_for_each)]
 pub(crate) mod cli;
+#[cfg(feature = "state-store")]
+pub(crate) mod catalog_journal;
 pub(crate) mod helpers;
 pub(crate) mod layers;
 
@@ -18,6 +20,7 @@ use axum::{
     routing::{get, post},
 };
 use build_info::BuildInfo;
+use catalog_metastore::InMemoryMetastore;
 use catalog_metastore::metastore_settings_config::MetastoreSettingsConfig;
 use clap::Parser;
 use dotenv::dotenv;
@@ -91,6 +94,31 @@ fn main() {
     });
 }
 
+/// Durable metastore construction (design §23.0, M17.0): when the PG state
+/// store is available, every catalog mutation is journalled through it and
+/// the catalog state is replayed on startup, so volumes / databases /
+/// tables survive a crash or restart. Without the feature the metastore
+/// stays ephemeral in-memory.
+#[cfg(feature = "state-store")]
+async fn build_metastore(
+    settings: MetastoreSettingsConfig,
+) -> Result<Arc<InMemoryMetastore>, Box<dyn std::error::Error + Send + Sync>> {
+    let store: Arc<dyn state_store::StateStore> =
+        Arc::new(state_store::PostgresStateStore::new_from_env().await?);
+    let journal = Arc::new(catalog_journal::StateStoreJournal::new(store));
+    let metastore = InMemoryMetastore::new_with_journal(journal, settings).await?;
+    tracing::info!("Metastore built with write-through catalog journal (replayed)");
+    Ok(Arc::new(metastore))
+}
+
+#[cfg(not(feature = "state-store"))]
+async fn build_metastore(
+    settings: MetastoreSettingsConfig,
+) -> Result<Arc<InMemoryMetastore>, Box<dyn std::error::Error + Send + Sync>> {
+    tracing::info!("Metastore built without journal (state-store feature disabled)");
+    Ok(Arc::new(InMemoryMetastore::new().with_settings_config(settings)))
+}
+
 #[allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -160,15 +188,17 @@ async fn async_main(
         .with_object_store_timeout(opts.object_store_timeout_secs)
         .with_object_store_connect_timeout(opts.object_store_connect_timeout_secs);
 
+    let metastore = build_metastore(metatore_settings_config).await?;
+
     let metastore_cfg = if let Some(config_path) = &opts.metastore_config {
         MetastoreConfig::ConfigPath(config_path.clone())
     } else {
         MetastoreConfig::Env
     };
-    let core_state = CoreState::new(
+    let core_state = CoreState::with_metastore(
+        metastore,
         execution_cfg,
         snowflake_rest_cfg,
-        metatore_settings_config,
         metastore_cfg,
     )
     .await

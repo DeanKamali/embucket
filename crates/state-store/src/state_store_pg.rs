@@ -96,7 +96,13 @@ impl PostgresStateStore {
                 ON state_queries (session_id);
             CREATE INDEX IF NOT EXISTS state_queries_request_id
                 ON state_queries (request_id)
-                WHERE request_id IS NOT NULL;",
+                WHERE request_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS state_catalog (
+                domain TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value BYTEA NOT NULL,
+                PRIMARY KEY (domain, key)
+            );",
         )
         .await
         .context(PgSnafu)?;
@@ -332,6 +338,49 @@ impl StateStore for PostgresStateStore {
             .collect::<Result<_>>()?;
         records.sort_by_key(|record| (record.start_time, record.warehouse.clone()));
         Ok(records)
+    }
+
+    async fn put_raw(&self, domain: &str, key: &str, value: Vec<u8>) -> Result<()> {
+        let client = self.client().await?;
+        client
+            .execute(
+                "INSERT INTO state_catalog (domain, key, value) VALUES ($1, $2, $3)
+                 ON CONFLICT (domain, key) DO UPDATE SET value = EXCLUDED.value",
+                &[&domain, &key, &value],
+            )
+            .await
+            .context(PgSnafu)?;
+        Ok(())
+    }
+
+    async fn delete_raw(&self, domain: &str, key: &str) -> Result<()> {
+        let client = self.client().await?;
+        client
+            .execute(
+                "DELETE FROM state_catalog WHERE domain = $1 AND key = $2",
+                &[&domain, &key],
+            )
+            .await
+            .context(PgSnafu)?;
+        Ok(())
+    }
+
+    async fn list_raw(&self, domain: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT key, value FROM state_catalog WHERE domain = $1",
+                &[&domain],
+            )
+            .await
+            .context(PgSnafu)?;
+        rows.into_iter()
+            .map(|row| {
+                let key: String = row.try_get("key").context(PgSnafu)?;
+                let value: Vec<u8> = row.try_get("value").context(PgSnafu)?;
+                Ok((key, value))
+            })
+            .collect()
     }
 }
 

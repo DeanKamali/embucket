@@ -34,6 +34,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Catalog journal: {message}"))]
+    Journal {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Metastore object of type {type_name} with name {name} already exists"))]
     ObjectAlreadyExists {
         type_name: String,

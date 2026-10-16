@@ -1,5 +1,6 @@
 use crate::server::error::CreateExecutorSnafu;
 use crate::server::error::MetastoreConfigSnafu;
+use crate::server::error::MetastoreStateSnafu;
 use crate::server::error::Result;
 use crate::server::server_models::RestApiConfig;
 use api_snowflake_rest_sessions::session::SessionStore;
@@ -38,6 +39,19 @@ impl CoreState {
         metastore_bootstrap_config: MetastoreConfig,
     ) -> Result<Self> {
         let metastore = create_metastore(metastore_settings_config);
+        Self::with_metastore(metastore, execution_cfg, rest_api_config, metastore_bootstrap_config)
+            .await
+    }
+
+    /// Build `CoreState` around a pre-built metastore (design §23.0, M17.0):
+    /// embucketd constructs the durable (journalled) metastore itself, since
+    /// it owns the state-store backend.
+    pub async fn with_metastore(
+        metastore: Arc<InMemoryMetastore>,
+        execution_cfg: ExecutionConfig,
+        rest_api_config: RestApiConfig,
+        metastore_bootstrap_config: MetastoreConfig,
+    ) -> Result<Self> {
         apply_metastore_bootstrap_config(metastore.clone(), metastore_bootstrap_config).await?;
         let executor = create_executor(
             metastore.clone(),
@@ -76,6 +90,14 @@ async fn apply_metastore_bootstrap_config(
     metastore: Arc<InMemoryMetastore>,
     metastore_bootstrap_config: MetastoreConfig,
 ) -> Result<()> {
+    // Durability (design §23.0, M17.0): if the journal replay already
+    // restored catalog objects, skip env/config seeding so a restart is a
+    // true no-op instead of re-creating (and conflicting with) persisted
+    // records.
+    if !metastore.is_empty().await.context(MetastoreStateSnafu)? {
+        tracing::info!("Metastore restored from journal; skipping bootstrap config");
+        return Ok(());
+    }
     match metastore_bootstrap_config {
         MetastoreConfig::Env => {
             tracing::info!("Bootstrapping metastore from environment");

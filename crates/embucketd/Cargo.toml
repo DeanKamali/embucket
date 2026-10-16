@@ -6,9 +6,12 @@ license-file.workspace = true
 
 [dependencies]
 queries = { workspace = true, optional = true }
+async-trait = { workspace = true }
 avalanche-account = { path = "../avalanche-account" }
+bytes = { workspace = true }
 executor = { path = "../executor" }
 catalog-metastore = { path = "../catalog-metastore" }
+state-store = { path = "../state-store", optional = true }
 api-snowflake-rest = { path = "../api-snowflake-rest" }
 api-snowflake-rest-sessions = { path = "../api-snowflake-rest-sessions" }
 build-info = { path = "../build-info" }
@@ -52,7 +55,7 @@ queries = ["dep:queries"]
 retry-disable = ["api-snowflake-rest/retry-disable"]
 rest-catalog = ["executor/rest-catalog"]
 dedicated-executor = ["executor/dedicated-executor"]
-state-store = ["executor/state-store"]
+state-store = ["executor/state-store", "dep:state-store"]
 state-store-query = ["executor/state-store-query"]
 state-store-query-test = ["executor/state-store-query-test"]
 

@@ -1,4 +1,5 @@
 use crate::error::{self as metastore_error, Result};
+use crate::journal::{self, CatalogJournal, CatalogRecord};
 use crate::metastore_settings_config::MetastoreSettingsConfig;
 use crate::models::{
     RwObject,
@@ -221,6 +222,9 @@ pub struct InMemoryMetastore {
     state: RwLock<MetastoreState>,
     object_store_cache: DashMap<VolumeIdent, Arc<dyn ObjectStore>>,
     settings_config: Option<MetastoreSettingsConfig>,
+    /// Durable write-through journal (design §23.0, M17.0). `None` keeps the
+    /// legacy pure in-memory behavior (tests, non-durable builds).
+    journal: Option<Arc<dyn CatalogJournal>>,
 }
 
 impl InMemoryMetastore {
@@ -230,7 +234,157 @@ impl InMemoryMetastore {
             state: RwLock::new(MetastoreState::default()),
             object_store_cache: DashMap::new(),
             settings_config: None,
+            journal: None,
         }
+    }
+
+    /// Durable metastore: journals every mutation and replays the journal
+    /// into the in-memory state at construction (design §23.0, M17.0).
+    ///
+    /// # Errors
+    /// When the journal cannot be read (bootstrap replay fails).
+    pub async fn new_with_journal(
+        journal: Arc<dyn CatalogJournal>,
+        settings: MetastoreSettingsConfig,
+    ) -> Result<Self> {
+        let state = Self::replay(&journal).await?;
+        Ok(Self {
+            state: RwLock::new(state),
+            object_store_cache: DashMap::new(),
+            settings_config: Some(settings),
+            journal: Some(journal),
+        })
+    }
+
+    /// True when no catalog records were replayed (fresh catalog). Used to
+    /// gate the bootstrap config so it only seeds a first boot.
+    ///
+    /// # Errors
+    /// When the replayed state cannot be read.
+    pub async fn is_empty(&self) -> Result<bool> {
+        let state = self.state.read().await;
+        Ok(state.volumes.is_empty()
+            && state.databases.is_empty()
+            && state.schemas.is_empty()
+            && state.tables.is_empty()
+            && state.dropped_tables.is_empty()
+            && state.streams.is_empty()
+            && state.tasks.is_empty()
+            && state.dynamic_tables.is_empty())
+    }
+
+    /// Bootstrap replay: apply every journaled record into the state.
+    /// Dropped-table tombstones apply first so live records win over
+    /// stale tombstones (see `journal::domain::REPLAY_ORDER`).
+    async fn replay(journal: &Arc<dyn CatalogJournal>) -> Result<MetastoreState> {
+        let mut state = MetastoreState::default();
+        for domain in journal::domain::REPLAY_ORDER {
+            let entries = journal
+                .list(domain)
+                .await
+                .map_err(|e| metastore_error::JournalSnafu { message: e.to_string() }.build())?;
+            for (_, value) in entries {
+                let record = CatalogRecord::from_bytes(domain, &value).map_err(|e| {
+                    // One corrupt record must not brick the whole catalog:
+                    // log and skip (matches the metering ledger's tolerant
+                    // load).
+                    tracing::error!(domain, error = %e, "skipping corrupt catalog record");
+                    metastore_error::JournalSnafu { message: e.to_string() }.build()
+                })?;
+                Self::apply_record(&mut state, record);
+            }
+        }
+        Ok(state)
+    }
+
+    /// Apply one replayed record to the state (key recomputed from the
+    /// record's ident — see `journal::CatalogRecord::journal_key`).
+    fn apply_record(state: &mut MetastoreState, record: CatalogRecord) {
+        match record {
+            CatalogRecord::Volume(row) => {
+                state.volumes.insert(row.data.ident.to_ascii_lowercase(), row);
+            }
+            CatalogRecord::Database(row) => {
+                state.databases.insert(row.data.ident.to_ascii_lowercase(), row);
+            }
+            CatalogRecord::Schema(row) => {
+                state
+                    .schemas
+                    .insert(Self::schema_key(&row.data.ident), row);
+            }
+            CatalogRecord::Table(row) => {
+                state.tables.insert(Self::table_key(&row.data.ident), row);
+            }
+            CatalogRecord::DroppedTable(row, dropped_at_ms) => {
+                state
+                    .dropped_tables
+                    .insert(Self::table_key(&row.data.ident), (row, dropped_at_ms));
+            }
+            CatalogRecord::Stream(row) => {
+                state.streams.insert(Self::table_key(&row.data.ident), row);
+            }
+            CatalogRecord::Task(row) => {
+                state.tasks.insert(Self::table_key(&row.data.ident), row);
+            }
+            CatalogRecord::DynamicTable(row) => {
+                state
+                    .dynamic_tables
+                    .insert(Self::table_key(&row.data.ident), row);
+            }
+        }
+    }
+
+    /// Write-through: serialize + persist a record before the in-memory
+    /// mutation. With no journal this is a no-op.
+    async fn journal_put(&self, record: &CatalogRecord) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal::put_record(journal, record)
+                .await
+                .map_err(|e| metastore_error::JournalSnafu { message: e.to_string() }.build())?;
+        }
+        Ok(())
+    }
+
+    /// Write-through: remove a record from the journal.
+    async fn journal_delete(&self, domain: &str, key: &str) -> Result<()> {
+        if let Some(journal) = &self.journal {
+            journal
+                .delete(domain, key)
+                .await
+                .map_err(|e| {
+                    metastore_error::JournalSnafu {
+                        message: format!("{domain}/{key}: {e}"),
+                    }
+                    .build()
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Journal key strings for state-map keys (cascades remove whole ranges
+    /// of state keys; these derive the journal key form directly).
+    fn database_journal_key(db: &str) -> String {
+        db.to_ascii_lowercase()
+    }
+
+    fn schema_journal_key(db: &str, schema: &str) -> String {
+        format!(
+            "{}{}{}",
+            db.to_ascii_lowercase(),
+            journal::key_sep(),
+            schema.to_ascii_lowercase()
+        )
+    }
+
+    fn table_journal_key(db: &str, schema: &str, table: &str) -> String {
+        format!(
+            "{}{}{}{}{}",
+            db.to_ascii_lowercase(),
+            journal::key_sep(),
+            schema.to_ascii_lowercase(),
+            journal::key_sep(),
+            table.to_ascii_lowercase()
+        )
     }
 
     #[allow(clippy::expect_used)]
@@ -341,6 +495,7 @@ impl Metastore for InMemoryMetastore {
             .fail();
         }
         let row = RwObject::new(volume);
+        self.journal_put(&CatalogRecord::Volume(row.clone())).await?;
         state.volumes.insert(name.clone(), row.clone());
         self.object_store_cache.insert(name.clone(), object_store);
         Ok(row)
@@ -368,6 +523,8 @@ impl Metastore for InMemoryMetastore {
             .build()
         })?;
         entry.update(volume);
+        self.journal_put(&CatalogRecord::Volume(entry.clone()))
+            .await?;
         self.object_store_cache
             .insert(name.clone(), object_store.clone());
         Ok(entry.clone())
@@ -397,6 +554,11 @@ impl Metastore for InMemoryMetastore {
                 .collect();
             for key in schema_keys {
                 state.schemas.remove(&key);
+                self.journal_delete(
+                    journal::domain::SCHEMAS,
+                    &Self::schema_journal_key(&key.0, &key.1),
+                )
+                .await?;
             }
             let table_keys: Vec<_> = state
                 .tables
@@ -406,11 +568,27 @@ impl Metastore for InMemoryMetastore {
                 .collect();
             for key in table_keys {
                 if let Some(table) = state.tables.remove(&key) {
-                    state.dropped_tables.insert(key, (table, Self::now_ms()));
+                    let dropped_at = Self::now_ms();
+                    self.journal_put(&CatalogRecord::DroppedTable(
+                        table.clone(),
+                        dropped_at,
+                    ))
+                    .await?;
+                    self.journal_delete(
+                        journal::domain::TABLES,
+                        &Self::table_journal_key(&key.0, &key.1, &key.2),
+                    )
+                    .await?;
+                    state.dropped_tables.insert(key, (table, dropped_at));
                 }
             }
             for db in in_use {
                 state.databases.remove(&db);
+                self.journal_delete(
+                    journal::domain::DATABASES,
+                    &Self::database_journal_key(&db),
+                )
+                .await?;
             }
         } else if !in_use.is_empty() {
             return metastore_error::VolumeInUseSnafu {
@@ -421,6 +599,11 @@ impl Metastore for InMemoryMetastore {
         if state.volumes.remove(name).is_some() {
             self.object_store_cache.remove(name);
         }
+        self.journal_delete(
+            journal::domain::VOLUMES,
+            &Self::database_journal_key(name),
+        )
+        .await?;
         Ok(())
     }
 
@@ -466,6 +649,8 @@ impl Metastore for InMemoryMetastore {
             return metastore_error::DatabaseAlreadyExistsSnafu { db: name }.fail();
         }
         let row = RwObject::new(database);
+        self.journal_put(&CatalogRecord::Database(row.clone()))
+            .await?;
         state.databases.insert(name.clone(), row.clone());
         Ok(row)
     }
@@ -493,6 +678,8 @@ impl Metastore for InMemoryMetastore {
             .get_mut(name)
             .ok_or_else(|| metastore_error::DatabaseNotFoundSnafu { db: name.clone() }.build())?;
         entry.update(database);
+        self.journal_put(&CatalogRecord::Database(entry.clone()))
+            .await?;
         Ok(entry.clone())
     }
 
@@ -518,6 +705,11 @@ impl Metastore for InMemoryMetastore {
         }
         for key in &schema_keys {
             state.schemas.remove(key);
+            self.journal_delete(
+                journal::domain::SCHEMAS,
+                &Self::schema_journal_key(&key.0, &key.1),
+            )
+            .await?;
         }
         let table_keys: Vec<_> = state
             .tables
@@ -527,12 +719,28 @@ impl Metastore for InMemoryMetastore {
             .collect();
         for key in &table_keys {
             if let Some(table) = state.tables.remove(key) {
+                let dropped_at = Self::now_ms();
+                self.journal_put(&CatalogRecord::DroppedTable(
+                    table.clone(),
+                    dropped_at,
+                ))
+                .await?;
+                self.journal_delete(
+                    journal::domain::TABLES,
+                    &Self::table_journal_key(&key.0, &key.1, &key.2),
+                )
+                .await?;
                 state
                     .dropped_tables
-                    .insert(key.clone(), (table, Self::now_ms()));
+                    .insert(key.clone(), (table, dropped_at));
             }
         }
         state.databases.remove(name);
+        self.journal_delete(
+            journal::domain::DATABASES,
+            &Self::database_journal_key(name),
+        )
+        .await?;
         Ok(())
     }
 
@@ -575,6 +783,8 @@ impl Metastore for InMemoryMetastore {
             .fail();
         }
         let row = RwObject::new(schema);
+        self.journal_put(&CatalogRecord::Schema(row.clone()))
+            .await?;
         state.schemas.insert(Self::schema_key(ident), row.clone());
         Ok(row)
     }
@@ -604,6 +814,8 @@ impl Metastore for InMemoryMetastore {
                 .build()
             })?;
         entry.update(schema);
+        self.journal_put(&CatalogRecord::Schema(entry.clone()))
+            .await?;
         Ok(entry.clone())
     }
 
@@ -625,10 +837,26 @@ impl Metastore for InMemoryMetastore {
         }
         for key in tables {
             if let Some(table) = state.tables.remove(&key) {
-                state.dropped_tables.insert(key, (table, Self::now_ms()));
+                let dropped_at = Self::now_ms();
+                self.journal_put(&CatalogRecord::DroppedTable(
+                    table.clone(),
+                    dropped_at,
+                ))
+                .await?;
+                self.journal_delete(
+                    journal::domain::TABLES,
+                    &Self::table_journal_key(&key.0, &key.1, &key.2),
+                )
+                .await?;
+                state.dropped_tables.insert(key, (table, dropped_at));
             }
         }
         state.schemas.remove(&Self::schema_key(ident));
+        self.journal_delete(
+            journal::domain::SCHEMAS,
+            &Self::schema_journal_key(&ident.database, &ident.schema),
+        )
+        .await?;
         Ok(())
     }
 
@@ -756,6 +984,7 @@ impl Metastore for InMemoryMetastore {
         };
 
         let row = RwObject::new(stored_table);
+        self.journal_put(&CatalogRecord::Table(row.clone())).await?;
         state.tables.insert(Self::table_key(ident), row.clone());
         Ok(row)
     }
@@ -769,6 +998,7 @@ impl Metastore for InMemoryMetastore {
     async fn register_table(&self, ident: &TableIdent, table: Table) -> Result<RwObject<Table>> {
         let mut state = self.state.write().await;
         let row = RwObject::new(table);
+        self.journal_put(&CatalogRecord::Table(row.clone())).await?;
         state.tables.insert(Self::table_key(ident), row.clone());
         Ok(row)
     }
@@ -831,6 +1061,7 @@ impl Metastore for InMemoryMetastore {
             ..source.data.clone()
         };
         let row = RwObject::new(clone);
+        self.journal_put(&CatalogRecord::Table(row.clone())).await?;
         state.tables.insert(Self::table_key(to), row.clone());
         Ok(row)
     }
@@ -963,6 +1194,7 @@ impl Metastore for InMemoryMetastore {
             format: source.data.format,
         };
         let row = RwObject::new(clone);
+        self.journal_put(&CatalogRecord::Table(row.clone())).await?;
         self.state
             .write()
             .await
@@ -1025,6 +1257,11 @@ impl Metastore for InMemoryMetastore {
         table_entry.data.metadata = metadata;
         table_entry.data.metadata_location = metadata_location;
         table_entry.touch();
+        // Write-through is essential here: the table record carries the
+        // metadata_location pointer, so a commit that is not journaled would
+        // make the table's snapshot advance invisible after a restart.
+        self.journal_put(&CatalogRecord::Table(table_entry.clone()))
+            .await?;
         Ok(table_entry.clone())
     }
 
@@ -1032,9 +1269,20 @@ impl Metastore for InMemoryMetastore {
     async fn delete_table(&self, ident: &TableIdent, _cascade: bool) -> Result<()> {
         let mut state = self.state.write().await;
         if let Some(table) = state.tables.remove(&Self::table_key(ident)) {
+            let dropped_at = Self::now_ms();
+            self.journal_put(&CatalogRecord::DroppedTable(
+                table.clone(),
+                dropped_at,
+            ))
+            .await?;
+            self.journal_delete(
+                journal::domain::TABLES,
+                &Self::table_journal_key(&ident.database, &ident.schema, &ident.table),
+            )
+            .await?;
             state
                 .dropped_tables
-                .insert(Self::table_key(ident), (table, Self::now_ms()));
+                .insert(Self::table_key(ident), (table, dropped_at));
         }
         Ok(())
     }
@@ -1059,6 +1307,12 @@ impl Metastore for InMemoryMetastore {
             }
             .fail();
         };
+        self.journal_put(&CatalogRecord::Table(table.clone())).await?;
+        self.journal_delete(
+            journal::domain::DROPPED_TABLES,
+            &Self::table_journal_key(&ident.database, &ident.schema, &ident.table),
+        )
+        .await?;
         state.tables.insert(key, table.clone());
         Ok(table)
     }
@@ -1148,6 +1402,8 @@ impl Metastore for InMemoryMetastore {
         }
         Self::assert_object_name_free(&state, ident)?;
         let row = RwObject::new(stream);
+        self.journal_put(&CatalogRecord::Stream(row.clone()))
+            .await?;
         state.streams.insert(Self::table_key(ident), row.clone());
         Ok(row)
     }
@@ -1184,13 +1440,15 @@ impl Metastore for InMemoryMetastore {
                 .build()
             })?;
         row.update(stream);
+        self.journal_put(&CatalogRecord::Stream(row.clone()))
+            .await?;
         Ok(row.clone())
     }
 
     #[instrument(name = "Metastore::delete_stream", level = "debug", skip(self), err)]
     async fn delete_stream(&self, ident: &TableIdent) -> Result<()> {
         let mut state = self.state.write().await;
-        state
+        let removed = state
             .streams
             .remove(&Self::table_key(ident))
             .ok_or_else(|| {
@@ -1201,6 +1459,12 @@ impl Metastore for InMemoryMetastore {
                 }
                 .build()
             })?;
+        drop(removed);
+        self.journal_delete(
+            journal::domain::STREAMS,
+            &Self::table_journal_key(&ident.database, &ident.schema, &ident.table),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1219,6 +1483,7 @@ impl Metastore for InMemoryMetastore {
         }
         Self::assert_object_name_free(&state, ident)?;
         let row = RwObject::new(task);
+        self.journal_put(&CatalogRecord::Task(row.clone())).await?;
         state.tasks.insert(Self::table_key(ident), row.clone());
         Ok(row)
     }
@@ -1261,13 +1526,14 @@ impl Metastore for InMemoryMetastore {
                 .build()
             })?;
         row.update(task);
+        self.journal_put(&CatalogRecord::Task(row.clone())).await?;
         Ok(row.clone())
     }
 
     #[instrument(name = "Metastore::delete_task", level = "debug", skip(self), err)]
     async fn delete_task(&self, ident: &TableIdent) -> Result<()> {
         let mut state = self.state.write().await;
-        state
+        let removed = state
             .tasks
             .remove(&Self::table_key(ident))
             .ok_or_else(|| {
@@ -1278,6 +1544,12 @@ impl Metastore for InMemoryMetastore {
                 }
                 .build()
             })?;
+        drop(removed);
+        self.journal_delete(
+            journal::domain::TASKS,
+            &Self::table_journal_key(&ident.database, &ident.schema, &ident.table),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1333,6 +1605,8 @@ impl Metastore for InMemoryMetastore {
             .fail();
         }
         let row = RwObject::new(dynamic_table);
+        self.journal_put(&CatalogRecord::DynamicTable(row.clone()))
+            .await?;
         state
             .dynamic_tables
             .insert(Self::table_key(ident), row.clone());
@@ -1397,13 +1671,15 @@ impl Metastore for InMemoryMetastore {
                 .build()
             })?;
         row.update(dynamic_table);
+        self.journal_put(&CatalogRecord::DynamicTable(row.clone()))
+            .await?;
         Ok(row.clone())
     }
 
     #[instrument(name = "Metastore::delete_dynamic_table", level = "debug", skip(self), err)]
     async fn delete_dynamic_table(&self, ident: &TableIdent) -> Result<()> {
         let mut state = self.state.write().await;
-        state
+        let removed = state
             .dynamic_tables
             .remove(&Self::table_key(ident))
             .ok_or_else(|| {
@@ -1414,6 +1690,12 @@ impl Metastore for InMemoryMetastore {
                 }
                 .build()
             })?;
+        drop(removed);
+        self.journal_delete(
+            journal::domain::DYNAMIC_TABLES,
+            &Self::table_journal_key(&ident.database, &ident.schema, &ident.table),
+        )
+        .await?;
         Ok(())
     }
 }

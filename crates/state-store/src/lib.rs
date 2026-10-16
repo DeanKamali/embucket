@@ -41,4 +41,12 @@ pub trait StateStore: Send + Sync {
         &self,
         warehouse: Option<&'a str>,
     ) -> Result<Vec<WarehouseMeteringRecord>>;
+
+    /// Generic opaque KV for durable subsystems beyond the typed records
+    /// above — e.g. the metastore catalog journal (design §23.0, M17.0).
+    /// Domains are logical namespaces; `list_raw` returns all `(key, value)`
+    /// pairs in one domain.
+    async fn put_raw(&self, domain: &str, key: &str, value: Vec<u8>) -> Result<()>;
+    async fn delete_raw(&self, domain: &str, key: &str) -> Result<()>;
+    async fn list_raw(&self, domain: &str) -> Result<Vec<(String, Vec<u8>)>>;
 }

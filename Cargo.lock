@@ -2551,7 +2551,7 @@ dependencies = [
 [[package]]
 name = "datafusion"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-schema 59.2.0",
@@ -2603,7 +2603,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "async-trait",
@@ -2627,7 +2627,7 @@ dependencies = [
 [[package]]
 name = "datafusion-catalog-listing"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "async-trait",
@@ -2650,7 +2650,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-ipc 59.2.0",
@@ -2676,7 +2676,7 @@ dependencies = [
 [[package]]
 name = "datafusion-common-runtime"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "futures",
  "log",
@@ -2686,7 +2686,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "async-compression",
@@ -2723,7 +2723,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-arrow"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-ipc 59.2.0",
@@ -2747,7 +2747,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-csv"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "async-trait",
@@ -2770,7 +2770,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-json"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "async-trait",
@@ -2793,7 +2793,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-schema 59.2.0",
@@ -2825,12 +2825,12 @@ dependencies = [
 [[package]]
 name = "datafusion-doc"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 
 [[package]]
 name = "datafusion-execution"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-buffer 59.2.0",
@@ -2855,7 +2855,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-schema 59.2.0",
@@ -2879,7 +2879,7 @@ dependencies = [
 [[package]]
 name = "datafusion-expr-common"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-common",
@@ -2890,7 +2890,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-buffer 59.2.0",
@@ -2921,7 +2921,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-common",
@@ -2941,7 +2941,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-aggregate-common"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-common",
@@ -2964,7 +2964,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-nested"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-ord 59.2.0",
@@ -2988,7 +2988,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-table"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "async-trait",
@@ -3003,7 +3003,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-common",
@@ -3019,7 +3019,7 @@ dependencies = [
 [[package]]
 name = "datafusion-functions-window-common"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
@@ -3028,7 +3028,7 @@ dependencies = [
 [[package]]
 name = "datafusion-macros"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "datafusion-doc",
  "quote",
@@ -3038,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "datafusion-optimizer"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "chrono",
@@ -3057,7 +3057,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-schema 59.2.0",
@@ -3080,7 +3080,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-adapter"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-common",
@@ -3094,7 +3094,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-expr-common"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "chrono",
@@ -3111,7 +3111,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-optimizer"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-common",
@@ -3130,7 +3130,7 @@ dependencies = [
 [[package]]
 name = "datafusion-physical-plan"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "arrow-data 59.2.0",
@@ -3165,7 +3165,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-catalog",
@@ -3191,7 +3191,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-common"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-common",
@@ -3201,7 +3201,7 @@ dependencies = [
 [[package]]
 name = "datafusion-proto-models"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "datafusion-common",
  "datafusion-proto-common",
@@ -3211,7 +3211,7 @@ dependencies = [
 [[package]]
 name = "datafusion-pruning"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "datafusion-common",
@@ -3226,7 +3226,7 @@ dependencies = [
 [[package]]
 name = "datafusion-session"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow-schema 59.2.0",
  "async-trait",
@@ -3240,7 +3240,7 @@ dependencies = [
 [[package]]
 name = "datafusion-sql"
 version = "55.1.0"
-source = "git+https://github.com/Embucket/datafusion.git?branch=embucket-sync-df55.0.0#7d8a646c71ea36b5de5f614802330e6b901b8b76"
+source = "git+https://github.com/DeanKamali/datafusion.git?branch=embucket-sync-df55.0.0#48ac11cb1067bd15043b573ca6bfc9352fccfebd"
 dependencies = [
  "arrow 59.2.0",
  "bigdecimal",
@@ -6708,7 +6708,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -6729,7 +6729,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6742,7 +6742,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6918,7 +6918,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.45",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -6956,7 +6956,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -8136,7 +8136,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

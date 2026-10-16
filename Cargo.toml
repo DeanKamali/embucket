@@ -137,17 +137,17 @@ parquet = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" 
 parquet-variant = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
 parquet-variant-compute = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
 parquet-variant-json = { git = "https://github.com/Embucket/arrow-rs.git", rev = "539206bde" }
-datafusion = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
-datafusion-common = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
-datafusion-expr = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
-datafusion-physical-plan = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
-datafusion-doc = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
-datafusion-macros = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-common = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-expr = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-physical-plan = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-doc = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-macros = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
 # Ballista (crates.io) pulls datafusion-proto from the registry, which drags in
 # the whole registry datafusion sub-crate family and forks the types; use the
 # fork's proto crates so all datafusion types stay unified.
-datafusion-proto = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
-datafusion-proto-common = { git = "https://github.com/Embucket/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-proto = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
+datafusion-proto-common = { git = "https://github.com/DeanKamali/datafusion.git", branch = "embucket-sync-df55.0.0" }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

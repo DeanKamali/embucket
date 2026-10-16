@@ -2095,6 +2095,26 @@ impl UserQuery {
                         NULL::VARCHAR as comment,
                         NULL::VARCHAR as constraint_name"
                         .to_string()
+                } else if variable.to_uppercase().contains("FUNCTIONS") {
+                    // `SHOW USER FUNCTIONS [IN SCHEMA ...]` parses as
+                    // `ShowVariable` on the DataFusion 50 SQL parser. dbt-snowflake
+                    // expects the real Snowflake column set (catalog_name,
+                    // schema_name, is_builtin). No UDF support yet, so return the
+                    // correct shape with zero rows.
+                    "SELECT
+                        NULL::TIMESTAMP as created_on,
+                        NULL::TIMESTAMP as updated_on,
+                        NULL::VARCHAR as catalog_name,
+                        NULL::VARCHAR as schema_name,
+                        NULL::VARCHAR as name,
+                        NULL::BIGINT as min_num_arguments,
+                        NULL::BIGINT as max_num_arguments,
+                        NULL::VARCHAR as arguments,
+                        NULL::VARCHAR as data_type,
+                        NULL::VARCHAR as is_builtin,
+                        NULL::VARCHAR as description
+                    LIMIT 0"
+                        .to_string()
                 } else {
                     format!(
                         "SELECT

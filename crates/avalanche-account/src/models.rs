@@ -92,6 +92,18 @@ pub struct UserRole {
     pub role: String,
 }
 
+/// A login attempt (M17.1, `LOGIN_HISTORY`). Timestamps are epoch
+/// milliseconds (the account crate carries no chrono dep).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginEvent {
+    pub timestamp_ms: u64,
+    pub user_name: String,
+    pub client_app_id: Option<String>,
+    pub client_ip: Option<String>,
+    /// `true` for successful authentication, `false` for failures.
+    pub success: bool,
+}
+
 /// A share: a named grant bundle attachable across accounts (design §21,
 /// M15). The provider grants privileges into the share; a consumer account
 /// that mounts the share (M15.2) sees exactly the granted objects.

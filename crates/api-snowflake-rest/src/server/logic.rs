@@ -10,11 +10,36 @@ use crate::server::helpers::handle_query_ok_result;
 use api_snowflake_rest_sessions::TokenizedSession;
 use api_snowflake_rest_sessions::helpers::{create_jwt, ensure_jwt_secret_is_valid, jwt_claims};
 use executor::RunningQueryId;
+use executor::account_usage::current_epoch_ms;
 use executor::models::{QueryContext, SessionMetadata, SessionMetadataAttr};
+use avalanche_account::models::LoginEvent;
+use avalanche_account::store::AccountStore;
 use snafu::{OptionExt, ResultExt};
+use std::sync::Arc;
 use time::Duration;
 
 pub const JWT_TOKEN_EXPIRATION_SECONDS: u32 = 3 * 24 * 60 * 60;
+
+/// LOGIN_HISTORY (M17.1): best-effort login recording — never blocks or
+/// fails authentication.
+async fn record_login(
+    store: &Arc<dyn AccountStore>,
+    login_name: &str,
+    client_app_id: Option<String>,
+    client_ip: Option<String>,
+    success: bool,
+) {
+    let event = LoginEvent {
+        timestamp_ms: current_epoch_ms(),
+        user_name: login_name.to_string(),
+        client_app_id,
+        client_ip,
+        success,
+    };
+    if let Err(e) = store.record_login(event).await {
+        tracing::warn!(error = %e, "failed to record login event");
+    }
+}
 
 /// Master token lifetime (Snowflake default is 4h session / 24h master).
 pub const MASTER_TOKEN_EXPIRATION_SECONDS: u32 = 24 * 60 * 60;
@@ -49,7 +74,18 @@ pub async fn handle_login_request(
     match &state.config.account {
         Some(store) => match store.authenticate(&login_name, &password).await {
             Ok(Some(_)) => {}
-            Ok(None) => return api_snowflake_rest_error::InvalidAuthDataSnafu.fail(),
+            Ok(None) => {
+                // LOGIN_HISTORY (M17.1): failed attempts are recorded too.
+                record_login(
+                    store,
+                    &login_name,
+                    Some(client_app_id.clone()),
+                    client_ip.clone(),
+                    false,
+                )
+                .await;
+                return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+            }
             Err(e) => {
                 tracing::error!(error = %e, "account store authentication failed");
                 return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
@@ -62,6 +98,9 @@ pub async fn handle_login_request(
                 return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
             }
         }
+    }
+    if let Some(store) = &state.config.account {
+        record_login(store, &login_name, Some(client_app_id.clone()), client_ip.clone(), true).await;
     }
 
     // host is required to check token audience claim

@@ -244,6 +244,20 @@ impl StateStore for PostgresStateStore {
             .collect()
     }
 
+    async fn list_queries(&self) -> Result<Vec<Query>> {
+        let client = self.client().await?;
+        let rows = client
+            .query("SELECT record FROM state_queries", &[])
+            .await
+            .context(PgSnafu)?;
+        rows.into_iter()
+            .map(|row| {
+                let json: serde_json::Value = row.try_get("record").context(PgSnafu)?;
+                serde_json::from_value(json).context(FailedToDeserializeRecordSnafu)
+            })
+            .collect()
+    }
+
     async fn delete_query(&self, query_id: &str) -> Result<()> {
         let client = self.client().await?;
         client

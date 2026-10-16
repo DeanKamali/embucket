@@ -19,6 +19,9 @@ use avalanche_warehouse::{MeteringHistoryTableFunc, WarehouseManager};
 use avalanche_account::authz::AuthzCatalogList;
 use avalanche_account::store::AccountStore;
 use avalanche_account::SessionAuthz;
+use crate::account_usage::{
+    GrantsToRolesTableFunc, GrantsToUsersTableFunc, LoginHistoryTableFunc, QueryHistoryTableFunc,
+};
 use catalog::catalog_list::{DEFAULT_CATALOG, EmbucketCatalogList};
 use catalog_metastore::Metastore;
 use datafusion::catalog::CatalogProviderList;
@@ -240,6 +243,33 @@ impl UserSession {
             "warehouse_metering_history",
             Arc::new(MeteringHistoryTableFunc::new(warehouse.metering())),
         );
+        // ACCOUNT_USAGE-style observability (design §23.1, M17.1)
+        #[cfg(feature = "state-store")]
+        ctx.register_udtf(
+            "query_history",
+            Arc::new(QueryHistoryTableFunc::new(Arc::clone(&state_store))),
+        );
+        #[cfg(not(feature = "state-store"))]
+        ctx.register_udtf(
+            "query_history",
+            Arc::new(QueryHistoryTableFunc::new(Arc::new(
+                state_store::InMemoryStateStore::new(),
+            ))),
+        );
+        if let Some(account) = &account {
+            ctx.register_udtf(
+                "login_history",
+                Arc::new(LoginHistoryTableFunc::new(Arc::clone(account))),
+            );
+            ctx.register_udtf(
+                "grants_to_users",
+                Arc::new(GrantsToUsersTableFunc::new(Arc::clone(account))),
+            );
+            ctx.register_udtf(
+                "grants_to_roles",
+                Arc::new(GrantsToRolesTableFunc::new(Arc::clone(account))),
+            );
+        }
         register_json_udfs(&mut ctx).context(ex_error::RegisterUDFSnafu)?;
         //register_geo_native(&ctx);
         //register_geo_udfs(&ctx);

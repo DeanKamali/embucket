@@ -25,6 +25,8 @@ pub trait StateStore: Send + Sync {
     async fn get_query(&self, query_id: &str) -> Result<Query>;
     async fn get_query_by_request_id(&self, request_id: &str) -> Result<Query>;
     async fn get_queries_by_session_id(&self, session_id: &str) -> Result<Vec<Query>>;
+    /// Every persisted query (ACCOUNT_USAGE.QUERY_HISTORY).
+    async fn list_queries(&self) -> Result<Vec<Query>>;
     async fn delete_query(&self, query_id: &str) -> Result<()>;
     async fn update_query(&self, query: &Query) -> Result<()>;
 

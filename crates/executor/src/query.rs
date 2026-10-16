@@ -3515,7 +3515,12 @@ fn build_target_schema(base_schema: &ArrowSchema) -> ArrowSchema {
 /// session warehouse: they read router-side session state (e.g. the M5
 /// metering ledger) that does not exist on warehouse compute.
 fn is_session_local_table_function(sql: &str) -> bool {
-    sql.to_ascii_lowercase().contains("warehouse_metering_history")
+    let lower = sql.to_ascii_lowercase();
+    lower.contains("warehouse_metering_history")
+        || lower.contains("query_history")
+        || lower.contains("login_history")
+        || lower.contains("grants_to_users")
+        || lower.contains("grants_to_roles")
 }
 
 /// Converts merge clauses into projection expressions for copy-on-write operations.

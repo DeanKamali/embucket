@@ -35,7 +35,13 @@ pub struct UnimplementedFunctionsChecker;
 /// Functions that are in the generated unimplemented registry but ARE
 /// implemented (as session-registered table functions) — the checker must
 /// not reject them.
-const IMPLEMENTED_TABLE_FUNCTIONS: &[&str] = &["WAREHOUSE_METERING_HISTORY"];
+const IMPLEMENTED_TABLE_FUNCTIONS: &[&str] = &[
+    "WAREHOUSE_METERING_HISTORY",
+    "QUERY_HISTORY",
+    "LOGIN_HISTORY",
+    "GRANTS_TO_USERS",
+    "GRANTS_TO_ROLES",
+];
 
 impl VisitorMut for UnimplementedFunctionsChecker {
     type Break = UnimplementedFunctionError;

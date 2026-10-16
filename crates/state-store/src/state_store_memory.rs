@@ -104,6 +104,11 @@ impl StateStore for InMemoryStateStore {
             .collect())
     }
 
+    async fn list_queries(&self) -> Result<Vec<Query>> {
+        let queries = self.queries.read().await;
+        Ok(queries.values().cloned().collect())
+    }
+
     async fn delete_query(&self, query_id: &str) -> Result<()> {
         let mut queries = self.queries.write().await;
         if let Some(request_id) = queries.remove(query_id).and_then(|q| q.request_id) {

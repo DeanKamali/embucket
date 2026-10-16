@@ -6,7 +6,8 @@
 
 use crate::error::{self as account_error, Result};
 use crate::models::{
-    AccountObject, Grant, Privilege, Role, Share, ShareGrant, User, UserRole, ACCOUNTADMIN,
+    AccountObject, Grant, LoginEvent, Privilege, Role, Share, ShareGrant, User, UserRole,
+    ACCOUNTADMIN,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -50,6 +51,13 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
     /// for store failures. Disabled users also return `Ok(None)`.
     async fn authenticate(&self, login_name: &str, password: &str) -> Result<Option<User>>;
 
+    /// Record a login attempt (M17.1, `LOGIN_HISTORY`). Best-effort at the
+    /// call site — never blocks authentication.
+    async fn record_login(&self, event: LoginEvent) -> Result<()>;
+
+    /// Every recorded login attempt, oldest first (M17.1).
+    async fn list_logins(&self) -> Result<Vec<LoginEvent>>;
+
     /// Whether `role` may exercise `privilege` on `object`. `ACCOUNTADMIN`
     /// members bypass everything; this method does not encode that — see
     /// [`SessionAuthz`].
@@ -65,6 +73,7 @@ struct StoreState {
     user_roles: Vec<UserRole>,
     shares: HashMap<String, Share>,
     share_grants: Vec<ShareGrant>,
+    logins: Vec<LoginEvent>,
 }
 
 /// In-memory [`AccountStore`].
@@ -301,6 +310,16 @@ impl AccountStore for InMemoryAccountStore {
             .find(|u| key(&u.login_name) == key(login_name))
             .filter(|u| !u.disabled && u.password == password)
             .cloned())
+    }
+
+    async fn record_login(&self, event: LoginEvent) -> Result<()> {
+        self.state.write().await.logins.push(event);
+        Ok(())
+    }
+
+    async fn list_logins(&self) -> Result<Vec<LoginEvent>> {
+        let state = self.state.read().await;
+        Ok(state.logins.clone())
     }
 
     async fn allowed(

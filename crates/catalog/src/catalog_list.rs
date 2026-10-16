@@ -147,14 +147,18 @@ impl EmbucketCatalogList {
         err
     )]
     pub async fn drop_catalog(&self, name: &str, cascade: bool) -> Result<()> {
-        let Some((_, catalog)) = self.catalogs.remove(name) else {
+        let Some(catalog) = self.catalogs.get(name).map(|c| Arc::clone(c.value())) else {
             return InvalidCacheSnafu {
                 entity: "catalog",
                 name,
             }
             .fail();
         };
-        match catalog.catalog_type {
+        // Delete from the metastore BEFORE deregistering: a failed
+        // (non-cascade) delete must leave the database registered and
+        // usable — deregistering first made the DB unresolvable until the
+        // next restart (M16.4).
+        let result = match catalog.catalog_type {
             CatalogType::Embucket | CatalogType::Memory => self
                 .metastore
                 .delete_database(&name.to_string(), cascade)
@@ -165,7 +169,11 @@ impl EmbucketCatalogList {
                 details: "Dropping S3 tables catalogs is not supported",
             }
             .fail(),
+        };
+        if result.is_ok() {
+            self.catalogs.remove(name);
         }
+        result
     }
 
     #[tracing::instrument(

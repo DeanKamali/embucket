@@ -502,8 +502,9 @@ impl UserQuery {
                 }
                 Statement::StartTransaction { .. }
                 | Statement::Commit { .. }
-                | Statement::Rollback { .. }
-                | Statement::Update { .. } => return self.status_response(),
+                | Statement::Rollback { .. } => return self.status_response(),
+                Statement::Delete(d) => return Box::pin(self.delete_query(d)).await,
+                Statement::Update(u) => return Box::pin(self.update_query(u)).await,
                 Statement::Insert { .. } => {
                     let result = Box::pin(self.execute_with_custom_plan(&self.query)).await;
                     // Stream consumption (design §18.1-1): a successful DML
@@ -878,8 +879,28 @@ impl UserQuery {
         // DROP DATABASE is a special case, since it is not a part of iceberg catalog
         if object_type == ObjectType::Database {
             if let Some(database) = names.first() {
-                self.drop_catalog(&object_name_to_string(database), cascade)
-                    .await?;
+                let db_name = object_name_to_string(database);
+                // IF EXISTS: a missing database is a success no-op; without
+                // IF EXISTS a missing database is a Snowflake-shaped error
+                // (not the catalog cache's "Invalid cache" shape).
+                let exists = self
+                    .metastore
+                    .get_database(&db_name)
+                    .await
+                    .context(ex_error::MetastoreSnafu)?
+                    .is_some();
+                if !exists {
+                    if if_exists {
+                        return self.status_response();
+                    }
+                    return ex_error::DatabaseNotFoundSnafu { db: db_name }.fail();
+                }
+                // Snowflake's DROP DATABASE drops contained schemas/tables
+                // by default (CASCADE/RESTRICT only affect dependent
+                // objects), and UNDROP (§17.2.2) provides recovery — so a
+                // non-cascade metastore refusal would leave the DB stuck
+                // for the common `DROP DATABASE` form.
+                self.drop_catalog(&db_name, true).await?;
                 return self.status_response();
             }
             let database_name = names
@@ -891,6 +912,32 @@ impl UserQuery {
                 ident: database_name,
             }
             .fail();
+        }
+
+        // DROP EXTERNAL VOLUME is metastore-level (no iceberg catalog
+        // entity); volumes are not planned through the data-plane DDL path.
+        if object_type == ObjectType::ExternalVolume {
+            let Some(volume) = names.first() else {
+                return ex_error::OnlyDropStatementsSnafu.fail();
+            };
+            let vol_name = object_name_to_string(volume);
+            let exists = self
+                .metastore
+                .get_volume(&vol_name)
+                .await
+                .context(ex_error::MetastoreSnafu)?
+                .is_some();
+            if !exists {
+                if if_exists {
+                    return self.status_response();
+                }
+                return ex_error::VolumeNotFoundSnafu { volume: vol_name }.fail();
+            }
+            self.metastore
+                .delete_volume(&vol_name, cascade)
+                .await
+                .context(ex_error::MetastoreSnafu)?;
+            return self.status_response();
         }
 
         let mut plan = self.sql_statement_to_plan(statement).await?;

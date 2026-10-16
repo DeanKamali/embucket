@@ -196,6 +196,10 @@ pub async fn fingerprint(session: &Arc<UserSession>, query: &Query) -> Option<u6
         .get_session_variable("role")
         .unwrap_or_default()
         .hash(&mut hasher);
+    // Account-state epoch (M17.3.1 fix): GRANT/REVOKE/role or share
+    // mutations bump it, so a cached result pre-dating a privilege change
+    // is never served even though the table snapshot is unchanged.
+    avalanche_account::store::account_epoch().hash(&mut hasher);
     for name in refs {
         let ident = resolve_ref(session, &name).await?;
         let Some(record) = session

@@ -121,3 +121,31 @@ pub async fn session(
 
     Ok(Json(serde_json::value::Value::Null))
 }
+
+/// Legacy JDBC close: `POST /session/v1/logout-request`. Equivalent to
+/// `POST /session?delete=true` — the shared sf_core logout path uses this
+/// endpoint, so it must exist for driver `close()` to succeed cleanly.
+#[tracing::instrument(name = "api_snowflake_rest::logout", level = "debug", skip(state), err, ret(level = tracing::Level::TRACE))]
+pub async fn logout(
+    TokenizedSession(session_id, ..): TokenizedSession,
+    State(state): State<AppState>,
+    _body: Option<Json<serde_json::value::Value>>,
+) -> Result<Json<serde_json::value::Value>> {
+    state.execution_svc.delete_session(&session_id).await?;
+    Ok(Json(serde_json::value::Value::Null))
+}
+
+/// JDBC keep-alive: `POST /session/v1/heartbeat-request`. The session is
+/// kept server-side until explicitly closed, so this only needs to answer
+/// success for the driver's heartbeat task to stay alive.
+#[tracing::instrument(name = "api_snowflake_rest::heartbeat", level = "debug", ret(level = tracing::Level::TRACE))]
+pub async fn heartbeat(
+    TokenizedSession(..): TokenizedSession,
+) -> Result<Json<serde_json::value::Value>> {
+    Ok(Json(serde_json::json!({
+        "data": {},
+        "code": null,
+        "message": null,
+        "success": true
+    })))
+}

@@ -1,4 +1,4 @@
-use super::handlers::{abort, login, query, session};
+use super::handlers::{abort, heartbeat, login, logout, query, session};
 use super::layer::require_auth;
 use super::state::AppState;
 use api_snowflake_rest_sessions::layer::Host;
@@ -19,6 +19,8 @@ pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/queries/v1/query-request", post(query))
         .route("/queries/v1/abort-request", post(abort))
+        .route("/session/v1/logout-request", post(logout))
+        .route("/session/v1/heartbeat-request", post(heartbeat))
 }
 
 pub fn make_snowflake_router(app_state: AppState) -> Router {

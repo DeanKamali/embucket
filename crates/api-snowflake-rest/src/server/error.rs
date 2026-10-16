@@ -298,6 +298,8 @@ impl Error {
                 total: None,
                 returned: None,
                 query_result_format: None,
+                statement_type_id: None,
+                stats: None,
                 // Query uuid is returned to the user
                 query_id: Some(self.query_id().to_string()),
             }),

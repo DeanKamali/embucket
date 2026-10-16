@@ -1,6 +1,6 @@
 ---
 source: crates/api-snowflake-rest/src/tests/test_rest_api.rs
-description: "SQL #1 [spent: 616/616ms]: select * from \n                ( select 1 as col ) schema1,\n                ( select 2 as col ) schema2\nQuery UUID: 00000000-0000-0000-0000-000000000000"
+description: "SQL #1 [spent: 273/273ms]: select * from \n                ( select 1 as col ) schema1,\n                ( select 2 as col ) schema2\nQuery UUID: 01a14278-dd37-7625-a609-b98844fcada4"
 expression: snapshot
 ---
 select * from 
@@ -39,13 +39,14 @@ select * from
     "rowsetBase64": null,
     "rowset": [
       [
-        1,
-        2
+        "1",
+        "2"
       ]
     ],
     "total": 1,
     "returned": 1,
     "queryResultFormat": "json",
+    "statementTypeId": 4096,
     "sqlState": "02000",
     "queryId": "UUID"
   },

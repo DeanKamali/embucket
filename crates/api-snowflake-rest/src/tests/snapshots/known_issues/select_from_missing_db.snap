@@ -1,6 +1,6 @@
 ---
 source: crates/api-snowflake-rest/src/tests/test_rest_api.rs
-description: "SQL #1 [spent: 195/195ms]: select * from missing_db.foo.foo\nQuery UUID: ccac994d-a508-4cb1-b2c2-3a7a1d09076a"
+description: "SQL #1 [spent: 763/763ms]: select * from missing_db.foo.foo\nQuery UUID: 01a14278-e11a-7410-9360-eee522cfb6a4"
 expression: snapshot
 ---
 select * from missing_db.foo.foo
@@ -10,11 +10,11 @@ select * from missing_db.foo.foo
     "rowsetBase64": null,
     "rowset": null,
     "queryResultFormat": null,
-    "errorCode": "002003",
+    "errorCode": "002043",
     "sqlState": "02000",
     "queryId": "UUID"
   },
   "success": false,
-  "message": "SQL compilation error: table 'missing_db.foo.foo' not found",
-  "code": "002003"
+  "message": "SQL compilation error: Table 'missing_db.foo.foo' does not exist or not authorized",
+  "code": "002043"
 }

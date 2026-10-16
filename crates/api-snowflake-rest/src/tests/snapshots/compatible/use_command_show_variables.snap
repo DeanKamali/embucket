@@ -1,6 +1,6 @@
 ---
 source: crates/api-snowflake-rest/src/tests/test_rest_api.rs
-description: "SQL #1 [spent: 611/611ms]: use schema test_schema\nQuery UUID: 00000000-0000-0000-0000-000000000000"
+description: "SQL #1 [spent: 352/352ms]: use schema test_schema\nQuery UUID: 01a14278-de08-7597-894f-7f4161402289"
 expression: snapshot
 ---
 use schema test_schema
@@ -30,6 +30,7 @@ use schema test_schema
     "total": 1,
     "returned": 1,
     "queryResultFormat": "json",
+    "statementTypeId": 17152,
     "sqlState": "02000",
     "queryId": "UUID"
   },

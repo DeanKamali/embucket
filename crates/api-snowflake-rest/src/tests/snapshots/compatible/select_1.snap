@@ -1,6 +1,6 @@
 ---
 source: crates/api-snowflake-rest/src/tests/test_rest_api.rs
-description: "SQL #1 [spent: 598/598ms]: select 1\nQuery UUID: 00000000-0000-0000-0000-000000000000"
+description: "SQL #1 [spent: 371/371ms]: select 1\nQuery UUID: 01a14278-de02-73bf-9234-73c441c1cbca"
 expression: snapshot
 ---
 select 1
@@ -24,12 +24,13 @@ select 1
     "rowsetBase64": null,
     "rowset": [
       [
-        1
+        "1"
       ]
     ],
     "total": 1,
     "returned": 1,
     "queryResultFormat": "json",
+    "statementTypeId": 4096,
     "sqlState": "02000",
     "queryId": "UUID"
   },

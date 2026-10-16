@@ -1,5 +1,6 @@
 pub mod client;
 pub mod create_test_server;
+pub mod null_projection_repro;
 pub mod read_arrow_data;
 pub mod snow_sql;
 pub mod sql_test_macro;

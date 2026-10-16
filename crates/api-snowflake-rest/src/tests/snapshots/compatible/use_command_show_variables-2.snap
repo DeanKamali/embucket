@@ -1,6 +1,6 @@
 ---
 source: crates/api-snowflake-rest/src/tests/test_rest_api.rs
-description: "SQL #2 [spent: 834/2246ms]: SHOW VARIABLES\nQuery UUID: 019ba0a2-81a9-7f01-8831-0ab6e9cef96c"
+description: "SQL #2 [spent: 570/963ms]: SHOW VARIABLES\nQuery UUID: 01a14278-e055-71b0-84ac-ecbdc27339b8"
 expression: snapshot
 ---
 SHOW VARIABLES
@@ -104,6 +104,7 @@ SHOW VARIABLES
     "total": 0,
     "returned": 0,
     "queryResultFormat": "json",
+    "statementTypeId": 17408,
     "sqlState": "02000",
     "queryId": "UUID"
   },

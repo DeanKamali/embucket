@@ -1,6 +1,6 @@
 ---
 source: crates/api-snowflake-rest/src/tests/test_rest_api.rs
-description: "SQL #1 [spent: 614/614ms]: SELECT TO_DATE('2022-08-19', 'YYYY-MM-DD'), CAST('2022-08-19-00:00' AS TIMESTAMP)\nQuery UUID: 00000000-0000-0000-0000-000000000000"
+description: "SQL #1 [spent: 369/376ms]: SELECT TO_DATE('2022-08-19', 'YYYY-MM-DD'), CAST('2022-08-19-00:00' AS TIMESTAMP)\nQuery UUID: 01a14278-de02-73bf-9234-73c63a6709af"
 expression: snapshot
 ---
 SELECT TO_DATE('2022-08-19', 'YYYY-MM-DD'), CAST('2022-08-19-00:00' AS TIMESTAMP)
@@ -37,13 +37,14 @@ SELECT TO_DATE('2022-08-19', 'YYYY-MM-DD'), CAST('2022-08-19-00:00' AS TIMESTAMP
     "rowsetBase64": null,
     "rowset": [
       [
-        19223,
+        "19223",
         "1660867200.0"
       ]
     ],
     "total": 1,
     "returned": 1,
     "queryResultFormat": "json",
+    "statementTypeId": 4096,
     "sqlState": "02000",
     "queryId": "UUID"
   },

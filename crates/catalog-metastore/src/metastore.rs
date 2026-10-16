@@ -153,9 +153,161 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
     /// there is no tombstone for it.
     async fn undrop_table(&self, ident: &TableIdent) -> Result<RwObject<Table>>;
 
+    /// Restore the most recently dropped schema (M17.2.2): the schema record
+    /// plus every table tombstone created by its cascade drop. Errors when a
+    /// live schema already occupies the name, when the parent database is
+    /// not live, or when there is no tombstone.
+    async fn undrop_schema(&self, ident: &SchemaIdent) -> Result<RwObject<Schema>>;
+
+    /// Restore the most recently dropped database (M17.2.2): the database
+    /// record plus every schema tombstone and contained-table tombstone
+    /// created by its cascade drop. Errors when a live database already
+    /// occupies the name or when there is no tombstone.
+    async fn undrop_database(&self, ident: &DatabaseIdent) -> Result<RwObject<Database>>;
+
     /// Tables currently tombstoned (dropped) in `schema`, most recent drop
     /// first.
     async fn list_dropped_tables(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Table>>>;
+
+    /// Schemas currently tombstoned (dropped) in `database`, most recent
+    /// drop first (M17.2.2).
+    async fn list_dropped_schemas(&self, database: &DatabaseIdent)
+    -> Result<Vec<(RwObject<Schema>, i64)>>;
+
+    /// Databases currently tombstoned (dropped), most recent drop first
+    /// (M17.2.2).
+    async fn list_dropped_databases(&self) -> Result<Vec<(RwObject<Database>, i64)>>;
+
+    /// Zero-copy as-of clone of a schema (M17.2.2, design §15): creates `to`
+    /// as a copy of the schema containing every table's state at `point_ms`.
+    /// Tables created after the point and dropped before it are excluded;
+    /// tables dropped after the point are cloned from their tombstoned
+    /// record as of the point. Returns the number of cloned tables.
+    async fn clone_schema_as_of(
+        &self,
+        from: &SchemaIdent,
+        to: &SchemaIdent,
+        point_ms: i64,
+    ) -> Result<usize> {
+        let source = self.get_schema(from).await?.ok_or_else(|| {
+            metastore_error::SchemaNotFoundSnafu {
+                schema: from.schema.clone(),
+                db: from.database.clone(),
+            }
+            .build()
+        })?;
+        let schema = Schema {
+            ident: to.clone(),
+            properties: source.data.properties.clone(),
+        };
+        self.create_schema(to, schema).await?;
+        let mut cloned = 0usize;
+        for table in self.list_tables(from).await? {
+            if self
+                .clone_table_record_as_of(&table, to, point_ms)
+                .await?
+            {
+                cloned += 1;
+            }
+        }
+        // Tables dropped after the point (or whose drop is still pending
+        // undrop) existed live at `point_ms` — clone them from their
+        // tombstoned record.
+        for (table, dropped_at) in self.list_dropped_tables_with_time(from).await? {
+            if dropped_at > point_ms
+                && self
+                    .clone_table_record_as_of(&table, to, point_ms)
+                    .await?
+            {
+                cloned += 1;
+            }
+        }
+        Ok(cloned)
+    }
+
+    /// Zero-copy as-of clone of a database (M17.2.2, design §15): creates
+    /// `to` with every schema's state at `point_ms` (see
+    /// [`Metastore::clone_schema_as_of`]). Returns the number of cloned
+    /// tables across all schemas.
+    async fn clone_database_as_of(
+        &self,
+        from: &DatabaseIdent,
+        to: &DatabaseIdent,
+        point_ms: i64,
+    ) -> Result<usize> {
+        let source = self.get_database(from).await?.ok_or_else(|| {
+            metastore_error::DatabaseNotFoundSnafu {
+                db: from.to_string(),
+            }
+            .build()
+        })?;
+        let database = Database {
+            ident: to.to_string(),
+            properties: source.data.properties.clone(),
+            volume: source.data.volume.clone(),
+            should_refresh: false,
+        };
+        self.create_database(&to.to_string(), database).await?;
+        let mut cloned = 0usize;
+        for schema in self.list_schemas(from).await? {
+            if rw_ms(&schema) > point_ms {
+                continue; // created after the point
+            }
+            let target_schema =
+                SchemaIdent::new(to.to_string(), schema.data.ident.schema.clone());
+            let source_schema = schema.data.ident.clone();
+            cloned += self
+                .clone_schema_as_of(&source_schema, &target_schema, point_ms)
+                .await?;
+        }
+        // Schemas dropped after the point existed live at it — clone their
+        // tombstoned records plus qualifying contained tables.
+        for (schema, dropped_at) in self.list_dropped_schemas(from).await? {
+            if dropped_at <= point_ms {
+                continue;
+            }
+            let target_schema = SchemaIdent::new(to.to_string(), schema.data.ident.schema.clone());
+            let target = Schema {
+                ident: target_schema.clone(),
+                properties: schema.data.properties.clone(),
+            };
+            self.create_schema(&target_schema, target).await?;
+            let source_schema = schema.data.ident.clone();
+            for (table, table_dropped_at) in
+                self.list_dropped_tables_with_time(&source_schema).await?
+            {
+                if table_dropped_at > point_ms
+                    && self
+                        .clone_table_record_as_of(&table, &target_schema, point_ms)
+                        .await?
+                {
+                    cloned += 1;
+                }
+            }
+        }
+        Ok(cloned)
+    }
+
+    /// Clone one table *record* (live or tombstoned) as-of `point_ms` into
+    /// `to_schema` (M17.2.2 helper). Iceberg tables are pinned to the latest
+    /// snapshot at or before `point_ms`; tables with no commit before the
+    /// point (or non-Iceberg) clone their current record — for a
+    /// never-rewritten table that is exactly its as-of state. Returns false
+    /// when the table did not exist at the point or the target name is
+    /// occupied.
+    async fn clone_table_record_as_of(
+        &self,
+        table: &RwObject<Table>,
+        to_schema: &SchemaIdent,
+        point_ms: i64,
+    ) -> Result<bool>;
+
+    /// Dropped tables with their drop timestamps (M17.2.2), most recent
+    /// first.
+    async fn list_dropped_tables_with_time(
+        &self,
+        schema: &SchemaIdent,
+    ) -> Result<Vec<(RwObject<Table>, i64)>>;
     async fn table_object_store(&self, ident: &TableIdent) -> Result<Option<Arc<dyn ObjectStore>>>;
 
     async fn table_exists(&self, ident: &TableIdent) -> Result<bool>;
@@ -212,6 +364,12 @@ struct MetastoreState {
     /// drop time. Keyed by table key; a re-drop of the same name overwrites
     /// the previous tombstone (UNDROP restores the most recent drop).
     dropped_tables: HashMap<(DatabaseIdent, String, String), (RwObject<Table>, i64)>,
+    /// Tombstones for dropped schemas (M17.2.2): record + epoch-ms drop time.
+    /// UNDROP SCHEMA restores the most recent drop, together with the tables
+    /// the cascade tombstoned at the same instant.
+    dropped_schemas: HashMap<(DatabaseIdent, String), (RwObject<Schema>, i64)>,
+    /// Tombstones for dropped databases (M17.2.2): record + epoch-ms drop time.
+    dropped_databases: HashMap<DatabaseIdent, (RwObject<Database>, i64)>,
     streams: HashMap<(DatabaseIdent, String, String), RwObject<Stream>>,
     tasks: HashMap<(DatabaseIdent, String, String), RwObject<Task>>,
     dynamic_tables: HashMap<(DatabaseIdent, String, String), RwObject<DynamicTable>>,
@@ -225,6 +383,10 @@ pub struct InMemoryMetastore {
     /// Durable write-through journal (design §23.0, M17.0). `None` keeps the
     /// legacy pure in-memory behavior (tests, non-durable builds).
     journal: Option<Arc<dyn CatalogJournal>>,
+    /// Strictly-increasing tombstone clock (ms): wall-clock ms collide for
+    /// fast successive drops, and tombstone ordering (container vs contents,
+    /// individual vs cascade) relies on strict monotonicity.
+    tombstone_clock: std::sync::atomic::AtomicI64,
 }
 
 impl InMemoryMetastore {
@@ -235,6 +397,7 @@ impl InMemoryMetastore {
             object_store_cache: DashMap::new(),
             settings_config: None,
             journal: None,
+            tombstone_clock: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -253,6 +416,7 @@ impl InMemoryMetastore {
             object_store_cache: DashMap::new(),
             settings_config: Some(settings),
             journal: Some(journal),
+            tombstone_clock: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -268,6 +432,8 @@ impl InMemoryMetastore {
             && state.schemas.is_empty()
             && state.tables.is_empty()
             && state.dropped_tables.is_empty()
+            && state.dropped_schemas.is_empty()
+            && state.dropped_databases.is_empty()
             && state.streams.is_empty()
             && state.tasks.is_empty()
             && state.dynamic_tables.is_empty())
@@ -319,6 +485,16 @@ impl InMemoryMetastore {
                 state
                     .dropped_tables
                     .insert(Self::table_key(&row.data.ident), (row, dropped_at_ms));
+            }
+            CatalogRecord::DroppedSchema(row, dropped_at_ms) => {
+                state
+                    .dropped_schemas
+                    .insert(Self::schema_key(&row.data.ident), (row, dropped_at_ms));
+            }
+            CatalogRecord::DroppedDatabase(row, dropped_at_ms) => {
+                state
+                    .dropped_databases
+                    .insert(row.data.ident.to_ascii_lowercase(), (row, dropped_at_ms));
             }
             CatalogRecord::Stream(row) => {
                 state.streams.insert(Self::table_key(&row.data.ident), row);
@@ -405,6 +581,27 @@ impl InMemoryMetastore {
         Utc::now().timestamp_millis()
     }
 
+    /// Strictly-increasing tombstone timestamp (see `tombstone_clock`).
+    /// Wall-clock ms collide for back-to-back drops; the compare-exchange
+    /// loop advances past any value already handed out.
+    fn tombstone_ms(&self) -> i64 {
+        use std::sync::atomic::Ordering;
+        let now = Self::now_ms();
+        let mut last = self.tombstone_clock.load(Ordering::Relaxed);
+        loop {
+            let target = now.max(last + 1);
+            match self.tombstone_clock.compare_exchange(
+                last,
+                target,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return target,
+                Err(seen) => last = seen,
+            }
+        }
+    }
+
     fn default_table_location(ident: &TableIdent) -> String {
         format!("{}/{}/{}", ident.database, ident.schema, ident.table)
     }
@@ -469,6 +666,11 @@ impl InMemoryMetastore {
             .context(metastore_error::ObjectStoreSnafu)?;
         Ok(path)
     }
+}
+
+/// `RwObject.created_at` as epoch milliseconds (as-of container clones).
+fn rw_ms<T: Eq + PartialEq>(o: &RwObject<T>) -> i64 {
+    o.created_at.and_utc().timestamp_millis()
 }
 
 #[async_trait]
@@ -568,7 +770,7 @@ impl Metastore for InMemoryMetastore {
                 .collect();
             for key in table_keys {
                 if let Some(table) = state.tables.remove(&key) {
-                    let dropped_at = Self::now_ms();
+                    let dropped_at = self.tombstone_ms();
                     self.journal_put(&CatalogRecord::DroppedTable(
                         table.clone(),
                         dropped_at,
@@ -703,8 +905,21 @@ impl Metastore for InMemoryMetastore {
             }
             .fail();
         }
+        // One cascade event = one tombstone timestamp: contained schemas and
+        // tables share the database's drop time (UNDROP DATABASE restores
+        // exactly what this statement tombstoned).
+        let dropped_at = self.tombstone_ms();
         for key in &schema_keys {
-            state.schemas.remove(key);
+            if let Some(schema) = state.schemas.remove(key) {
+                self.journal_put(&CatalogRecord::DroppedSchema(
+                    schema.clone(),
+                    dropped_at,
+                ))
+                .await?;
+                state
+                    .dropped_schemas
+                    .insert(key.clone(), (schema, dropped_at));
+            }
             self.journal_delete(
                 journal::domain::SCHEMAS,
                 &Self::schema_journal_key(&key.0, &key.1),
@@ -719,7 +934,6 @@ impl Metastore for InMemoryMetastore {
             .collect();
         for key in &table_keys {
             if let Some(table) = state.tables.remove(key) {
-                let dropped_at = Self::now_ms();
                 self.journal_put(&CatalogRecord::DroppedTable(
                     table.clone(),
                     dropped_at,
@@ -735,12 +949,28 @@ impl Metastore for InMemoryMetastore {
                     .insert(key.clone(), (table, dropped_at));
             }
         }
-        state.databases.remove(name);
-        self.journal_delete(
-            journal::domain::DATABASES,
-            &Self::database_journal_key(name),
-        )
-        .await?;
+        // M17.2.2: tombstone the database record itself (UNDROP DATABASE).
+        if let Some(database) = state.databases.remove(name) {
+            self.journal_put(&CatalogRecord::DroppedDatabase(
+                database.clone(),
+                dropped_at,
+            ))
+            .await?;
+            self.journal_delete(
+                journal::domain::DATABASES,
+                &Self::database_journal_key(name),
+            )
+            .await?;
+            state
+                .dropped_databases
+                .insert(name.clone(), (database, dropped_at));
+        } else {
+            self.journal_delete(
+                journal::domain::DATABASES,
+                &Self::database_journal_key(name),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -835,9 +1065,12 @@ impl Metastore for InMemoryMetastore {
             }
             .fail();
         }
+        // One cascade event = one tombstone timestamp (shared with the
+        // schema tombstone below), so UNDROP SCHEMA restores exactly the
+        // tables this statement tombstoned.
+        let dropped_at = self.tombstone_ms();
         for key in tables {
             if let Some(table) = state.tables.remove(&key) {
-                let dropped_at = Self::now_ms();
                 self.journal_put(&CatalogRecord::DroppedTable(
                     table.clone(),
                     dropped_at,
@@ -851,12 +1084,29 @@ impl Metastore for InMemoryMetastore {
                 state.dropped_tables.insert(key, (table, dropped_at));
             }
         }
-        state.schemas.remove(&Self::schema_key(ident));
-        self.journal_delete(
-            journal::domain::SCHEMAS,
-            &Self::schema_journal_key(&ident.database, &ident.schema),
-        )
-        .await?;
+        // M17.2.2: tombstone the schema record itself (UNDROP SCHEMA, as-of
+        // container clones) before removing it.
+        if let Some(schema) = state.schemas.remove(&Self::schema_key(ident)) {
+            self.journal_put(&CatalogRecord::DroppedSchema(
+                schema.clone(),
+                dropped_at,
+            ))
+            .await?;
+            self.journal_delete(
+                journal::domain::SCHEMAS,
+                &Self::schema_journal_key(&ident.database, &ident.schema),
+            )
+            .await?;
+            state
+                .dropped_schemas
+                .insert(Self::schema_key(ident), (schema, dropped_at));
+        } else {
+            self.journal_delete(
+                journal::domain::SCHEMAS,
+                &Self::schema_journal_key(&ident.database, &ident.schema),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -1269,7 +1519,7 @@ impl Metastore for InMemoryMetastore {
     async fn delete_table(&self, ident: &TableIdent, _cascade: bool) -> Result<()> {
         let mut state = self.state.write().await;
         if let Some(table) = state.tables.remove(&Self::table_key(ident)) {
-            let dropped_at = Self::now_ms();
+            let dropped_at = self.tombstone_ms();
             self.journal_put(&CatalogRecord::DroppedTable(
                 table.clone(),
                 dropped_at,
@@ -1291,6 +1541,15 @@ impl Metastore for InMemoryMetastore {
     async fn undrop_table(&self, ident: &TableIdent) -> Result<RwObject<Table>> {
         let mut state = self.state.write().await;
         let key = Self::table_key(ident);
+        if !state.schemas.contains_key(&Self::schema_key(&ident.clone().into())) {
+            // Parent schema gone (dropped): UNDROP TABLE would create an
+            // orphan — Snowflake errors; UNDROP SCHEMA restores the pair.
+            return metastore_error::SchemaNotFoundSnafu {
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
         if state.tables.contains_key(&key) {
             return metastore_error::TableAlreadyExistsSnafu {
                 table: ident.table.clone(),
@@ -1326,8 +1585,356 @@ impl Metastore for InMemoryMetastore {
             .filter(|((db, sch, _), _)| db == &schema.database && sch == &schema.schema)
             .map(|(_, (table, dropped_at))| (table.clone(), *dropped_at))
             .collect();
-        items.sort_by(|a, b| b.1.cmp(&a.1));
+        items.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
         Ok(items.into_iter().map(|(table, _)| table).collect())
+    }
+
+    #[instrument(
+        name = "Metastore::list_dropped_tables_with_time",
+        level = "trace",
+        ret
+    )]
+    async fn list_dropped_tables_with_time(
+        &self,
+        schema: &SchemaIdent,
+    ) -> Result<Vec<(RwObject<Table>, i64)>> {
+        let state = self.state.read().await;
+        let mut items: Vec<(RwObject<Table>, i64)> = state
+            .dropped_tables
+            .iter()
+            .filter(|((db, sch, _), _)| db == &schema.database && sch == &schema.schema)
+            .map(|(_, (table, dropped_at))| (table.clone(), *dropped_at))
+            .collect();
+        items.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+        Ok(items)
+    }
+
+    #[instrument(
+        name = "Metastore::list_dropped_schemas",
+        level = "trace",
+        ret
+    )]
+    async fn list_dropped_schemas(
+        &self,
+        database: &DatabaseIdent,
+    ) -> Result<Vec<(RwObject<Schema>, i64)>> {
+        let state = self.state.read().await;
+        let mut items: Vec<(RwObject<Schema>, i64)> = state
+            .dropped_schemas
+            .iter()
+            .filter(|((db, _), _)| db == database)
+            .map(|(_, (schema, dropped_at))| (schema.clone(), *dropped_at))
+            .collect();
+        items.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+        Ok(items)
+    }
+
+    #[instrument(name = "Metastore::list_dropped_databases", level = "trace", ret)]
+    async fn list_dropped_databases(&self) -> Result<Vec<(RwObject<Database>, i64)>> {
+        let state = self.state.read().await;
+        let mut items: Vec<(RwObject<Database>, i64)> = state
+            .dropped_databases
+            .values()
+            .map(|(database, dropped_at)| (database.clone(), *dropped_at))
+            .collect();
+        items.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+        Ok(items)
+    }
+
+    #[instrument(name = "Metastore::undrop_schema", level = "debug", skip(self), err)]
+    async fn undrop_schema(&self, ident: &SchemaIdent) -> Result<RwObject<Schema>> {
+        let mut state = self.state.write().await;
+        let key = Self::schema_key(ident);
+        if state.schemas.contains_key(&key) {
+            return metastore_error::SchemaAlreadyExistsSnafu {
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        if !state.databases.contains_key(&ident.database) {
+            return metastore_error::DatabaseNotFoundSnafu {
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        let Some((schema, dropped_at)) = state.dropped_schemas.remove(&key) else {
+            return metastore_error::SchemaNotFoundSnafu {
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        };
+        // The cascade drop tombstoned every contained table at the same
+        // moment — restore those tombstones with the schema (tables dropped
+        // individually before the schema drop stay tombstoned).
+        let cascade_tables: Vec<_> = state
+            .dropped_tables
+            .iter()
+            .filter(|((db, sch, _), (_, table_dropped_at))| {
+                db == &ident.database && sch == &ident.schema && *table_dropped_at >= dropped_at
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for table_key in cascade_tables {
+            if let Some((table, _)) = state.dropped_tables.remove(&table_key) {
+                self.journal_put(&CatalogRecord::Table(table.clone()))
+                    .await?;
+                self.journal_delete(
+                    journal::domain::DROPPED_TABLES,
+                    &Self::table_journal_key(&table_key.0, &table_key.1, &table_key.2),
+                )
+                .await?;
+                state.tables.insert(table_key, table.clone());
+            }
+        }
+        self.journal_put(&CatalogRecord::Schema(schema.clone()))
+            .await?;
+        self.journal_delete(
+            journal::domain::DROPPED_SCHEMAS,
+            &Self::schema_journal_key(&ident.database, &ident.schema),
+        )
+        .await?;
+        state.schemas.insert(key, schema.clone());
+        Ok(schema)
+    }
+
+    #[instrument(name = "Metastore::undrop_database", level = "debug", skip(self), err)]
+    async fn undrop_database(&self, ident: &DatabaseIdent) -> Result<RwObject<Database>> {
+        let mut state = self.state.write().await;
+        if state.databases.contains_key(ident) {
+            return metastore_error::DatabaseAlreadyExistsSnafu {
+                db: ident.clone(),
+            }
+            .fail();
+        }
+        let Some((database, dropped_at)) = state.dropped_databases.remove(ident) else {
+            return metastore_error::DatabaseNotFoundSnafu {
+                db: ident.clone(),
+            }
+            .fail();
+        };
+        // Restore the schema tombstones the cascade created (schemas dropped
+        // individually before the database drop stay tombstoned), then the
+        // tables tombstoned at/after the database drop whose parent schema
+        // is live.
+        let cascade_schemas: Vec<_> = state
+            .dropped_schemas
+            .iter()
+            .filter(|((db, _), (_, schema_dropped_at))| {
+                db == ident && *schema_dropped_at >= dropped_at
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for schema_key in cascade_schemas {
+            if let Some((schema, _)) = state.dropped_schemas.remove(&schema_key) {
+                self.journal_put(&CatalogRecord::Schema(schema.clone()))
+                    .await?;
+                self.journal_delete(
+                    journal::domain::DROPPED_SCHEMAS,
+                    &Self::schema_journal_key(&schema_key.0, &schema_key.1),
+                )
+                .await?;
+                state.schemas.insert(schema_key.clone(), schema);
+            }
+        }
+        let cascade_tables: Vec<_> = state
+            .dropped_tables
+            .iter()
+            .filter(|((db, sch, _), (_, table_dropped_at))| {
+                db == ident
+                    && *table_dropped_at >= dropped_at
+                    && state.schemas.contains_key(&(db.clone(), sch.clone()))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for table_key in cascade_tables {
+            if let Some((table, _)) = state.dropped_tables.remove(&table_key) {
+                self.journal_put(&CatalogRecord::Table(table.clone()))
+                    .await?;
+                self.journal_delete(
+                    journal::domain::DROPPED_TABLES,
+                    &Self::table_journal_key(&table_key.0, &table_key.1, &table_key.2),
+                )
+                .await?;
+                state.tables.insert(table_key, table.clone());
+            }
+        }
+        self.journal_put(&CatalogRecord::Database(database.clone()))
+            .await?;
+        self.journal_delete(
+            journal::domain::DROPPED_DATABASES,
+            &Self::database_journal_key(ident),
+        )
+        .await?;
+        state.databases.insert(ident.clone(), database.clone());
+        Ok(database)
+    }
+
+    #[instrument(
+        name = "Metastore::clone_table_record_as_of",
+        level = "debug",
+        skip(self),
+        err
+    )]
+    async fn clone_table_record_as_of(
+        &self,
+        table: &RwObject<Table>,
+        to_schema: &SchemaIdent,
+        point_ms: i64,
+    ) -> Result<bool> {
+        let to = TableIdent::new(
+            &to_schema.database,
+            &to_schema.schema,
+            &table.data.ident.table,
+        );
+        {
+            let state = self.state.read().await;
+            if !state
+                .schemas
+                .contains_key(&Self::schema_key(to_schema))
+            {
+                return metastore_error::SchemaNotFoundSnafu {
+                    schema: to_schema.schema.clone(),
+                    db: to_schema.database.clone(),
+                }
+                .fail();
+            }
+            if state.tables.contains_key(&Self::table_key(&to)) {
+                // Target name occupied — the live table was already cloned
+                // from the live loop (recreated after the drop).
+                return Ok(false);
+            }
+        }
+        if rw_ms(table) > point_ms {
+            return Ok(false); // created after the point
+        }
+
+        // As-of pinning: latest Iceberg snapshot at or before the point.
+        // Snowflake parity: a table that existed before the point but whose
+        // commits all land after it clones as an EMPTY table (schema only,
+        // no data). A never-committed (or non-Iceberg) table clones its
+        // record as-is — that is exactly its as-of state.
+        if table.data.format == TableFormat::Iceberg
+            && (!table.data.metadata.snapshot_log.is_empty()
+                || table.data.metadata.current_snapshot_id.is_some())
+        {
+            let source = table;
+            let snapshot_id = source
+                .data
+                .metadata
+                .snapshot_log
+                .iter()
+                .filter(|e| e.timestamp_ms <= point_ms)
+                .max_by_key(|e| e.timestamp_ms)
+                .map(|e| e.snapshot_id);
+            let snapshot = match snapshot_id {
+                Some(id) => Some(
+                    source
+                        .data
+                        .metadata
+                        .snapshots
+                        .get(&id)
+                        .ok_or_else(|| {
+                            metastore_error::SnapshotNotFoundSnafu {
+                                snapshot: id,
+                                table: to.table.clone(),
+                                schema: to.schema.clone(),
+                                db: to.database.clone(),
+                            }
+                            .build()
+                        })?,
+                ),
+                None => None,
+            };
+            let (snapshots, snapshot_log, refs) = match (snapshot_id, snapshot) {
+                (Some(id), Some(s)) => (
+                    HashMap::from_iter([(id, s.clone())]),
+                    vec![SnapshotLog {
+                        snapshot_id: id,
+                        timestamp_ms: point_ms,
+                    }],
+                    HashMap::from_iter([(
+                        "main".to_string(),
+                        SnapshotReference {
+                            snapshot_id: id,
+                            retention: SnapshotRetention::Branch {
+                                min_snapshots_to_keep: None,
+                                max_snapshot_age_ms: None,
+                                max_ref_age_ms: None,
+                            },
+                        },
+                    )]),
+                ),
+                _ => (HashMap::new(), Vec::new(), HashMap::new()),
+            };
+            let metadata = TableMetadataBuilder::default()
+                .format_version(source.data.metadata.format_version)
+                .location(source.data.metadata.location.clone())
+                .last_updated_ms(point_ms)
+                .last_column_id(source.data.metadata.last_column_id)
+                .schemas(source.data.metadata.schemas.clone())
+                .current_schema_id(source.data.metadata.current_schema_id)
+                .partition_specs(source.data.metadata.partition_specs.clone())
+                .default_spec_id(source.data.metadata.default_spec_id)
+                .last_partition_id(source.data.metadata.last_partition_id)
+                .properties(source.data.metadata.properties.clone())
+                .current_snapshot_id(snapshot_id)
+                .snapshots(snapshots)
+                .snapshot_log(snapshot_log)
+                .refs(refs)
+                .build()
+                .context(metastore_error::TableMetadataBuilderSnafu)?;
+
+            let object_store =
+                self.table_object_store(&to)
+                    .await?
+                    .ok_or_else(|| {
+                        metastore_error::TableObjectStoreNotFoundSnafu {
+                            table: to.table.clone(),
+                            schema: to.schema.clone(),
+                            db: to.database.clone(),
+                        }
+                        .build()
+                    })?;
+            let metadata_location =
+                self.put_metadata(&to, object_store, &metadata).await?;
+
+            let clone = Table {
+                ident: to.clone(),
+                metadata,
+                metadata_location,
+                properties: source.data.properties.clone(),
+                volume_ident: source.data.volume_ident.clone(),
+                volume_location: source.data.volume_location.clone(),
+                is_temporary: source.data.is_temporary,
+                format: source.data.format.clone(),
+            };
+            let row = RwObject::new(clone);
+            self.journal_put(&CatalogRecord::Table(row.clone()))
+                .await?;
+            self.state
+                .write()
+                .await
+                .tables
+                .insert(Self::table_key(&to), row.clone());
+            return Ok(true);
+        }
+
+        // Plain clone of the record (zero-copy, current lineage).
+        let clone = Table {
+            ident: to.clone(),
+            ..table.data.clone()
+        };
+        let row = RwObject::new(clone);
+        self.journal_put(&CatalogRecord::Table(row.clone()))
+            .await?;
+        self.state
+            .write()
+            .await
+            .tables
+            .insert(Self::table_key(&to), row.clone());
+        Ok(true)
     }
 
     #[instrument(name = "Metastore::table_object_store", level = "trace", ret)]
@@ -2000,9 +2607,175 @@ mod undrop_tests {
             .await
             .unwrap();
         assert_eq!(dropped.len(), 1);
-        // Schema is gone — restore still works at the metastore level.
-        ms.undrop_table(&ident).await.expect("undrop");
+        // Schema is gone — UNDROP TABLE would orphan the table and errors
+        // (M17.2.2); UNDROP SCHEMA restores the pair.
+        let err = ms.undrop_table(&ident).await.unwrap_err().to_string();
+        assert!(err.contains("not found"), "got: {err}");
+        ms.undrop_schema(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .expect("undrop schema");
+        assert!(ms
+            .get_schema(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .unwrap()
+            .is_some());
+        // The cascade table tombstone was consumed by the schema restore.
         assert!(ms.get_table(&ident).await.unwrap().is_some());
+        let dropped = ms
+            .list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .unwrap();
+        assert!(dropped.is_empty());
+    }
+
+    async fn add_table(ms: &InMemoryMetastore, db: &str, schema: &str, table: &str) {
+        ms.create_table(
+            &TableIdent::new(db, schema, table),
+            TableCreateRequest {
+                ident: TableIdent::new(db, schema, table),
+                properties: None,
+                format: Some(TableFormat::Iceberg),
+                location: None,
+                schema: test_schema(),
+                partition_spec: None,
+                sort_order: None,
+                stage_create: None,
+                volume_ident: Some("vol".to_string()),
+                is_temporary: Some(false),
+            },
+        )
+        .await
+        .expect("table");
+    }
+
+    #[tokio::test]
+    async fn undrop_database_restores_cascade_containers() {
+        let ms = metastore_with_table("d", "s1", "t1").await;
+        ms.create_schema(
+            &SchemaIdent::new("d".into(), "s2".into()),
+            Schema {
+                ident: SchemaIdent::new("d".into(), "s2".into()),
+                properties: None,
+            },
+        )
+        .await
+        .expect("schema s2");
+        add_table(&ms, "d", "s2", "t2").await;
+
+        ms.delete_database(&"d".to_string(), true)
+            .await
+            .expect("db drop");
+        assert!(!ms.get_database(&"d".to_string()).await.unwrap().is_some());
+        assert_eq!(
+            ms.list_dropped_schemas(&"d".to_string()).await.unwrap().len(),
+            2
+        );
+
+        let restored = ms
+            .undrop_database(&"d".to_string())
+            .await
+            .expect("undrop database");
+        assert_eq!(restored.data.ident, "d");
+        // Both schemas and both cascade tables are back; tombstones consumed.
+        for s in ["s1", "s2"] {
+            assert!(ms
+                .get_schema(&SchemaIdent::new("d".into(), s.into()))
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert!(ms
+            .get_table(&TableIdent::new("d", "s1", "t1"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(ms
+            .get_table(&TableIdent::new("d", "s2", "t2"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(ms.list_dropped_schemas(&"d".to_string()).await.unwrap().is_empty());
+        assert!(ms.list_dropped_databases().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn undrop_schema_skips_individually_dropped_tables() {
+        let ms = metastore_with_table("d", "s", "t1").await;
+        add_table(&ms, "d", "s", "t2").await;
+
+        // t1 dropped individually (tombstone predates the schema drop).
+        ms.delete_table(&TableIdent::new("d", "s", "t1"), false)
+            .await
+            .expect("drop t1");
+        ms.delete_schema(&SchemaIdent::new("d".into(), "s".into()), true)
+            .await
+            .expect("schema drop");
+
+        ms.undrop_schema(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .expect("undrop schema");
+        // t2 (cascade drop) is restored; t1 (individual drop) stays dropped.
+        assert!(ms
+            .get_table(&TableIdent::new("d", "s", "t2"))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!ms
+            .get_table(&TableIdent::new("d", "s", "t1"))
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            ms.list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn undrop_errors_when_live_name_occupied() {
+        let ms = metastore_with_table("d", "s", "t").await;
+        ms.delete_schema(&SchemaIdent::new("d".into(), "s".into()), true)
+            .await
+            .expect("schema drop");
+        ms.create_schema(
+            &SchemaIdent::new("d".into(), "s".into()),
+            Schema {
+                ident: SchemaIdent::new("d".into(), "s".into()),
+                properties: None,
+            },
+        )
+        .await
+        .expect("recreate schema");
+        let err = ms
+            .undrop_schema(&SchemaIdent::new("d".into(), "s".into()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "got: {err}");
+
+        ms.delete_database(&"d".to_string(), true)
+            .await
+            .expect("db drop");
+        ms.create_database(
+            &"d".to_string(),
+            Database {
+                ident: "d".to_string(),
+                properties: None,
+                volume: "vol".to_string(),
+                should_refresh: false,
+            },
+        )
+        .await
+        .expect("recreate database");
+        let err = ms
+            .undrop_database(&"d".to_string())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "got: {err}");
     }
 }
 
@@ -2090,6 +2863,50 @@ mod clone_as_of_tests {
         // Target must not have been created by the failed clone.
         assert!(!ms
             .get_table(&TableIdent::new("d", "s", "t2"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn schema_clone_as_of_bounds_tables_by_creation() {
+        let ms = metastore_with_table("d", "s", "t").await;
+        let table = ms
+            .get_table(&TableIdent::new("d", "s", "t"))
+            .await
+            .unwrap()
+            .expect("table");
+        let created = table.created_at.and_utc().timestamp_millis();
+
+        // Point before the table's creation: nothing cloned (target schema
+        // is still created — it exists as of "now").
+        let cloned = ms
+            .clone_schema_as_of(
+                &SchemaIdent::new("d".into(), "s".into()),
+                &SchemaIdent::new("d".into(), "s2".into()),
+                created - 1000,
+            )
+            .await
+            .expect("clone as-of before creation");
+        assert_eq!(cloned, 0);
+        assert!(!ms
+            .get_table(&TableIdent::new("d", "s2", "t"))
+            .await
+            .unwrap()
+            .is_some());
+
+        // Point after creation: the never-committed record clones as-is.
+        let cloned = ms
+            .clone_schema_as_of(
+                &SchemaIdent::new("d".into(), "s".into()),
+                &SchemaIdent::new("d".into(), "s3".into()),
+                created + 1000,
+            )
+            .await
+            .expect("clone as-of after creation");
+        assert_eq!(cloned, 1);
+        assert!(ms
+            .get_table(&TableIdent::new("d", "s3", "t"))
             .await
             .unwrap()
             .is_some());

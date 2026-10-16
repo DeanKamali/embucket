@@ -6,11 +6,13 @@
 //! fresh metastore replays the journal at construction (bootstrap replay).
 //!
 //! The journal is a flat KV space per logical domain (`volumes`, `databases`,
-//! `schemas`, `tables`, `dropped_tables`, `streams`, `tasks`,
-//! `dynamic_tables`). Values are serde-serialized metastore records; the key
-//! is derived from the record's ident so replay can recompute keys without
-//! storing them separately. Dropped-table tombstones (design §15, M9.3)
-//! include the drop timestamp so UNDROP semantics survive restarts.
+//! `schemas`, `tables`, `dropped_tables`, `dropped_schemas`,
+//! `dropped_databases`, `streams`, `tasks`, `dynamic_tables`). Values are
+//! serde-serialized metastore records; the key is derived from the record's
+//! ident so replay can recompute keys without storing them separately.
+//! Dropped-table tombstones (design §15, M9.3) include the drop timestamp so
+//! UNDROP semantics survive restarts; M17.2.2 adds schema/database tombstones
+//! for UNDROP SCHEMA/DATABASE and as-of container clones.
 
 use crate::models::{
     RwObject,
@@ -35,14 +37,20 @@ pub mod domain {
     pub const SCHEMAS: &str = "schemas";
     pub const TABLES: &str = "tables";
     pub const DROPPED_TABLES: &str = "dropped_tables";
+    /// M17.2.2: schema-level tombstones (UNDROP SCHEMA).
+    pub const DROPPED_SCHEMAS: &str = "dropped_schemas";
+    /// M17.2.2: database-level tombstones (UNDROP DATABASE).
+    pub const DROPPED_DATABASES: &str = "dropped_databases";
     pub const STREAMS: &str = "streams";
     pub const TASKS: &str = "tasks";
     pub const DYNAMIC_TABLES: &str = "dynamic_tables";
 
-    /// Replay order: dropped-table tombstones are applied before live
-    /// records so a record present in both (crash between the two journal
-    /// writes of an undrop, or a re-create over a drop) resolves to live.
-    pub const REPLAY_ORDER: [&str; 8] = [
+    /// Replay order: tombstones are applied before live records so a record
+    /// present in both (crash between the two journal writes of an undrop,
+    /// or a re-create over a drop) resolves to live.
+    pub const REPLAY_ORDER: [&str; 10] = [
+        DROPPED_DATABASES,
+        DROPPED_SCHEMAS,
         DROPPED_TABLES,
         VOLUMES,
         DATABASES,
@@ -64,6 +72,10 @@ pub enum CatalogRecord {
     Table(RwObject<Table>),
     /// Tombstone for a dropped table (record + epoch-ms drop time).
     DroppedTable(RwObject<Table>, i64),
+    /// Tombstone for a dropped schema (record + epoch-ms drop time). M17.2.2.
+    DroppedSchema(RwObject<Schema>, i64),
+    /// Tombstone for a dropped database (record + epoch-ms drop time). M17.2.2.
+    DroppedDatabase(RwObject<Database>, i64),
     Stream(RwObject<Stream>),
     Task(RwObject<Task>),
     DynamicTable(RwObject<DynamicTable>),
@@ -80,6 +92,8 @@ impl CatalogRecord {
             Self::Schema(_) => domain::SCHEMAS,
             Self::Table(_) => domain::TABLES,
             Self::DroppedTable(..) => domain::DROPPED_TABLES,
+            Self::DroppedSchema(..) => domain::DROPPED_SCHEMAS,
+            Self::DroppedDatabase(..) => domain::DROPPED_DATABASES,
             Self::Stream(_) => domain::STREAMS,
             Self::Task(_) => domain::TASKS,
             Self::DynamicTable(_) => domain::DYNAMIC_TABLES,
@@ -87,13 +101,16 @@ impl CatalogRecord {
     }
 
     /// The record's ident, lowercased — the journal key (see module docs).
-    /// `DroppedTable` uses the *dropped table's* ident.
+    /// `DroppedTable` uses the *dropped table's* ident; `DroppedSchema` /
+    /// `DroppedDatabase` use the *dropped container's* ident.
     #[must_use]
     pub fn journal_key(&self) -> String {
         match self {
             Self::Volume(v) => v.data.ident.to_ascii_lowercase(),
-            Self::Database(d) => d.data.ident.to_ascii_lowercase(),
-            Self::Schema(s) => format!(
+            Self::Database(d) | Self::DroppedDatabase(d, _) => {
+                d.data.ident.to_ascii_lowercase()
+            }
+            Self::Schema(s) | Self::DroppedSchema(s, _) => format!(
                 "{}{}{}",
                 s.data.ident.database.to_ascii_lowercase(),
                 key_sep(),

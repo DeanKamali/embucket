@@ -16,6 +16,9 @@ use time::Duration;
 
 pub const JWT_TOKEN_EXPIRATION_SECONDS: u32 = 3 * 24 * 60 * 60;
 
+/// Master token lifetime (Snowflake default is 4h session / 24h master).
+pub const MASTER_TOKEN_EXPIRATION_SECONDS: u32 = 24 * 60 * 60;
+
 #[tracing::instrument(
     name = "api_snowflake_rest::handle_login_request",
     level = "debug",
@@ -83,18 +86,22 @@ pub async fn handle_login_request(
 
     tracing::Span::current().record("session_metadata", format!("{session_metadata:?}"));
 
-    let tokenized_session = TokenizedSession::default().with_metadata(session_metadata);
+    let tokenized_session = TokenizedSession::default().with_metadata(session_metadata.clone());
 
     let jwt_claims = jwt_claims(
         &login_name,
         &host,
         Duration::seconds(JWT_TOKEN_EXPIRATION_SECONDS.into()),
-        tokenized_session,
+        tokenized_session.clone(),
     );
 
     tracing::info!("Host '{host}' for token creation");
 
     let session_id = jwt_claims.session.session_id();
+    // The driver core expects a numeric `sessionId`; our session ids are
+    // strings (uuid-like), so v1 emits a best-effort numeric id and keeps
+    // the authoritative id in the JWT claims.
+    let numeric_session_id: i64 = session_id.parse().unwrap_or(0);
     let _session = state
         .execution_svc
         .create_session(session_id, Some(jwt_claims.session.metadata().clone()))
@@ -102,8 +109,28 @@ pub async fn handle_login_request(
 
     let jwt_token = create_jwt(&jwt_claims, jwt_secret).context(CreateJwtSnafu)?;
 
+    // Master token (M13): the driver core requires `masterToken` in the login
+    // response for session renewal. v1 issues a second JWT over the *same*
+    // session with a longer lifetime; refresh/renewal endpoints are a
+    // follow-up (§16 record).
+    let master_claims = api_snowflake_rest_sessions::helpers::jwt_claims(
+        &login_name,
+        &host,
+        Duration::seconds(MASTER_TOKEN_EXPIRATION_SECONDS.into()),
+        tokenized_session.clone(),
+    );
+    let master_token = create_jwt(&master_claims, jwt_secret).context(CreateJwtSnafu)?;
+
     Ok(LoginResponse {
-        data: Option::from(LoginResponseData { token: jwt_token }),
+        data: Option::from(LoginResponseData {
+            token: jwt_token,
+            master_token,
+            validity_in_seconds: Some(JWT_TOKEN_EXPIRATION_SECONDS.into()),
+            master_validity_in_seconds: Some(MASTER_TOKEN_EXPIRATION_SECONDS.into()),
+            display_user_name: Some(login_name.clone()),
+            server_version: None,
+            session_id: numeric_session_id,
+        }),
         success: true,
         message: Option::from("successfully executed".to_string()),
     })

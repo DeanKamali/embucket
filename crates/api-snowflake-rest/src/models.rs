@@ -25,9 +25,54 @@ pub struct LoginResponse {
     pub message: Option<String>,
 }
 
+/// DML affected-row stats (Snowflake `Data.stats` shape). Values are
+/// serialized as JSON numbers — the driver core's proto parser expects
+/// int64 `QueryStats` (inserted/updated/deleted/duplicates) and rejects
+/// string-encoded values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DmlStats {
+    pub num_rows_inserted: i64,
+    pub num_rows_updated: i64,
+    pub num_rows_deleted: i64,
+    #[serde(rename = "numDmlDuplicates", skip_serializing_if = "is_zero")]
+    pub num_dml_duplicates: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoginResponseData {
     pub token: String,
+    /// Master session token (Snowflake wire shape: `masterToken`); the
+    /// driver core requires it for session refresh/renewal (M13).
+    #[serde(rename = "masterToken")]
+    pub master_token: String,
+    /// Session token validity in seconds (`validityInSeconds`).
+    #[serde(rename = "validityInSeconds", skip_serializing_if = "Option::is_none")]
+    pub validity_in_seconds: Option<i64>,
+    /// Master token validity in seconds (`masterValidityInSeconds`).
+    #[serde(
+        rename = "masterValidityInSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub master_validity_in_seconds: Option<i64>,
+    #[serde(
+        rename = "displayUserName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_user_name: Option<String>,
+    /// Session id (`sessionId`), required by the driver core to address the
+    /// session in renew/refresh requests.
+    #[serde(rename = "sessionId")]
+    pub session_id: i64,
+    #[serde(
+        rename = "serverVersion",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub server_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +155,16 @@ pub struct ResponseData {
     pub returned: Option<i64>,
     #[serde(rename = "queryResultFormat")]
     pub query_result_format: Option<String>,
+    /// Snowflake statement type id (family nibble drives connector
+    /// rowcount/behavior classification, M13 wire parity).
+    #[serde(
+        rename = "statementTypeId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub statement_type_id: Option<i64>,
+    /// Affected-row stats for DML (metering/ACCOUNT_USAGE shape).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<DmlStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,6 +196,15 @@ pub struct ColumnInfo {
     scale: Option<i32>,
     precision: Option<i32>,
     collation: Option<String>,
+}
+
+impl ColumnInfo {
+    /// Rename a column in a built response (DML count columns carry
+    /// Snowflake's canonical name — `number of rows inserted` — which the
+    /// driver core keys on when extracting `rowsAffected`).
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
 }
 
 impl From<ColumnInfoModel> for ColumnInfo {

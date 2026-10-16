@@ -176,3 +176,16 @@ option_if_let_else = { level = "allow", priority = 2 }
 needless_for_each = { level = "allow", priority = 2 } #  #[derive(OpenApi)]
 
 # TEMPORARY (M11 debug): local fork copy with eprintln diagnostics.
+
+# Local iceberg-rust fork: overwrite (Replace) commits must extend the
+# current snapshot's lineage (parent_snapshot_id) so change-feed scans can
+# walk (start, end] ancestry — upstream Replace created parentless root
+# snapshots, breaking streams and incremental MV refresh after any
+# INSERT OVERWRITE. All sibling crates are patched to the same local copy
+# so intra-repo path deps resolve to one coherent source tree.
+[patch."https://github.com/Embucket/iceberg-rust.git"]
+datafusion_iceberg = { path = "/root/iceberg-rust-fork/datafusion_iceberg" }
+iceberg-rest-catalog = { path = "/root/iceberg-rust-fork/catalogs/iceberg-rest-catalog" }
+iceberg-rust = { path = "/root/iceberg-rust-fork/iceberg-rust" }
+iceberg-rust-spec = { path = "/root/iceberg-rust-fork/iceberg-rust-spec" }
+iceberg-s3tables-catalog = { path = "/root/iceberg-rust-fork/catalogs/iceberg-s3tables-catalog" }

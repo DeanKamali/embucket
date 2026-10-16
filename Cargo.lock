@@ -3256,7 +3256,6 @@ dependencies = [
 [[package]]
 name = "datafusion_iceberg"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4834,7 +4833,6 @@ dependencies = [
 [[package]]
 name = "iceberg-rest-catalog"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -4859,7 +4857,6 @@ dependencies = [
 [[package]]
 name = "iceberg-rust"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "apache-avro",
  "arrow 59.2.0",
@@ -4895,7 +4892,6 @@ dependencies = [
 [[package]]
 name = "iceberg-rust-spec"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "apache-avro",
  "arrow-schema 59.2.0",
@@ -4923,7 +4919,6 @@ dependencies = [
 [[package]]
 name = "iceberg-s3tables-catalog"
 version = "0.10.0"
-source = "git+https://github.com/Embucket/iceberg-rust.git?branch=embucket-sync-df55.0.0#3ccc1e82238ad159e15e368ac6256f518115c0c4"
 dependencies = [
  "async-trait",
  "aws-config",

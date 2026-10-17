@@ -92,6 +92,17 @@ pub struct UserRole {
     pub role: String,
 }
 
+/// A role-role grant (design §23, M17.3 role hierarchies):
+/// `GRANT ROLE <child> TO ROLE <parent>` — `child`'s privileges become
+/// part of `parent`'s effective privilege set (transitively).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleRole {
+    /// The granted (child) role.
+    pub child: String,
+    /// The receiving (parent) role.
+    pub parent: String,
+}
+
 /// A login attempt (M17.1, `LOGIN_HISTORY`). Timestamps are epoch
 /// milliseconds (the account crate carries no chrono dep).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

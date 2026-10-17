@@ -437,6 +437,20 @@ impl TableFunctionImpl for GrantsToRolesTableFunc {
                             grant.object.to_string(),
                         ));
                     }
+                    // Role hierarchies (M17.3): child roles granted to this
+                    // role appear as `GRANT ROLE <child>` rows.
+                    for child in account
+                        .role_children(&role.name)
+                        .await
+                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+                    {
+                        rows.push((
+                            role.name.clone(),
+                            format!("GRANT ROLE {child}"),
+                            "ROLE".to_string(),
+                            child,
+                        ));
+                    }
                 }
                 let schema = Arc::new(GrantsToRolesTableFunc::schema());
                 let batch = RecordBatch::try_new(

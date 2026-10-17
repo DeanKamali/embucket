@@ -97,7 +97,9 @@ impl SessionAuthz {
         Ok(Some(Arc::new(authz)))
     }
 
-    /// Activate `role` for this session's user: the user must hold the role,
+    /// Activate `role` for this session's user: the user must hold the role
+    /// directly, hold it through the role hierarchy (it lies in the
+    /// transitive closure of the user's directly granted roles — M17.3),
     /// or hold `ACCOUNTADMIN` (which may assume any role). Refreshes the
     /// snapshot. `ACCOUNTADMIN` activation makes the session an admin.
     pub async fn activate_role(&self, role: &str) -> Result<()> {
@@ -109,7 +111,12 @@ impl SessionAuthz {
         };
         let held = self.store.user_roles(&self.user).await?;
         let holds_admin = held.iter().any(|h| h.eq_ignore_ascii_case(ACCOUNTADMIN));
-        if !holds_admin && !held.iter().any(|h| h.eq_ignore_ascii_case(&r.name)) {
+        let effective = if holds_admin {
+            Vec::new()
+        } else {
+            self.store.effective_roles(&held).await?
+        };
+        if !holds_admin && !effective.iter().any(|h| h.eq_ignore_ascii_case(&r.name)) {
             return account_error::NotAllowedSnafu {
                 message: format!("role '{}' is not granted to user '{}'", r.name, self.user),
             }
@@ -160,13 +167,19 @@ impl SessionAuthz {
                 })
                 .map(|db| db.ident.to_ascii_lowercase())
                 .collect();
-            snapshot.grants = self
-                .store
-                .role_grants(role)
-                .await?
-                .into_iter()
-                .map(|g| (g.privilege, g.object))
-                .collect();
+            snapshot.grants = {
+                // Role hierarchies (M17.3): the active role's effective
+                // privilege set unions its own grants with the grants of
+                // every role granted beneath it, transitively.
+                let effective = self.store.effective_roles(&[role.to_string()]).await?;
+                let mut grants = std::collections::HashSet::new();
+                for r in &effective {
+                    for g in self.store.role_grants(r).await? {
+                        grants.insert((g.privilege, g.object));
+                    }
+                }
+                grants
+            };
         }
         *self.snapshot.write().unwrap() = snapshot;
         Ok(())
@@ -549,6 +562,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(authz2.active_role(), "analyst");
+    }
+
+    #[tokio::test]
+    async fn role_hierarchy_inherits_privileges_and_activation() {
+        let (store, metastore) = setup(None).await;
+        // senior (u2's role) inherits analyst's grants via the hierarchy.
+        store.create_role("senior").await.unwrap();
+        store.create_user(User {
+            name: "u2".into(),
+            login_name: "u2".into(),
+            password: "pw".into(),
+            default_role: Some("senior".into()),
+            tenant: None,
+            disabled: false,
+        })
+        .await
+        .unwrap();
+        store.grant_role_to_user("u2", "senior").await.unwrap();
+        store.grant_role_to_role("analyst", "senior").await.unwrap();
+        store
+            .grant(Grant {
+                role: "analyst".into(),
+                privilege: Privilege::Usage,
+                object: AccountObject::Database("embucket".into()),
+            })
+            .await
+            .unwrap();
+
+        let authz = SessionAuthz::new(Arc::clone(&store), Arc::clone(&metastore), "u2", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authz.active_role(), "senior");
+        // Inherited: senior sees analyst's database USAGE.
+        assert!(authz.database_visible("embucket"));
+        // Indirect activation: analyst lies beneath senior's hierarchy.
+        authz.activate_role("analyst").await.unwrap();
+        assert_eq!(authz.active_role(), "analyst");
+
+        // Upward is NOT inherited: u1 (analyst) cannot assume senior.
+        let authz1 = SessionAuthz::new(Arc::clone(&store), Arc::clone(&metastore), "u1", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(authz1.activate_role("senior").await.is_err());
+
+        // Revoking the hierarchy link removes the inherited privilege.
+        store.revoke_role_from_role("analyst", "senior").await.unwrap();
+        authz.activate_role("senior").await.unwrap();
+        assert!(!authz.database_visible("embucket"));
+        // ...and u2 can no longer activate analyst (no longer beneath senior).
+        assert!(authz.activate_role("analyst").await.is_err());
     }
 
     #[tokio::test]

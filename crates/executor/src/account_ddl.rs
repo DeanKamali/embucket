@@ -62,6 +62,16 @@ pub enum AccountStatement {
         role: String,
         user: String,
     },
+    /// `GRANT ROLE <child> TO ROLE <parent>` (M17.3 role hierarchies).
+    GrantRoleRole {
+        child: String,
+        parent: String,
+    },
+    /// `REVOKE ROLE <child> FROM ROLE <parent>`.
+    RevokeRoleRole {
+        child: String,
+        parent: String,
+    },
     Grant {
         privilege: Privilege,
         object: AccountObject,
@@ -206,18 +216,30 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
                 });
             }
             // Role membership: `GRANT ROLE <r> TO USER <u>` /
-            // `REVOKE ROLE <r> FROM USER <u>`.
-            if tok.len() == 6
-                && tok[1].eq_ignore_ascii_case("role")
-                && tok[4].eq_ignore_ascii_case("user")
-                && tok[3].eq_ignore_ascii_case(if is_grant { "to" } else { "from" })
-            {
-                let (role, user) = (tok[2].to_string(), tok[5].to_string());
-                return if is_grant {
-                    Some(AccountStatement::GrantRole { role, user })
-                } else {
-                    Some(AccountStatement::RevokeRole { role, user })
-                };
+            // `REVOKE ROLE <r> FROM USER <u>`, or the hierarchy form
+            // `GRANT ROLE <child> TO ROLE <parent>` (M17.3).
+            if tok.len() == 6 && tok[1].eq_ignore_ascii_case("role") {
+                let direction_ok =
+                    tok[3].eq_ignore_ascii_case(if is_grant { "to" } else { "from" });
+                if !direction_ok {
+                    return None;
+                }
+                if tok[4].eq_ignore_ascii_case("user") {
+                    let (role, user) = (tok[2].to_string(), tok[5].to_string());
+                    return if is_grant {
+                        Some(AccountStatement::GrantRole { role, user })
+                    } else {
+                        Some(AccountStatement::RevokeRole { role, user })
+                    };
+                }
+                if tok[4].eq_ignore_ascii_case("role") {
+                    let (child, parent) = (tok[2].to_string(), tok[5].to_string());
+                    return if is_grant {
+                        Some(AccountStatement::GrantRoleRole { child, parent })
+                    } else {
+                        Some(AccountStatement::RevokeRoleRole { child, parent })
+                    };
+                }
             }
             return None;
         }
@@ -473,6 +495,20 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
                 .map_err(|e| external_error("account", e))?;
             crate::clone_ddl::status_row()
         }
+        AccountStatement::GrantRoleRole { child, parent } => {
+            store
+                .grant_role_to_role(&norm(child), &norm(parent))
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::RevokeRoleRole { child, parent } => {
+            store
+                .revoke_role_from_role(&norm(child), &norm(parent))
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
         AccountStatement::Grant {
             privilege,
             object,
@@ -537,6 +573,19 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
                 privilege_col.push(g.privilege.to_string());
                 granted_on_col.push(g.object.kind().to_string());
                 name_col.push(g.object.to_string());
+                granted_to_col.push("ROLE".to_string());
+                grantee_col.push(role.clone());
+            }
+            // Role hierarchies (M17.3): roles granted *to* this role show
+            // as `GRANT ROLE <child>` rows (Snowflake shape).
+            let children = store
+                .role_children(&role)
+                .await
+                .map_err(|e| external_error("account", e))?;
+            for child in children {
+                privilege_col.push(format!("GRANT ROLE {child}"));
+                granted_on_col.push("ROLE".to_string());
+                name_col.push(child);
                 granted_to_col.push("ROLE".to_string());
                 grantee_col.push(role.clone());
             }
@@ -956,7 +1005,22 @@ mod tests {
             }
         );
         assert!(parse("GRANT INSERT ON TABLE db.s.t TO ROLE r").is_none());
-        assert!(parse("GRANT ROLE r1 TO ROLE r2").is_none());
+        // Role hierarchies (M17.3).
+        assert_eq!(
+            parsed("GRANT ROLE junior TO ROLE analyst"),
+            AccountStatement::GrantRoleRole {
+                child: "junior".into(),
+                parent: "analyst".into()
+            }
+        );
+        assert_eq!(
+            parsed("revoke role junior from role analyst;"),
+            AccountStatement::RevokeRoleRole {
+                child: "junior".into(),
+                parent: "analyst".into()
+            }
+        );
+        assert!(parse("GRANT ROLE r1 TO SHARE s").is_none());
     }
 
     #[test]

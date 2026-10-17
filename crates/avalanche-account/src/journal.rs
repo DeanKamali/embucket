@@ -12,7 +12,7 @@
 //! idempotent per key, so replay order across domains does not matter
 //! (unlike the catalog journal, there are no cascading tombstones).
 
-use crate::models::{Grant, LoginEvent, Role, Share, ShareGrant, User, UserRole};
+use crate::models::{Grant, LoginEvent, Role, RoleRole, Share, ShareGrant, User, UserRole};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +30,7 @@ pub mod domain {
     pub const USERS: &str = "account_users";
     pub const ROLES: &str = "account_roles";
     pub const USER_ROLES: &str = "account_user_roles";
+    pub const ROLE_ROLES: &str = "account_role_roles";
     pub const GRANTS: &str = "account_grants";
     pub const SHARES: &str = "account_shares";
     pub const SHARE_GRANTS: &str = "account_share_grants";
@@ -37,10 +38,11 @@ pub mod domain {
 
     /// All domains (no ordering requirement — records are idempotent per
     /// key; see module docs).
-    pub const ALL: [&str; 7] = [
+    pub const ALL: [&str; 8] = [
         USERS,
         ROLES,
         USER_ROLES,
+        ROLE_ROLES,
         GRANTS,
         SHARES,
         SHARE_GRANTS,
@@ -61,6 +63,7 @@ pub enum AccountRecord {
     User(User),
     Role(Role),
     UserRole(UserRole),
+    RoleRole(RoleRole),
     Grant(Grant),
     Share(Share),
     ShareGrant(ShareGrant),
@@ -75,6 +78,7 @@ impl AccountRecord {
             Self::User(_) => domain::USERS,
             Self::Role(_) => domain::ROLES,
             Self::UserRole(_) => domain::USER_ROLES,
+            Self::RoleRole(_) => domain::ROLE_ROLES,
             Self::Grant(_) => domain::GRANTS,
             Self::Share(_) => domain::SHARES,
             Self::ShareGrant(_) => domain::SHARE_GRANTS,
@@ -93,6 +97,9 @@ impl AccountRecord {
             Self::Role(r) => r.name.to_ascii_lowercase(),
             Self::UserRole(ur) => {
                 format!("{}{sep}{}", ur.user.to_ascii_lowercase(), ur.role.to_ascii_lowercase())
+            }
+            Self::RoleRole(rr) => {
+                format!("{}{sep}{}", rr.child.to_ascii_lowercase(), rr.parent.to_ascii_lowercase())
             }
             Self::Grant(g) => format!(
                 "{}{sep}{}{sep}{}{sep}{}",

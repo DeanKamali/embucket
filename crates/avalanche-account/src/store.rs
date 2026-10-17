@@ -6,7 +6,7 @@
 
 use crate::error::{self as account_error, Result};
 use crate::models::{
-    AccountObject, Grant, LoginEvent, Privilege, Role, Share, ShareGrant, User, UserRole,
+    AccountObject, Grant, LoginEvent, Privilege, Role, RoleRole, Share, ShareGrant, User, UserRole,
     ACCOUNTADMIN,
 };
 use async_trait::async_trait;
@@ -33,6 +33,26 @@ fn bump_account_epoch() {
     ACCOUNT_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Whether `target` is reachable from `start` walking the children graph
+/// (`parent → child` edges of `role_roles`). Keys are pre-lowercased.
+fn role_graph_reachable(links: &[RoleRole], start: &str, target: &str) -> bool {
+    let mut queue = vec![start.to_string()];
+    let mut seen = vec![start.to_string()];
+    while let Some(next) = queue.pop() {
+        for rr in links.iter().filter(|rr| key(&rr.parent) == next) {
+            let ck = key(&rr.child);
+            if ck == target {
+                return true;
+            }
+            if !seen.contains(&ck) {
+                seen.push(ck.clone());
+                queue.push(ck);
+            }
+        }
+    }
+    false
+}
+
 #[async_trait]
 pub trait AccountStore: std::fmt::Debug + Send + Sync {
     async fn create_role(&self, name: &str) -> Result<Role>;
@@ -49,6 +69,19 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
     async fn grant_role_to_user(&self, user: &str, role: &str) -> Result<()>;
     async fn revoke_role_from_user(&self, user: &str, role: &str) -> Result<()>;
     async fn user_roles(&self, user: &str) -> Result<Vec<String>>;
+
+    /// Grant `child` to `parent` (design §23, M17.3 role hierarchies):
+    /// `parent`'s effective privilege set becomes the union of its own
+    /// grants and every role granted beneath it, transitively. Rejects
+    /// self-grants and grants that would create a cycle.
+    async fn grant_role_to_role(&self, child: &str, parent: &str) -> Result<()>;
+    async fn revoke_role_from_role(&self, child: &str, parent: &str) -> Result<()>;
+    /// Roles granted directly *beneath* `parent` (its direct children).
+    async fn role_children(&self, parent: &str) -> Result<Vec<String>>;
+    /// Transitive closure of `roles` over the role-role graph: each role
+    /// plus everything granted beneath it. Cycle-safe (the graph is
+    /// acyclic by construction, but the walk defends anyway).
+    async fn effective_roles(&self, roles: &[String]) -> Result<Vec<String>>;
 
     async fn grant(&self, grant: Grant) -> Result<()>;
     async fn revoke(&self, grant: &Grant) -> Result<()>;
@@ -91,6 +124,7 @@ struct StoreState {
     roles: HashMap<String, Role>,
     grants: Vec<Grant>,
     user_roles: Vec<UserRole>,
+    role_roles: Vec<RoleRole>,
     shares: HashMap<String, Share>,
     share_grants: Vec<ShareGrant>,
     logins: Vec<LoginEvent>,
@@ -149,6 +183,9 @@ impl InMemoryAccountStore {
                     }
                     crate::journal::AccountRecord::UserRole(ur) => {
                         state.user_roles.push(ur);
+                    }
+                    crate::journal::AccountRecord::RoleRole(rr) => {
+                        state.role_roles.push(rr);
                     }
                     crate::journal::AccountRecord::Grant(g) => state.grants.push(g),
                     crate::journal::AccountRecord::Share(s) => {
@@ -310,12 +347,23 @@ impl AccountStore for InMemoryAccountStore {
             .filter(|ur| key(&ur.role).eq_ignore_ascii_case(&key(name)))
             .cloned()
             .collect();
+        // Role-role grants vanish with either endpoint (M17.3).
+        let removed_role_links: Vec<RoleRole> = state
+            .role_roles
+            .iter()
+            .filter(|rr| key(&rr.child) == key(name) || key(&rr.parent) == key(name))
+            .cloned()
+            .collect();
         for g in &removed_grants {
             self.journal_delete(&crate::journal::AccountRecord::Grant(g.clone()))
                 .await?;
         }
         for ur in &removed_links {
             self.journal_delete(&crate::journal::AccountRecord::UserRole(ur.clone()))
+                .await?;
+        }
+        for rr in &removed_role_links {
+            self.journal_delete(&crate::journal::AccountRecord::RoleRole(rr.clone()))
                 .await?;
         }
         self.journal_delete(&crate::journal::AccountRecord::Role(Role {
@@ -326,6 +374,9 @@ impl AccountStore for InMemoryAccountStore {
         state
             .user_roles
             .retain(|ur| !key(&ur.role).eq_ignore_ascii_case(&key(name)));
+        state
+            .role_roles
+            .retain(|rr| !(key(&rr.child) == key(name) || key(&rr.parent) == key(name)));
         Ok(())
     }
 
@@ -454,6 +505,116 @@ impl AccountStore for InMemoryAccountStore {
             .filter(|ur| key(&ur.user) == key(user))
             .map(|ur| ur.role.clone())
             .collect())
+    }
+
+    async fn grant_role_to_role(&self, child: &str, parent: &str) -> Result<()> {
+        bump_account_epoch();
+        let mut state = self.state.write().await;
+        if !state.roles.contains_key(&key(child)) {
+            return account_error::RoleNotFoundSnafu { role: child.to_string() }.fail();
+        }
+        if !state.roles.contains_key(&key(parent)) {
+            return account_error::RoleNotFoundSnafu { role: parent.to_string() }.fail();
+        }
+        if key(child) == key(parent) {
+            return account_error::NotAllowedSnafu {
+                message: format!("cannot grant role '{child}' to itself"),
+            }
+            .fail();
+        }
+        // A cycle forms when `parent` is already (transitively) beneath
+        // `child` in the hierarchy: walk the children graph from `child`
+        // and look for `parent` (Snowflake rejects circular hierarchies).
+        if role_graph_reachable(&state.role_roles, &key(child), &key(parent)) {
+            return account_error::NotAllowedSnafu {
+                message: format!(
+                    "circular role hierarchy detected: role '{parent}' \
+                     already inherits from '{child}'"
+                ),
+            }
+            .fail();
+        }
+        let link = RoleRole {
+            child: child.to_string(),
+            parent: parent.to_string(),
+        };
+        let exists = state
+            .role_roles
+            .iter()
+            .any(|rr| key(&rr.child) == key(child) && key(&rr.parent) == key(parent));
+        if !exists {
+            state.role_roles.push(link.clone());
+            self.journal_put(&crate::journal::AccountRecord::RoleRole(link))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn revoke_role_from_role(&self, child: &str, parent: &str) -> Result<()> {
+        bump_account_epoch();
+        let mut state = self.state.write().await;
+        let removed: Vec<RoleRole> = state
+            .role_roles
+            .iter()
+            .filter(|rr| key(&rr.child) == key(child) && key(&rr.parent) == key(parent))
+            .cloned()
+            .collect();
+        if removed.is_empty() {
+            return account_error::GrantNotFoundSnafu {
+                message: format!("role '{child}' is not granted to role '{parent}'"),
+            }
+            .fail();
+        }
+        for rr in &removed {
+            self.journal_delete(&crate::journal::AccountRecord::RoleRole(rr.clone()))
+                .await?;
+        }
+        state
+            .role_roles
+            .retain(|rr| !(key(&rr.child) == key(child) && key(&rr.parent) == key(parent)));
+        Ok(())
+    }
+
+    async fn role_children(&self, parent: &str) -> Result<Vec<String>> {
+        let state = self.state.read().await;
+        Ok(state
+            .role_roles
+            .iter()
+            .filter(|rr| key(&rr.parent) == key(parent))
+            .map(|rr| rr.child.clone())
+            .collect())
+    }
+
+    async fn effective_roles(&self, roles: &[String]) -> Result<Vec<String>> {
+        let state = self.state.read().await;
+        // Resolve a lowercase key back to a display name: prefer the seed
+        // (caller) casing, then the stored grant casing, then the key.
+        let name_for = |k: &str| -> String {
+            if let Some(r) = roles.iter().find(|r| key(r) == k) {
+                return r.clone();
+            }
+            state
+                .role_roles
+                .iter()
+                .find(|rr| key(&rr.child) == k)
+                .map(|rr| rr.child.clone())
+                .unwrap_or_else(|| k.to_string())
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut queue: Vec<String> = roles.iter().map(|r| key(r)).collect();
+        while let Some(next) = queue.pop() {
+            if out.iter().any(|r| key(r) == next) {
+                continue;
+            }
+            out.push(name_for(&next));
+            for rr in state.role_roles.iter().filter(|rr| key(&rr.parent) == next) {
+                let ck = key(&rr.child);
+                if !queue.contains(&ck) && !out.iter().any(|r| key(r) == ck) {
+                    queue.push(ck);
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn grant(&self, grant: Grant) -> Result<()> {
@@ -1085,5 +1246,108 @@ mod tests {
         .await
         .unwrap();
         assert!(super::account_epoch() > after_grant, "revoke bumps");
+    }
+
+    #[tokio::test]
+    async fn role_hierarchy_grant_revoke_and_effective() {
+        let s = store();
+        for name in ["junior", "analyst", "senior"] {
+            s.create_role(name).await.unwrap();
+        }
+        // Chain: junior -> analyst -> senior (senior inherits both).
+        s.grant_role_to_role("junior", "analyst").await.unwrap();
+        s.grant_role_to_role("analyst", "senior").await.unwrap();
+        // Idempotent re-grant.
+        s.grant_role_to_role("junior", "analyst").await.unwrap();
+
+        assert_eq!(
+            s.role_children("analyst").await.unwrap(),
+            vec!["junior".to_string()]
+        );
+        let eff = s.effective_roles(&["senior".to_string()]).await.unwrap();
+        for name in ["senior", "analyst", "junior"] {
+            assert!(eff.iter().any(|r| r.eq_ignore_ascii_case(name)), "{:?}", eff);
+        }
+        assert_eq!(eff.len(), 3);
+        // Seeds keep their casing; inherited roles come from the grants.
+        let eff = s.effective_roles(&["Analyst".to_string()]).await.unwrap();
+        assert_eq!(eff.len(), 2);
+
+        // Revoke cuts the chain.
+        s.revoke_role_from_role("analyst", "senior").await.unwrap();
+        let eff = s.effective_roles(&["senior".to_string()]).await.unwrap();
+        assert_eq!(eff.len(), 1);
+        // Revoking a non-existent link errors.
+        assert!(s.revoke_role_from_role("analyst", "senior").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn role_hierarchy_rejects_cycles_and_missing_roles() {
+        let s = store();
+        for name in ["a", "b", "c"] {
+            s.create_role(name).await.unwrap();
+        }
+        // Self-grant.
+        assert!(s.grant_role_to_role("a", "a").await.is_err());
+        // Direct cycle: grant a to b, then b to a.
+        s.grant_role_to_role("a", "b").await.unwrap();
+        assert!(s.grant_role_to_role("b", "a").await.is_err());
+        // Indirect cycle: a->b->c, then c to a.
+        s.grant_role_to_role("b", "c").await.unwrap();
+        let err = s.grant_role_to_role("c", "a").await.unwrap_err().to_string();
+        assert!(err.contains("circular"), "{err}");
+        // Missing roles.
+        assert!(s.grant_role_to_role("ghost", "a").await.is_err());
+        assert!(s.grant_role_to_role("a", "ghost").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn drop_role_cascades_role_role_links() {
+        let journal = Arc::new(MockJournal::default());
+        let s = InMemoryAccountStore::new_with_journal(journal.clone())
+            .await
+            .unwrap();
+        s.ensure_admin("embucket", "embucket").await.unwrap();
+        for name in ["junior", "mid", "senior"] {
+            s.create_role(name).await.unwrap();
+        }
+        s.grant_role_to_role("junior", "mid").await.unwrap();
+        s.grant_role_to_role("mid", "senior").await.unwrap();
+        // Dropping `mid` removes both links (child and parent side).
+        s.drop_role("mid").await.unwrap();
+        assert!(s.role_children("senior").await.unwrap().is_empty());
+
+        let s2 = InMemoryAccountStore::new_with_journal(journal).await.unwrap();
+        assert!(s2.role_children("senior").await.unwrap().is_empty());
+        // junior still exists with no parents.
+        assert_eq!(
+            s2.effective_roles(&["junior".to_string()]).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_replays_role_roles() {
+        let journal = Arc::new(MockJournal::default());
+        let s = InMemoryAccountStore::new_with_journal(journal.clone())
+            .await
+            .unwrap();
+        s.ensure_admin("embucket", "embucket").await.unwrap();
+        for name in ["jr", "sr"] {
+            s.create_role(name).await.unwrap();
+        }
+        s.grant_role_to_role("jr", "sr").await.unwrap();
+
+        let s2 = InMemoryAccountStore::new_with_journal(journal.clone())
+            .await
+            .unwrap();
+        let eff = s2.effective_roles(&["sr".to_string()]).await.unwrap();
+        assert_eq!(eff.len(), 2, "{:?}", eff);
+        // Idempotent replay: reload once more.
+        let s3 = InMemoryAccountStore::new_with_journal(journal).await.unwrap();
+        assert_eq!(
+            s3.effective_roles(&["sr".to_string()]).await.unwrap().len(),
+            2
+        );
     }
 }

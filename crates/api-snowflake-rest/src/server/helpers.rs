@@ -342,14 +342,18 @@ pub fn handle_query_ok_result(
                 // DML count columns must carry Snowflake's canonical names — the driver
                 // core keys affected-row extraction on them. INSERT/UPDATE/
                 // DELETE/COPY return one count column; MERGE returns two
-                // (inserted, updated) in that order.
+                // (inserted, updated) in that order. A multi-column COPY INTO
+                // result is the Snowflake-shaped per-file load report and is
+                // passed through untouched.
                 if let Some(kind) = stmt.dml_kind() {
                     if matches!(stmt, WireStatementType::Merge) {
                         let names = ["number of rows inserted", "number of rows updated"];
                         for (c, n) in rt.iter_mut().zip(names) {
                             c.set_name(n.to_string());
                         }
-                    } else if let Some(c) = rt.first_mut() {
+                    } else if rt.len() == 1
+                        && let Some(c) = rt.first_mut()
+                    {
                         c.set_name(format!("number of rows {kind}"));
                     }
                 }

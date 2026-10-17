@@ -2920,7 +2920,7 @@ mod automation_tests {
     //! state updates, dynamic-table record lifecycle.
 
     use super::*;
-    use crate::models::automation::{TaskRunState, TaskSchedule, TaskState};
+    use crate::models::automation::{RefreshMode, TaskRunState, TaskSchedule, TaskState};
     use crate::models::volumes::{Volume, VolumeType};
     use iceberg_rust_spec::types::PrimitiveType;
 
@@ -3142,6 +3142,9 @@ mod automation_tests {
             warehouse: Some("wh".to_string()),
             target_lag_seconds: Some(60),
             last_refresh_ms: None,
+            refresh_mode: RefreshMode::default(),
+            base_table: None,
+            stream_ident: None,
         };
         ms.create_dynamic_table(&ident, record).await.expect("create");
         let fetched = ms

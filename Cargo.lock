@@ -1942,6 +1942,7 @@ dependencies = [
  "dashmap",
  "error-stack",
  "error-stack-trace",
+ "futures",
  "iceberg-rust",
  "iceberg-rust-spec",
  "insta",

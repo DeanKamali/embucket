@@ -4,6 +4,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
 pub mod automation;
+pub mod block_cache;
 pub mod database;
 pub mod schema;
 pub mod table;

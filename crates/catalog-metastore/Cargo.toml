@@ -14,6 +14,7 @@ aws-sdk-s3tables = { workspace = true }
 aws-credential-types = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
+futures = { workspace = true }
 iceberg-rust = { workspace = true }
 iceberg-rust-spec = { workspace = true }
 object_store = { workspace = true }

@@ -1,3 +1,4 @@
+use super::block_cache::maybe_wrap_cached;
 use crate::error::{self as metastore_error, Result};
 use object_store::{ObjectStoreExt, 
     ClientOptions, ObjectStore,
@@ -358,14 +359,20 @@ impl Volume {
                 let s3_builder = volume.get_s3_builder();
                 s3_builder
                     .build()
-                    .map(|s3| Arc::new(s3) as Arc<dyn ObjectStore>)
+                    .map(|s3| {
+                        // M14.1: executor-local warm block cache behind
+                        // AVALANCHE_CACHE_DIR (no-op when unset).
+                        maybe_wrap_cached(Arc::new(s3) as Arc<dyn ObjectStore>, &self.prefix())
+                    })
                     .context(metastore_error::ObjectStoreSnafu)
             }
             VolumeType::S3Tables(volume) => {
                 let s3_builder = volume.s3_builder();
                 s3_builder
                     .build()
-                    .map(|s3| Arc::new(s3) as Arc<dyn ObjectStore>)
+                    .map(|s3| {
+                        maybe_wrap_cached(Arc::new(s3) as Arc<dyn ObjectStore>, &self.prefix())
+                    })
                     .context(metastore_error::ObjectStoreSnafu)
             }
             VolumeType::File(file) => {
@@ -447,7 +454,10 @@ pub async fn create_object_store_from_url(
             builder = builder.with_skip_signature(true);
 
             let s3 = builder.build().context(metastore_error::ObjectStoreSnafu)?;
-            Ok(Arc::new(s3))
+            Ok(maybe_wrap_cached(
+                Arc::new(s3),
+                &format!("s3://{bucket}"),
+            ))
         }
         "file" => {
             let local_fs = LocalFileSystem::new();

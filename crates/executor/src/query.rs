@@ -391,7 +391,22 @@ impl UserQuery {
             self.session.warehouse.ensure_running(&warehouse).await;
         }
         let statement = self.parse_query().context(ex_error::DataFusionSnafu)?;
-        self.query = statement.to_string();
+        // Re-serialize with string literals re-escaped for the session
+        // dialect: the AST holds decoded values and `to_string()` only
+        // re-escapes quotes, so a backslash-escape dialect (snowflake) would
+        // decode literals a second time when this text is re-parsed below
+        // (execute_with_custom_plan / execute_sql) — see sql_text.rs.
+        self.query = crate::sql_text::re_escape_string_literals(
+            &statement.to_string(),
+            self.session
+                .ctx
+                .state()
+                .config()
+                .options()
+                .sql_parser
+                .dialect
+                .as_ref(),
+        );
         self.raw_statement = Some(statement.clone());
 
         // Inbound shares (design §21, M15.2) mount read-only: deny DML

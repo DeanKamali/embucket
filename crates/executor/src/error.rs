@@ -246,6 +246,18 @@ pub enum Error {
         location: Location,
     },
 
+    /// Ownership-aware data-plane DDL (design §23.7, M17.4): the active
+    /// role holds no OWNERSHIP/CREATE privilege covering the object.
+    #[snafu(display(
+        "SQL access control error: insufficient privileges to operate on {operation} '{object}'"
+    ))]
+    InsufficientPrivileges {
+        operation: String,
+        object: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Unsupported file format {format}"))]
     UnsupportedFileFormat {
         format: String,

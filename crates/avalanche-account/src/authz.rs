@@ -12,7 +12,7 @@
 //! whose tenant label differs (or who have none).
 
 use crate::error::{self as account_error, Result};
-use crate::models::{AccountObject, Privilege, ACCOUNTADMIN};
+use crate::models::{AccountObject, Grant, Privilege, ACCOUNTADMIN};
 use crate::store::AccountStore;
 use async_trait::async_trait;
 use catalog::catalog_list::EmbucketCatalogList;
@@ -31,6 +31,11 @@ pub struct RoleSnapshot {
     /// Databases whose `properties["tenant"]` does not match the user's
     /// tenant label (admins bypass). Lowercased idents.
     pub denied_databases: HashSet<String>,
+    /// Record-level tenant scoping (design §23.7): schemas whose metastore
+    /// record carries a mismatching `properties["tenant"]` label
+    /// (`db.schema`, lowercased). Tables inherit at creation, so schema
+    /// coverage transitively scopes them.
+    pub denied_schemas: HashSet<String>,
 }
 
 impl RoleSnapshot {
@@ -50,6 +55,9 @@ pub struct SessionAuthz {
     login_name: String,
     role: RwLock<String>,
     snapshot: RwLock<RoleSnapshot>,
+    /// Account epoch the snapshot was materialized at (§23.5 result-cache
+    /// fingerprint uses the same counter). Re-materialize when it moves.
+    materialized_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl SessionAuthz {
@@ -80,6 +88,7 @@ impl SessionAuthz {
             login_name: u.login_name.to_ascii_lowercase(),
             role: RwLock::new(String::new()),
             snapshot: RwLock::new(RoleSnapshot::default()),
+            materialized_epoch: std::sync::atomic::AtomicU64::new(0),
         };
         let candidates = [
             requested_role.map(ToOwned::to_owned),
@@ -124,7 +133,38 @@ impl SessionAuthz {
         }
         let admin = r.name.eq_ignore_ascii_case(ACCOUNTADMIN);
         self.materialize(&r.name, admin).await?;
+        self.materialized_epoch
+            .store(crate::store::account_epoch(), std::sync::atomic::Ordering::SeqCst);
         *self.role.write().unwrap() = r.name;
+        Ok(())
+    }
+
+    /// Re-materialize the snapshot when the account epoch has moved since
+    /// the last materialize (M17.4, design §23.7): a session must see the
+    /// grants recorded *by itself* during the session — the implicit
+    /// OWNERSHIP of a just-created table, an ownership transfer, a
+    /// sibling session's GRANT — without re-logging-in. No-op when the
+    /// epoch is unchanged or no role is active.
+    ///
+    /// # Errors
+    /// When the account store or metastore rejects the re-materialize.
+    pub async fn refresh_if_stale(&self) -> Result<()> {
+        if self.active_role().is_empty() {
+            return Ok(());
+        }
+        let now = crate::store::account_epoch();
+        if self
+            .materialized_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == now
+        {
+            return Ok(());
+        }
+        let admin = self.is_admin_now();
+        let role = self.active_role();
+        self.materialize(&role, admin).await?;
+        self.materialized_epoch
+            .store(now, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -135,9 +175,19 @@ impl SessionAuthz {
         };
         if !admin {
             // Tenant hard filter: deny databases whose tenant label does
-            // not match this user's label.
+            // not match this user's label. A session with no tenant label
+            // sees only unlabeled databases.
             let user = self.store.get_user(&self.user).await?;
-            snapshot.denied_databases = self
+            let user_tenant = user
+                .as_ref()
+                .and_then(|u| u.tenant.as_ref())
+                .map(|t| t.to_ascii_lowercase());
+            let tenant_mismatch = |label: Option<String>| match (label, user_tenant.clone()) {
+                (Some(t), Some(u)) => t != u,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            let databases = self
                 .metastore
                 .list_databases()
                 .await
@@ -146,8 +196,9 @@ impl SessionAuthz {
                         message: e.to_string(),
                     }
                     .build()
-                })?
-                .into_iter()
+                })?;
+            snapshot.denied_databases = databases
+                .iter()
                 .filter(|db| {
                     let db_tenant = db
                         .data
@@ -155,18 +206,46 @@ impl SessionAuthz {
                         .as_ref()
                         .and_then(|p| p.get("tenant"))
                         .map(|t| t.to_ascii_lowercase());
-                    let user_tenant = user
-                        .as_ref()
-                        .and_then(|u| u.tenant.as_ref())
-                        .map(|t| t.to_ascii_lowercase());
-                    match (db_tenant, user_tenant) {
-                        (Some(db_t), Some(u_t)) => db_t != u_t,
-                        (Some(_), None) => true,
-                        _ => false,
-                    }
+                    tenant_mismatch(db_tenant)
                 })
                 .map(|db| db.ident.to_ascii_lowercase())
                 .collect();
+            // Record-level tenant scoping (design §23.7): every database the
+            // session can still see has its schemas checked against their
+            // metastore records — a schema record carrying a mismatching
+            // `properties["tenant"]` label is denied even though the
+            // database itself is shared. Tables inherit the label at
+            // creation, so schema coverage transitively scopes them.
+            for db in &databases {
+                if snapshot.denied_databases.contains(&db.ident.to_ascii_lowercase()) {
+                    continue;
+                }
+                for schema in self
+                    .metastore
+                    .list_schemas(&db.ident)
+                    .await
+                    .map_err(|e| {
+                        account_error::InvalidInputSnafu {
+                            message: e.to_string(),
+                        }
+                        .build()
+                    })?
+                {
+                    let label = schema
+                        .data
+                        .properties
+                        .as_ref()
+                        .and_then(|p| p.get("tenant"))
+                        .map(|t| t.to_ascii_lowercase());
+                    if tenant_mismatch(label) {
+                        snapshot.denied_schemas.insert(format!(
+                            "{}.{}",
+                            db.ident.to_ascii_lowercase(),
+                            schema.ident.schema.to_ascii_lowercase()
+                        ));
+                    }
+                }
+            }
             snapshot.grants = {
                 // Role hierarchies (M17.3): the active role's effective
                 // privilege set unions its own grants with the grants of
@@ -221,29 +300,57 @@ impl SessionAuthz {
         snapshot.allowed(
             Privilege::Usage,
             &AccountObject::Database(database.to_string()),
+        ) || snapshot.allowed(
+            Privilege::Ownership,
+            &AccountObject::Database(database.to_string()),
         )
     }
 
-    /// Whether the schema is visible (USAGE grant).
+    /// Whether the schema is visible (USAGE grant + record-level tenant
+    /// scoping — design §23.7).
     #[must_use]
     pub fn schema_visible(&self, database: &str, schema: &str) -> bool {
-        self.allowed_now(
+        let snapshot = self.snapshot.read().unwrap();
+        if snapshot.admin {
+            return true;
+        }
+        if snapshot
+            .denied_schemas
+            .contains(&format!(
+                "{}.{}",
+                database.to_ascii_lowercase(),
+                schema.to_ascii_lowercase()
+            ))
+        {
+            return false;
+        }
+        snapshot.allowed(
             Privilege::Usage,
             &AccountObject::Schema(database.to_string(), schema.to_string()),
+        ) || snapshot.allowed(
+            Privilege::Ownership,
+            &AccountObject::Schema(database.to_string(), schema.to_string()),
+        ) || snapshot.allowed(
+            Privilege::Ownership,
+            &AccountObject::Database(database.to_string()),
         )
     }
 
-    /// Whether the table is visible (SELECT grant).
+    /// Whether the table is visible (SELECT grant, or OWNERSHIP on the
+    /// table or one of its containers — the owner may query the object,
+    /// design §23.7).
     #[must_use]
     pub fn table_visible(&self, database: &str, schema: &str, table: &str) -> bool {
-        self.allowed_now(
-            Privilege::Select,
-            &AccountObject::Table(
-                database.to_string(),
-                schema.to_string(),
-                table.to_string(),
-            ),
-        )
+        let obj = AccountObject::Table(
+            database.to_string(),
+            schema.to_string(),
+            table.to_string(),
+        );
+        self.allowed_now(Privilege::Select, &obj)
+            || obj
+                .with_containers()
+                .iter()
+                .any(|o| self.allowed_now(Privilege::Ownership, o))
     }
 
     /// Whether the warehouse is usable (USAGE grant).
@@ -253,6 +360,101 @@ impl SessionAuthz {
             Privilege::Usage,
             &AccountObject::Warehouse(warehouse.to_string()),
         )
+    }
+
+    // ------------------------------------------------------------------
+    // Ownership-aware data-plane DDL (design §23.7, M17.4).
+    // ------------------------------------------------------------------
+
+    /// Whether the active role may `CREATE SCHEMA <db>.<s>`: USAGE + CREATE
+    /// on the database, or OWNERSHIP on it (a container owner holds its
+    /// child privileges implicitly — design §23.7). Admins bypass.
+    #[must_use]
+    pub fn can_create_schema(&self, database: &str) -> bool {
+        let db = AccountObject::Database(database.to_string());
+        let owns_db = self.allowed_now(Privilege::Ownership, &db);
+        (self.allowed_now(Privilege::Usage, &db)
+            && self.allowed_now(Privilege::Create, &db))
+            || owns_db
+    }
+
+    /// Whether the active role may `CREATE TABLE <db>.<s>.<t>`: USAGE on
+    /// the database plus USAGE + CREATE on the schema, or OWNERSHIP on the
+    /// schema (a schema owner creates tables implicitly — design §23.7).
+    /// Admins bypass.
+    #[must_use]
+    pub fn can_create_table(&self, database: &str, schema: &str) -> bool {
+        let db_ok = self.allowed_now(
+            Privilege::Usage,
+            &AccountObject::Database(database.to_string()),
+        );
+        let schema_obj = AccountObject::Schema(database.to_string(), schema.to_string());
+        let owns_schema = self.allowed_now(Privilege::Ownership, &schema_obj);
+        db_ok && ((self.allowed_now(Privilege::Usage, &schema_obj)
+            && self.allowed_now(Privilege::Create, &schema_obj))
+            || owns_schema)
+    }
+
+    /// Whether the active role may drop/alter `object`: OWNERSHIP on the
+    /// object or on any of its containers (schema covers its tables,
+    /// database covers everything), admins bypass.
+    #[must_use]
+    pub fn can_drop_object(&self, object: &AccountObject) -> bool {
+        if self.is_admin_now() {
+            return true;
+        }
+        object
+            .with_containers()
+            .iter()
+            .any(|o| self.allowed_now(Privilege::Ownership, o))
+    }
+
+    /// Record implicit OWNERSHIP for the active (non-admin) role after a
+    /// successful `CREATE` of `object` — the creator becomes the owner
+    /// (design §23.7). No-op for admins (they bypass every check) and for
+    /// sessions without an active role.
+    ///
+    /// # Errors
+    /// When the account store rejects the grant.
+    pub async fn record_ownership(&self, object: &AccountObject) -> Result<()> {
+        if self.is_admin_now() {
+            return Ok(());
+        }
+        let role = self.active_role();
+        if role.is_empty() {
+            return Ok(());
+        }
+        self.store
+            .grant(Grant {
+                role,
+                privilege: Privilege::Ownership,
+                object: object.clone(),
+            })
+            .await?;
+        // Make the new ownership effective immediately in THIS session:
+        // the snapshot was materialized at login/last activation, before
+        // the CREATE — without this, the creator cannot resolve (let alone
+        // drop) the object until re-activation. Store grants were already
+        // epoch-bumped (result-cache invalidation); this only catches the
+        // live snapshot up.
+        let mut snapshot = self.snapshot.write().unwrap();
+        snapshot
+            .grants
+            .insert((Privilege::Ownership, object.clone()));
+        Ok(())
+    }
+
+    /// Remove every grant on a dropped object (Snowflake drops object
+    /// grants together with the object, so a later re-creation with the
+    /// same name cannot resurrect them).
+    ///
+    /// # Errors
+    /// When the account store fails to list or revoke grants.
+    pub async fn drop_object_grants(&self, object: &AccountObject) -> Result<()> {
+        for g in self.store.object_grants(object).await? {
+            self.store.revoke(&g).await?;
+        }
+        Ok(())
     }
 
     /// The login name this session is authorized as.
@@ -614,6 +816,151 @@ mod tests {
         assert!(!authz.database_visible("embucket"));
         // ...and u2 can no longer activate analyst (no longer beneath senior).
         assert!(authz.activate_role("analyst").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ownership_aware_ddl_checks() {
+        let (store, metastore) = setup(None).await;
+        let authz = SessionAuthz::new(Arc::clone(&store), Arc::clone(&metastore), "u1", None)
+            .await
+            .unwrap()
+            .unwrap();
+        // No privileges yet: nothing creatable or droppable.
+        assert!(!authz.can_create_table("embucket", "public"));
+        assert!(!authz.can_create_schema("embucket"));
+        let t = AccountObject::Table("embucket".into(), "public".into(), "t".into());
+        assert!(!authz.can_drop_object(&t));
+        // USAGE on the database enables nothing by itself.
+        store
+            .grant(Grant {
+                role: "analyst".into(),
+                privilege: Privilege::Usage,
+                object: AccountObject::Database("embucket".into()),
+            })
+            .await
+            .unwrap();
+        assert!(!authz.can_create_table("embucket", "public"), "needs re-activate");
+        authz.activate_role("analyst").await.unwrap();
+        assert!(!authz.can_create_table("embucket", "public"), "missing CREATE");
+        store
+            .grant(Grant {
+                role: "analyst".into(),
+                privilege: Privilege::Usage,
+                object: AccountObject::Schema("embucket".into(), "public".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .grant(Grant {
+                role: "analyst".into(),
+                privilege: Privilege::Create,
+                object: AccountObject::Schema("embucket".into(), "public".into()),
+            })
+            .await
+            .unwrap();
+        authz.activate_role("analyst").await.unwrap();
+        assert!(authz.can_create_table("embucket", "public"));
+        // Container ownership: CREATE on a database enables schema creation.
+        store
+            .grant(Grant {
+                role: "analyst".into(),
+                privilege: Privilege::Create,
+                object: AccountObject::Database("embucket".into()),
+            })
+            .await
+            .unwrap();
+        authz.activate_role("analyst").await.unwrap();
+        assert!(authz.can_create_schema("embucket"));
+        // OWNERSHIP on the schema covers dropping its tables.
+        store
+            .grant(Grant {
+                role: "analyst".into(),
+                privilege: Privilege::Ownership,
+                object: AccountObject::Schema("embucket".into(), "public".into()),
+            })
+            .await
+            .unwrap();
+        authz.activate_role("analyst").await.unwrap();
+        assert!(authz.can_drop_object(&t));
+    }
+
+    #[tokio::test]
+    async fn record_and_drop_object_ownership() {
+        let (store, metastore) = setup(None).await;
+        let authz = SessionAuthz::new(Arc::clone(&store), Arc::clone(&metastore), "u1", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let t = AccountObject::Table("embucket".into(), "public".into(), "t".into());
+        authz.record_ownership(&t).await.unwrap();
+        let grants = store.object_grants(&t).await.unwrap();
+        assert_eq!(grants.len(), 1, "creator role owns the created table");
+        assert_eq!(grants[0].privilege, Privilege::Ownership);
+        assert_eq!(grants[0].role, "analyst");
+        authz.drop_object_grants(&t).await.unwrap();
+        assert!(store.object_grants(&t).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_level_tenant_scoping() {
+        let (store, metastore) = setup(None).await;
+        // Schema record stamped with a tenant label inside the shared db.
+        let ident = catalog_metastore::models::SchemaIdent {
+            database: "embucket".into(),
+            schema: "tenantx".into(),
+        };
+        metastore
+            .create_schema(
+                &ident,
+                catalog_metastore::models::Schema {
+                    ident: ident.clone(),
+                    properties: Some(HashMap::from([("tenant".to_string(), "acme".to_string())])),
+                },
+            )
+            .await
+            .unwrap();
+        // Baseline grants so the un-stamped schema is visible via USAGE.
+        store
+            .grant(Grant {
+                role: "analyst".into(),
+                privilege: Privilege::Usage,
+                object: AccountObject::Schema("embucket".into(), "public".into()),
+            })
+            .await
+            .unwrap();
+        // u1 (analyst) has no tenant label → mismatching record denied.
+        let authz = SessionAuthz::new(Arc::clone(&store), Arc::clone(&metastore), "u1", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(authz.schema_visible("embucket", "public"));
+        assert!(!authz.schema_visible("embucket", "tenantx"));
+        // A same-tenant user sees the record (admin is bypassed entirely).
+        store
+            .grant(Grant {
+                role: "analyst".into(),
+                privilege: Privilege::Usage,
+                object: AccountObject::Schema("embucket".into(), "tenantx".into()),
+            })
+            .await
+            .unwrap();
+        store
+            .create_user(User {
+                name: "uacme".into(),
+                login_name: "uacme".into(),
+                password: "pw".into(),
+                default_role: Some("analyst".into()),
+                tenant: Some("acme".into()),
+                disabled: false,
+            })
+            .await
+            .unwrap();
+        store.grant_role_to_user("uacme", "analyst").await.unwrap();
+        let authz = SessionAuthz::new(store, metastore, "uacme", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(authz.schema_visible("embucket", "tenantx"));
     }
 
     #[tokio::test]

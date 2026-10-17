@@ -142,6 +142,8 @@ fn parse_on_grant(tok: &[&str], from: usize) -> Option<(Privilege, AccountObject
     let privilege = match tok.get(from)?.to_ascii_uppercase().as_str() {
         "USAGE" => Privilege::Usage,
         "SELECT" => Privilege::Select,
+        "CREATE" => Privilege::Create,
+        "OWNERSHIP" => Privilege::Ownership,
         _ => return None,
     };
     if !tok.get(from + 1)?.eq_ignore_ascii_case("on") {
@@ -987,6 +989,30 @@ mod tests {
             AccountStatement::Grant {
                 privilege: Privilege::Usage,
                 object: AccountObject::Warehouse("wh".into()),
+                role: "analyst".into()
+            }
+        );
+        assert_eq!(
+            parsed("GRANT OWNERSHIP ON TABLE db.public.t TO ROLE analyst"),
+            AccountStatement::Grant {
+                privilege: Privilege::Ownership,
+                object: AccountObject::Table("db".into(), "public".into(), "t".into()),
+                role: "analyst".into()
+            }
+        );
+        assert_eq!(
+            parsed("GRANT CREATE ON SCHEMA db.public TO ROLE analyst"),
+            AccountStatement::Grant {
+                privilege: Privilege::Create,
+                object: AccountObject::Schema("db".into(), "public".into()),
+                role: "analyst".into()
+            }
+        );
+        assert_eq!(
+            parsed("REVOKE OWNERSHIP ON DATABASE db FROM ROLE analyst"),
+            AccountStatement::Revoke {
+                privilege: Privilege::Ownership,
+                object: AccountObject::Database("db".into()),
                 role: "analyst".into()
             }
         );

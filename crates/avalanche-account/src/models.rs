@@ -1,7 +1,8 @@
 //! Account-plane model (design §17, M10): users, roles, privileges, grants.
 //!
-//! Snowflake-shaped subset. Role hierarchies and ownership grants are v2;
-//! the only built-in role is `ACCOUNTADMIN`, which bypasses every check.
+//! Snowflake-shaped subset. Role hierarchies landed in M17.3; ownership-aware
+//! data-plane DDL in M17.4 (design §23.7). The only built-in role is
+//! `ACCOUNTADMIN`, which bypasses every check.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,12 @@ pub enum Privilege {
     Usage,
     /// SELECT on a table.
     Select,
+    /// CREATE on a database (create schemas) or schema (create tables)
+    /// — design §23.7, ownership-aware data-plane DDL.
+    Create,
+    /// OWNERSHIP on a database, schema or table: the creator role holds it
+    /// implicitly; DROP and children-creation derive from it.
+    Ownership,
 }
 
 /// The four grantable object kinds (design §17).
@@ -62,6 +69,25 @@ impl AccountObject {
         match self {
             Self::Database(db) | Self::Schema(db, _) | Self::Table(db, _, _) => db,
             Self::Warehouse(_) => "",
+        }
+    }
+
+    /// The object itself followed by its ancestor containers, innermost
+    /// first — ownership of any container covers the object (design
+    /// §23.7, ownership-aware data-plane DDL).
+    #[must_use]
+    pub fn with_containers(&self) -> Vec<Self> {
+        match self {
+            Self::Database(_) | Self::Warehouse(_) => vec![self.clone()],
+            Self::Schema(db, s) => vec![
+                Self::Schema(db.clone(), s.clone()),
+                Self::Database(db.clone()),
+            ],
+            Self::Table(db, s, t) => vec![
+                Self::Table(db.clone(), s.clone(), t.clone()),
+                Self::Schema(db.clone(), s.clone()),
+                Self::Database(db.clone()),
+            ],
         }
     }
 }

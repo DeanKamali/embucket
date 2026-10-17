@@ -53,6 +53,21 @@ fn role_graph_reachable(links: &[RoleRole], start: &str, target: &str) -> bool {
     false
 }
 
+/// Whether a stored grant's object is `dropped` itself or contained
+/// within it (a grant on `db.s` or `db.s.t` dies with `db`; a grant on
+/// `db.s.t` dies with `db.s` — design §23.7: dropping an object cascades
+/// grant removal to its children).
+fn grant_covers_object(grant_obj: &AccountObject, dropped: &AccountObject) -> bool {
+    match (grant_obj, dropped) {
+        (AccountObject::Schema(gdb, _), AccountObject::Database(tdb)) => key(gdb) == key(tdb),
+        (AccountObject::Table(gdb, _, _), AccountObject::Database(tdb)) => key(gdb) == key(tdb),
+        (AccountObject::Table(gdb, gs, _), AccountObject::Schema(tdb, ts)) => {
+            key(gdb) == key(tdb) && key(gs) == key(ts)
+        }
+        _ => grant_obj == dropped,
+    }
+}
+
 #[async_trait]
 pub trait AccountStore: std::fmt::Debug + Send + Sync {
     async fn create_role(&self, name: &str) -> Result<Role>;
@@ -86,6 +101,14 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
     async fn grant(&self, grant: Grant) -> Result<()>;
     async fn revoke(&self, grant: &Grant) -> Result<()>;
     async fn role_grants(&self, role: &str) -> Result<Vec<Grant>>;
+
+    /// Every privilege grant on `object` — and on anything *contained
+    /// within it* (a database grant covers its schemas and tables, a
+    /// schema grant covers its tables) — regardless of role. Used by
+    /// data-plane DDL to remove a dropped object's grants (design §23.7:
+    /// Snowflake removes grants when an object is dropped, cascading to
+    /// children).
+    async fn object_grants(&self, object: &AccountObject) -> Result<Vec<Grant>>;
 
     /// Shares (design §21, M15.1): named grant bundles.
     async fn create_share(&self, name: &str) -> Result<Share>;
@@ -683,6 +706,16 @@ impl AccountStore for InMemoryAccountStore {
             .collect())
     }
 
+    async fn object_grants(&self, object: &AccountObject) -> Result<Vec<Grant>> {
+        let state = self.state.read().await;
+        Ok(state
+            .grants
+            .iter()
+            .filter(|g| grant_covers_object(&g.object, object))
+            .cloned()
+            .collect())
+    }
+
     async fn share_grants(&self, share: &str) -> Result<Vec<ShareGrant>> {
         let state = self.state.read().await;
         if !state.shares.contains_key(&key(share)) {
@@ -1202,25 +1235,30 @@ mod tests {
 
     #[tokio::test]
     async fn account_epoch_bumps_on_authz_mutations_only() {
+        // The epoch counter is process-global (result-cache fingerprint,
+        // §23.5) and sibling tests bump it concurrently — so every
+        // assertion here brackets exactly ONE operation (delta across a
+        // single await, not a chain).
         let s = InMemoryAccountStore::new();
         let before = super::account_epoch();
         s.create_role("e1").await.unwrap();
         assert!(super::account_epoch() > before, "create_role bumps");
-        s.record_login(LoginEvent {
+        let event = LoginEvent {
             timestamp_ms: 0,
             sequence: 0,
             user_name: "e1".into(),
             client_app_id: None,
             client_ip: None,
             success: true,
-        })
-        .await
-        .unwrap();
+        };
+        let before_login = super::account_epoch();
+        s.record_login(event).await.unwrap();
         assert_eq!(
             super::account_epoch(),
-            before + 1,
+            before_login,
             "record_login must not bump (no authorization effect)"
         );
+        let before_grant = super::account_epoch();
         s.grant(Grant {
             role: "e1".to_string(),
             privilege: crate::models::Privilege::Select,
@@ -1232,8 +1270,8 @@ mod tests {
         })
         .await
         .unwrap();
-        let after_grant = super::account_epoch();
-        assert!(after_grant > before + 1, "grant bumps");
+        assert!(super::account_epoch() > before_grant, "grant bumps");
+        let before_revoke = super::account_epoch();
         s.revoke(&Grant {
             role: "e1".to_string(),
             privilege: crate::models::Privilege::Select,
@@ -1245,7 +1283,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(super::account_epoch() > after_grant, "revoke bumps");
+        assert!(super::account_epoch() > before_revoke, "revoke bumps");
     }
 
     #[tokio::test]
@@ -1324,6 +1362,73 @@ mod tests {
             s2.effective_roles(&["junior".to_string()]).await.unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn object_grants_spans_roles() {
+        let s = store();
+        for name in ["r1", "r2"] {
+            s.create_role(name).await.unwrap();
+        }
+        let t = AccountObject::Table("db".into(), "s".into(), "t".into());
+        for role in ["r1", "r2"] {
+            s.grant(Grant {
+                role: role.into(),
+                privilege: Privilege::Select,
+                object: t.clone(),
+            })
+            .await
+            .unwrap();
+        }
+        // Ownership grant from a third role on the same object.
+        s.grant(Grant {
+            role: "r1".into(),
+            privilege: Privilege::Ownership,
+            object: t.clone(),
+        })
+        .await
+        .unwrap();
+        let grants = s.object_grants(&t).await.unwrap();
+        assert_eq!(grants.len(), 3, "{grants:?}");
+        // Unrelated object grants are not matched.
+        assert!(s
+            .object_grants(&AccountObject::Table("db".into(), "s".into(), "other".into()))
+            .await
+            .unwrap()
+            .is_empty());
+        // Containment (design §23.7): a schema grant is covered by the
+        // database and covers its tables.
+        s.grant(Grant {
+            role: "r2".into(),
+            privilege: Privilege::Ownership,
+            object: AccountObject::Schema("db".into(), "s".into()),
+        })
+        .await
+        .unwrap();
+        s.grant(Grant {
+            role: "r1".into(),
+            privilege: Privilege::Usage,
+            object: AccountObject::Database("db".into()),
+        })
+        .await
+        .unwrap();
+        let sobj = AccountObject::Schema("db".into(), "s".into());
+        let dobj = AccountObject::Database("db".into());
+        assert_eq!(
+            s.object_grants(&sobj).await.unwrap().len(),
+            4,
+            "schema grant + 3 table grants inside the schema"
+        );
+        assert_eq!(
+            s.object_grants(&dobj).await.unwrap().len(),
+            5,
+            "db grant + schema grant + 3 table grants"
+        );
+        assert!(s
+            .object_grants(&AccountObject::Database("otherdb".into()))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

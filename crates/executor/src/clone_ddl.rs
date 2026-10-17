@@ -18,6 +18,7 @@
 //! the point (see `Metastore::clone_schema_as_of`).
 
 use crate::error::{self as ex_error, Error, Result};
+use avalanche_account::models::AccountObject;
 use crate::models::QueryResult;
 use crate::session::UserSession;
 use crate::time_travel::{TimePoint, parse_timestamp, resolve_snapshot};
@@ -229,6 +230,58 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
     let target = resolve_name(&db, &schema, &norm(&stmt.target), stmt.kind)?;
     let source = resolve_name(&db, &schema, &norm(&stmt.source), stmt.kind)?;
 
+    // Ownership-aware data-plane DDL (design §23.7): a clone is a create —
+    // the source must be readable and the target creatable; database
+    // clones stay ACCOUNTADMIN-only (matching CREATE DATABASE). Invisible
+    // sources fail as-if-missing.
+    if let Some(authz) = &session.authz {
+        if !authz.is_admin_now() {
+            match stmt.kind {
+                CloneKind::Table => {
+                    let from = table_ident(&source);
+                    let to = table_ident(&target);
+                    if !authz.table_visible(&from.database, &from.schema, &from.table) {
+                        return Err(external_error(
+                            "clone",
+                            format!("Table '{}' does not exist", from.table),
+                        ));
+                    }
+                    if !authz.can_create_table(&to.database, &to.schema) {
+                        return ex_error::InsufficientPrivilegesSnafu {
+                            operation: "CREATE TABLE",
+                            object: to.to_string(),
+                        }
+                        .fail();
+                    }
+                }
+                CloneKind::Schema => {
+                    let from = schema_ident(&source);
+                    let to = schema_ident(&target);
+                    if !authz.schema_visible(&from.database, &from.schema) {
+                        return Err(external_error(
+                            "clone",
+                            format!("Schema '{}' does not exist", from.schema),
+                        ));
+                    }
+                    if !authz.can_create_schema(&to.database) {
+                        return ex_error::InsufficientPrivilegesSnafu {
+                            operation: "CREATE SCHEMA",
+                            object: to.to_string(),
+                        }
+                        .fail();
+                    }
+                }
+                CloneKind::Database => {
+                    return ex_error::InsufficientPrivilegesSnafu {
+                        operation: "CREATE DATABASE",
+                        object: one_part(&target, "database")?,
+                    }
+                    .fail();
+                }
+            }
+        }
+    }
+
     // Resolve the time point to epoch-ms (statement keys through query history).
     let point = match &stmt.at {
         Some(AtSpec::Unsupported(key)) => {
@@ -398,6 +451,24 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
                     .map_err(|e| external_error("clone", e))?;
             }
         }
+    }
+    // The creator role implicitly owns the clone target (design §23.7);
+    // record_ownership no-ops for admins and sessions without an account.
+    let target_object = match stmt.kind {
+        CloneKind::Table => AccountObject::Table(
+            target[0].clone(),
+            target[1].clone(),
+            target[2].clone(),
+        ),
+        CloneKind::Schema => {
+            AccountObject::Schema(target[0].clone(), target[1].clone())
+        }
+        CloneKind::Database => AccountObject::Database(target[0].clone()),
+    };
+    if let Some(authz) = &session.authz {
+        authz.record_ownership(&target_object)
+            .await
+            .map_err(|e| external_error("account", e))?;
     }
     status_row()
 }

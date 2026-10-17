@@ -17,6 +17,7 @@ use crate::datafusion::physical_plan::merge::{
 };
 use crate::datafusion::rewriters::session_context::SessionContextExprRewriter;
 use crate::error::{OperationOn, OperationType};
+use avalanche_account::models::{AccountObject, Privilege};
 use crate::models::{QueryContext, QueryMetric, QueryResult, metrics_set_to_json};
 use crate::query_types::{DdlStType, DmlStType, MiscStType, QueryStats, QueryType};
 use catalog::table::{CachingTable, IcebergTableBuilder};
@@ -335,6 +336,15 @@ impl UserQuery {
         err
     )]
     pub async fn execute(&mut self) -> Result<QueryResult> {
+        // M17.4 (design §23.7): re-materialize the authz snapshot when the
+        // account epoch moved — the session must see grants recorded during
+        // the session (implicit ownership of a just-created table, grants
+        // from sibling sessions) without re-logging-in.
+        if let Some(authz) = &self.session.authz {
+            authz.refresh_if_stale()
+                .await
+                .map_err(Self::account_store_error)?;
+        }
         // Avalanche (design §17, M10): account-level RBAC DDL is intercepted
         // pre-parse (ACCOUNTADMIN-only).
         if let Some(result) =
@@ -994,7 +1004,7 @@ impl UserQuery {
                         ex_error::TableNotFoundInSchemaInDatabaseSnafu {
                             operation_on: OperationOn::Table(OperationType::Drop),
                             table: table_ref.table.to_string(),
-                            schema: schema_name,
+                            schema: schema_name.clone(),
                             db: catalog_name.to_string(),
                         }
                         .fail()?;
@@ -1018,7 +1028,38 @@ impl UserQuery {
             }
             _ => {}
         }
+        // Ownership-aware data-plane DDL (design §23.7): dropping requires
+        // OWNERSHIP on the object or one of its containers. Invisible
+        // objects already fail as-if-missing above.
+        let account_object = match object_type {
+            ObjectType::Table | ObjectType::View => Some(AccountObject::Table(
+                catalog_name.to_string(),
+                schema_name.clone(),
+                table_ref.table.to_string(),
+            )),
+            ObjectType::Schema => Some(AccountObject::Schema(
+                catalog_name.to_string(),
+                schema_name.clone(),
+            )),
+            ObjectType::Database => Some(AccountObject::Database(catalog_name.to_string())),
+            _ => None,
+        };
+        if let (Some(authz), Some(obj)) = (&self.session.authz, &account_object) {
+            if !authz.can_drop_object(obj) {
+                return ex_error::InsufficientPrivilegesSnafu {
+                    operation: format!("DROP {}", obj.kind()),
+                    object: obj.to_string(),
+                }
+                .fail();
+            }
+        }
         self.execute_logical_plan(plan).await?;
+        // Snowflake removes an object's grants together with the object.
+        if let (Some(authz), Some(obj)) = (&self.session.authz, &account_object) {
+            authz.drop_object_grants(obj)
+                .await
+                .map_err(Self::account_store_error)?;
+        }
         self.status_response()
     }
 
@@ -1084,6 +1125,22 @@ impl UserQuery {
         let table_ref = self.resolve_ident(&new_table_ident)?;
         let catalog_name = table_ref.catalog.to_string();
         let table_name = table_ref.table.to_string();
+        // Ownership-aware data-plane DDL (design §23.7): USAGE on the
+        // database and schema plus CREATE on the schema. Only add the
+        // explicit denial when the schema is visible — invisible schemas
+        // already fail as-if-missing below.
+        let schema_str = table_ref.schema.to_string();
+        if let Some(authz) = &self.session.authz {
+            if authz.schema_visible(&catalog_name, &schema_str)
+                && !authz.can_create_table(&catalog_name, &schema_str)
+            {
+                return ex_error::InsufficientPrivilegesSnafu {
+                    operation: "CREATE TABLE",
+                    object: format!("{catalog_name}.{schema_str}.{table_name}"),
+                }
+                .fail();
+            }
+        }
         let catalog = self.get_catalog(&catalog_name).map_err(|_| {
             ex_error::CatalogNotFoundSnafu {
                 operation_on: OperationOn::Table(OperationType::Create),
@@ -1100,18 +1157,72 @@ impl UserQuery {
             .build()
         })?;
 
-        let table_provider: Option<Arc<dyn TableProvider>> = self.create_iceberg_table_provider(
-            table_ref,
-            schema_provider.clone(),
-            table_location,
-            if_not_exists,
-            or_replace,
-            plan.clone(),
-        )?;
+        let table_provider: Option<Arc<dyn TableProvider>> = {
+            // CREATE OR REPLACE swaps the name at the schema level: the
+            // replace decision must use real (unfiltered) existence — a
+            // session-catalog existence check through the authz wrapper
+            // would hide tables the role cannot see, and the metastore
+            // create would then fail with "already exists". The CREATE
+            // privilege gate above is the authorization; ownership of the
+            // replaced table is not required (Snowflake semantics), and
+            // the replaced object's grants are removed by the
+            // `drop_object_grants` call in the `registered` branch below.
+            if or_replace {
+                let ident = MetastoreTableIdent::new(&catalog_name, &schema_str, &table_name);
+                if self
+                    .metastore
+                    .table_exists(&ident)
+                    .await
+                    .context(ex_error::MetastoreSnafu)?
+                {
+                    schema_provider
+                        .deregister_table(&table_ref.table)
+                        .context(ex_error::DataFusionSnafu)?;
+                    self.metastore
+                        .delete_table(&ident, false)
+                        .await
+                        .context(ex_error::MetastoreSnafu)?;
+                }
+            }
+            self.create_iceberg_table_provider(
+                table_ref,
+                schema_provider.clone(),
+                table_location,
+                if_not_exists,
+                or_replace,
+                plan.clone(),
+            )?
+        };
+        let registered = table_provider.is_some();
         if let Some(provider) = table_provider {
             schema_provider
-                .register_table(table_name, provider)
+                .register_table(table_name.clone(), provider)
                 .context(ex_error::DataFusionSnafu)?;
+        }
+        // The creator role implicitly owns the table (design §23.7); skip
+        // when IF NOT EXISTS found an existing table. OR REPLACE transfers
+        // ownership: the replaced table's grants are removed first.
+        if registered {
+            if let Some(authz) = &self.session.authz {
+                let account_object = AccountObject::Table(
+                    catalog_name.clone(),
+                    schema_str.clone(),
+                    table_name.clone(),
+                );
+                authz.drop_object_grants(&account_object)
+                    .await
+                    .map_err(Self::account_store_error)?;
+                authz.record_ownership(&account_object)
+                    .await
+                    .map_err(Self::account_store_error)?;
+            }
+            // Record-level tenant scoping: inherit the database's label.
+            self.stamp_table_tenant(&MetastoreTableIdent::new(
+                &catalog_name,
+                &schema_str,
+                &table_name,
+            ))
+            .await?;
         }
 
         // Insert data to new table
@@ -1317,10 +1428,38 @@ impl UserQuery {
             properties: None,
         };
 
+        // Ownership-aware data-plane DDL (design §23.7): external tables
+        // follow the same CREATE rule — USAGE on db + schema, CREATE on
+        // the schema. Invisible schemas already fail at resolution.
+        if let Some(authz) = &self.session.authz {
+            if authz.schema_visible(&table_ident.database, &table_ident.schema)
+                && !authz.can_create_table(&table_ident.database, &table_ident.schema)
+            {
+                return ex_error::InsufficientPrivilegesSnafu {
+                    operation: "CREATE TABLE",
+                    object: table_ident.to_string(),
+                }
+                .fail();
+            }
+        }
+
         self.metastore
             .create_table(&table_ident, table_create_request)
             .await
             .context(ex_error::MetastoreSnafu)?;
+        // The creator role implicitly owns the table (design §23.7).
+        if let Some(authz) = &self.session.authz {
+            authz.record_ownership(&AccountObject::Table(
+                table_ident.database.clone(),
+                table_ident.schema.clone(),
+                table_ident.table.clone(),
+            ))
+            .await
+            .map_err(Self::account_store_error)?;
+        }
+        // Record-level tenant scoping: inherit the database's tenant label
+        // (design §23.7).
+        self.stamp_table_tenant(&table_ident).await?;
 
         // Register the table's volume-backed object store into this
         // session's registry. Parquet external tables resolve their object
@@ -1801,6 +1940,61 @@ impl UserQuery {
         }))
     }
 
+    /// Inherited record-level tenant properties (design §23.7, M17.4): when
+/// the parent database carries a `properties["tenant"]` label, stamp it
+/// into newly created schema/table records so record-level scoping covers
+/// them independently of the database label. `None` when the database is
+/// unlabeled (no record-level restriction).
+    async fn inherited_tenant_properties(
+        &self,
+        db: &str,
+    ) -> Result<Option<HashMap<String, String>>> {
+        Ok(match self
+            .metastore
+            .get_database(&db.to_string())
+            .await
+            .context(ex_error::MetastoreSnafu)?
+        {
+            Some(db) => db
+                .data
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("tenant"))
+                .map(|t| HashMap::from([("tenant".to_string(), t.clone())])),
+            None => None,
+        })
+    }
+
+    /// Map an account-store failure into a DataFusion external error.
+    fn account_store_error(e: impl std::fmt::Display) -> Error {
+        Error::DataFusion {
+            error: Box::new(datafusion::common::DataFusionError::External(
+                format!("account: {e}").into(),
+            )),
+            location: snafu::Location::default(),
+        }
+    }
+
+    /// Record-level tenant scoping (design §23.7): stamp the parent
+    /// database's `tenant` label into a freshly created table record. No-op
+    /// when the database is unlabeled.
+    async fn stamp_table_tenant(&self, ident: &MetastoreTableIdent) -> Result<()> {
+        let Some(props) = self.inherited_tenant_properties(&ident.database).await? else {
+            return Ok(());
+        };
+        let update = catalog_metastore::models::TableUpdate {
+            requirements: vec![],
+            updates: vec![iceberg_rust::catalog::commit::TableUpdate::SetProperties {
+                updates: props,
+            }],
+        };
+        self.metastore
+            .update_table(ident, update)
+            .await
+            .context(ex_error::MetastoreSnafu)?;
+        Ok(())
+    }
+
     #[instrument(name = "UserQuery::create_database", level = "trace", skip(self), err)]
     pub async fn create_database(
         &self,
@@ -1809,6 +2003,19 @@ impl UserQuery {
         external_volume: Option<String>,
     ) -> Result<QueryResult> {
         let catalog_name = object_name_to_string(&db_name);
+        // Ownership-aware data-plane DDL (design §23.7): database creation
+        // stays ACCOUNTADMIN-only (Snowflake default — ACCOUNTADMIN holds
+        // CREATE DATABASE). Checked before the volume requirement so the
+        // denial is not masked by a missing-volume error.
+        if let Some(authz) = &self.session.authz {
+            if !authz.is_admin_now() {
+                return ex_error::InsufficientPrivilegesSnafu {
+                    operation: "CREATE DATABASE",
+                    object: catalog_name.clone(),
+                }
+                .fail();
+            }
+        }
         if external_volume.is_none() {
             return ex_error::ExternalVolumeRequiredForCreateDatabaseSnafu { name: catalog_name }
                 .fail();
@@ -1982,7 +2189,58 @@ impl UserQuery {
             }
             .fail();
         }
+        // Ownership-aware data-plane DDL (design §23.7): USAGE on the
+        // database plus CREATE on it. Only add the explicit denial when the
+        // database is visible — invisible databases already fail
+        // as-if-missing above.
+        if let Some(authz) = &self.session.authz {
+            if authz.database_visible(&schema_ref.catalog)
+                && !authz.can_create_schema(&schema_ref.catalog)
+            {
+                return ex_error::InsufficientPrivilegesSnafu {
+                    operation: "CREATE SCHEMA",
+                    object: format!("{}.{}", schema_ref.catalog, schema_ref.schema),
+                }
+                .fail();
+            }
+        }
         self.execute_logical_plan(plan).await?;
+        // The creator role implicitly owns the schema; the record inherits
+        // the database's tenant label (design §23.7).
+        let schema_object = AccountObject::Schema(
+            schema_ref.catalog.to_string(),
+            schema_ref.schema.to_string(),
+        );
+        if let Some(authz) = &self.session.authz {
+            authz.record_ownership(&schema_object)
+                .await
+                .map_err(Self::account_store_error)?;
+        }
+        if let Some(props) = self
+            .inherited_tenant_properties(&schema_ref.catalog)
+            .await?
+        {
+            let ident = catalog_metastore::models::SchemaIdent {
+                database: schema_ref.catalog.to_string(),
+                schema: schema_ref.schema.to_string(),
+            };
+            if let Some(mut schema) = self
+                .metastore
+                .get_schema(&ident)
+                .await
+                .context(ex_error::MetastoreSnafu)?
+            {
+                let mut merged = schema.data.properties.clone().unwrap_or_default();
+                for (k, v) in props {
+                    merged.entry(k).or_insert(v);
+                }
+                schema.data.properties = Some(merged);
+                self.metastore
+                    .update_schema(&ident, schema.data)
+                    .await
+                    .context(ex_error::MetastoreSnafu)?;
+            }
+        }
         self.created_entity_response()
     }
 
@@ -2354,7 +2612,10 @@ impl UserQuery {
                     .into_iter()
                     .map(|ident| match ident {
                         ObjectNamePart::Identifier(ident) => {
-                            self.normalize_ident(ident).to_string()
+                            // Bare value: quoted idents keep their exact case
+                            // but must not carry quote markers into catalog
+                            // lookups (Ident::to_string() re-renders `"x"`).
+                            self.normalize_ident(ident).value
                         }
                         ObjectNamePart::Function(_) => String::new(),
                     })

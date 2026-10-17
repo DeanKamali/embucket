@@ -1,6 +1,7 @@
 pub use catalog;
 pub mod account_ddl;
 pub mod account_usage;
+pub mod cache_stats;
 pub mod automation_ddl;
 pub mod datafusion;
 #[cfg(feature = "dedicated-executor")]

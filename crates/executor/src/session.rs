@@ -248,6 +248,11 @@ impl UserSession {
             "warehouse_metering_history",
             Arc::new(MeteringHistoryTableFunc::new(warehouse.metering())),
         );
+        // Warm block-cache observability (design §20.1.5, M14.3)
+        ctx.register_udtf(
+            "warehouse_cache_history",
+            Arc::new(crate::cache_stats::WarehouseCacheHistoryTableFunc::new()),
+        );
         // ACCOUNT_USAGE-style observability (design §23.1, M17.1)
         #[cfg(feature = "state-store")]
         ctx.register_udtf(

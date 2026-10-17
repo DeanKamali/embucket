@@ -34,12 +34,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A batch fetcher resolved at scan time: the underlying sources (state
 /// store, account store) are async, but `TableFunctionImpl::call` is sync.
-type FetchBatches = Pin<Box<dyn Future<Output = DFResult<Vec<RecordBatch>>> + Send>>;
+pub(crate) type FetchBatches =
+    Pin<Box<dyn Future<Output = DFResult<Vec<RecordBatch>>> + Send>>;
 
 /// Snapshot table whose rows are fetched lazily at scan time and executed
 /// through a `MemTable` (same shape as the sync `WAREHOUSE_METERING_HISTORY`
 /// provider, but tolerant of async sources).
-struct LazySnapshot {
+pub(crate) struct LazySnapshot {
     schema: SchemaRef,
     fetch: Arc<dyn Fn() -> FetchBatches + Send + Sync>,
 }
@@ -53,7 +54,10 @@ impl std::fmt::Debug for LazySnapshot {
 }
 
 impl LazySnapshot {
-    fn new(schema: Schema, fetch: impl Fn() -> FetchBatches + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(
+        schema: Schema,
+        fetch: impl Fn() -> FetchBatches + Send + Sync + 'static,
+    ) -> Self {
         Self {
             schema: Arc::new(schema),
             fetch: Arc::new(fetch),
@@ -100,7 +104,7 @@ fn ts_field(name: &str) -> Field {
     Field::new(name, DataType::Timestamp(TimeUnit::Nanosecond, None), true)
 }
 
-fn str_field(name: &str) -> Field {
+pub(crate) fn str_field(name: &str) -> Field {
     Field::new(name, DataType::Utf8, true)
 }
 

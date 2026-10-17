@@ -32,6 +32,15 @@ test_query!(
     sort_all = true,
     snapshot_path = "show"
 );
+// Regression: quoted identifiers in `IN <db>` / `IN <db>.<schema>` must not
+// carry their quote markers into catalog lookups (used to fail with
+// `Database '"embucket"' does not exist or not authorized`).
+test_query!(
+    show_schemas_in_db_quoted,
+    r#"SHOW SCHEMAS IN DATABASE "embucket""#,
+    sort_all = true,
+    snapshot_path = "show"
+);
 test_query!(
     show_schemas_in_db_and_prefix,
     "SHOW SCHEMAS IN embucket STARTS WITH 'pub'",

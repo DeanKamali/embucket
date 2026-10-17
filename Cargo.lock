@@ -3256,6 +3256,7 @@ dependencies = [
 [[package]]
 name = "datafusion_iceberg"
 version = "0.10.0"
+source = "git+https://github.com/DeanKamali/iceberg-rust.git?rev=c430dd59b8bdb99714d1d8138b378547d8be68cc#c430dd59b8bdb99714d1d8138b378547d8be68cc"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4833,6 +4834,7 @@ dependencies = [
 [[package]]
 name = "iceberg-rest-catalog"
 version = "0.10.0"
+source = "git+https://github.com/DeanKamali/iceberg-rust.git?rev=c430dd59b8bdb99714d1d8138b378547d8be68cc#c430dd59b8bdb99714d1d8138b378547d8be68cc"
 dependencies = [
  "async-trait",
  "aws-credential-types",
@@ -4857,6 +4859,7 @@ dependencies = [
 [[package]]
 name = "iceberg-rust"
 version = "0.10.0"
+source = "git+https://github.com/DeanKamali/iceberg-rust.git?rev=c430dd59b8bdb99714d1d8138b378547d8be68cc#c430dd59b8bdb99714d1d8138b378547d8be68cc"
 dependencies = [
  "apache-avro",
  "arrow 59.2.0",
@@ -4892,6 +4895,7 @@ dependencies = [
 [[package]]
 name = "iceberg-rust-spec"
 version = "0.10.0"
+source = "git+https://github.com/DeanKamali/iceberg-rust.git?rev=c430dd59b8bdb99714d1d8138b378547d8be68cc#c430dd59b8bdb99714d1d8138b378547d8be68cc"
 dependencies = [
  "apache-avro",
  "arrow-schema 59.2.0",
@@ -4919,6 +4923,7 @@ dependencies = [
 [[package]]
 name = "iceberg-s3tables-catalog"
 version = "0.10.0"
+source = "git+https://github.com/DeanKamali/iceberg-rust.git?rev=c430dd59b8bdb99714d1d8138b378547d8be68cc#c430dd59b8bdb99714d1d8138b378547d8be68cc"
 dependencies = [
  "async-trait",
  "aws-config",

@@ -380,6 +380,13 @@ impl UserQuery {
         {
             return result;
         }
+        // Iceberg maintenance DDL (design §20, M14.2) — pre-parse: COMPACT /
+        // CLUSTER BY / EXPIRE SNAPSHOTS have no sqlparser grammar.
+        if let Some(result) =
+            crate::maintenance_ddl::try_execute(&self.raw_query, &self.session).await
+        {
+            return result;
+        }
         // Time travel (design §15, M9.2) — pre-parse AT() predicate rewrite:
         // the sqlparser fork has no AT() grammar either.
         crate::time_travel::rewrite(&mut self.raw_query, &self.session).await?;

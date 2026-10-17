@@ -10,6 +10,7 @@ pub mod dml;
 pub mod dt_incremental;
 pub mod error;
 pub mod error_code;
+pub mod maintenance_ddl;
 pub mod time_travel;
 pub mod undrop_ddl;
 pub mod models;

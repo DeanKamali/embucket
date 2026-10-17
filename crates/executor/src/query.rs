@@ -3927,7 +3927,11 @@ impl UserQuery {
                         .get_s3_builder()
                         .build()
                         .context(ex_error::ObjectStoreSnafu)?;
-                    Ok(Arc::new(s3))
+                    // M14.1: warm block cache behind AVALANCHE_CACHE_DIR.
+                    Ok(catalog_metastore::block_cache::maybe_wrap_cached(
+                        Arc::new(s3),
+                        &format!("s3://{bucket}"),
+                    ))
                 } else {
                     // Fall through to URL-based object store creation
                     Ok(create_object_store_from_url(

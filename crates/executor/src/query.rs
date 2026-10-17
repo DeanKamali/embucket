@@ -27,7 +27,7 @@ use catalog_metastore::{
     TableIdent as MetastoreTableIdent, Volume, VolumeType,
     models::volumes::create_object_store_from_url,
 };
-use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::arrow::datatypes::{Fields, SchemaBuilder};
 use datafusion::catalog::default_table_source::source_as_provider;
@@ -95,7 +95,7 @@ use iceberg_rust::spec::types::StructType;
 use iceberg_rust::spec::values::Value as IcebergValue;
 use iceberg_rust::table::manifest_list::snapshot_partition_bounds;
 use object_store::aws::{AmazonS3Builder, resolve_bucket_region};
-use object_store::{ClientOptions, ObjectStore};
+use object_store::{ClientOptions, ObjectMeta, ObjectStore};
 use snafu::{OptionExt, ResultExt, location};
 use sqlparser::ast::helpers::key_value_options::KeyValueOptionKind;
 use sqlparser::ast::helpers::key_value_options::KeyValueOptions;
@@ -1631,12 +1631,17 @@ impl UserQuery {
         err
     )]
     pub async fn copy_into_snowflake_query(&self, statement: Statement) -> Result<QueryResult> {
+        use futures::TryStreamExt;
+
         let Statement::CopyIntoSnowflake {
             into,
             from_obj,
             from_obj_alias,
             stage_params,
             file_format,
+            files,
+            pattern,
+            copy_options,
             ..
         } = statement
         else {
@@ -1667,52 +1672,142 @@ impl UserQuery {
 
             self.session
                 .ctx
-                .register_object_store(url.object_store().as_ref(), object_store);
+                .register_object_store(url.object_store().as_ref(), object_store.clone());
 
-            let config = self
-                .build_listing_table_config(file_format, &into_provider, url)
-                .await?;
+            // File set: every object under the location prefix (Snowflake
+            // semantics), narrowed by FILES (basename match) and PATTERN
+            // (regex match on the full object path).
+            let mut metas: Vec<ObjectMeta> = object_store
+                .list(Some(url.prefix()))
+                .try_collect()
+                .await
+                .context(ex_error::ObjectStoreSnafu)?;
+            metas.retain(|meta| !meta.location.as_ref().ends_with('/'));
+            if let Some(wanted) = &files {
+                metas.retain(|meta| {
+                    let path = meta.location.as_ref();
+                    path.rsplit('/')
+                        .next()
+                        .is_some_and(|base| wanted.iter().any(|f| f == base))
+                });
+            }
+            if let Some(pattern) = pattern.as_deref() {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))
+                    .context(ex_error::DataFusionSnafu)?;
+                metas.retain(|meta| re.is_match(meta.location.as_ref()));
+            }
 
-            let table_provider =
-                ListingTable::try_new(config).context(ex_error::DataFusionSnafu)?;
-
-            let builder = LogicalPlanBuilder::scan(
-                "external_location",
-                Arc::new(DefaultTableSource::new(Arc::new(table_provider))),
-                None,
-            )
-            .context(ex_error::DataFusionSnafu)?;
-
-            let builder = if let Some(alias) = from_obj_alias {
-                builder
-                    .alias(alias.to_string())
-                    .context(ex_error::DataFusionSnafu)?
-            } else {
-                builder
+            // ON_ERROR (Snowflake default is ABORT_STATEMENT): CONTINUE /
+            // SKIP_FILE record the failure per file and keep loading the
+            // remaining files.
+            #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+            enum OnError {
+                Abort,
+                Continue,
+                SkipFile,
+            }
+            let on_error = match get_kv_option(&copy_options, "ON_ERROR")
+                .as_deref()
+                .map(|v| v.to_ascii_uppercase())
+                .as_deref()
+            {
+                Some("CONTINUE") => OnError::Continue,
+                Some(v) if v.starts_with("SKIP_FILE") => OnError::SkipFile,
+                _ => OnError::Abort,
             };
 
-            let input = builder.build().context(ex_error::DataFusionSnafu)?;
-
-            let input = if input.schema().as_arrow() == &*into_provider.schema() {
-                input
-            } else {
-                cast_input_to_target_schema(Arc::new(input), &into_provider.schema())?
-            };
-
-            let plan = LogicalPlanBuilder::insert_into(
-                input,
-                insert_reference,
-                Arc::new(DefaultTableSource::new(into_provider)),
-                InsertOp::Append,
-            )
-            .context(ex_error::DataFusionSnafu)?
-            .build()
-            .context(ex_error::DataFusionSnafu)?;
-
-            self.execute_logical_plan(plan).await
+            let mut report: CopyReportRows = Vec::new();
+            for meta in metas {
+                let file_url_str =
+                    format!("{}{}", url.object_store(), meta.location.as_ref());
+                let file_url =
+                    ListingTableUrl::parse(&file_url_str).context(ex_error::DataFusionSnafu)?;
+                match self
+                    .copy_load_one_file(
+                        file_url,
+                        &file_format,
+                        from_obj_alias.as_ref(),
+                        &insert_reference,
+                        &into_provider,
+                    )
+                    .await
+                {
+                    Ok(loaded) => report.push((
+                        file_url_str,
+                        "Loaded".to_string(),
+                        Some(loaded as i64),
+                        Some(loaded as i64),
+                        None,
+                        Some(0),
+                        None,
+                        None,
+                    )),
+                    Err(err) if on_error != OnError::Abort => {
+                        report.push((
+                            file_url_str,
+                            "Load failed".to_string(),
+                            None,
+                            None,
+                            None,
+                            Some(1),
+                            Some(err.to_string()),
+                            None,
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            copy_report_result(report)
         } else {
             ex_error::StagesNotSupportedSnafu.fail()
         }
+    }
+
+    /// Loads one file from an external location into the COPY target table:
+    /// builds a per-file `ListingTable` scan, casts it to the target schema
+    /// and executes an append `INSERT` plan. Returns the loaded row count.
+    async fn copy_load_one_file(
+        &self,
+        file_url: ListingTableUrl,
+        file_format: &KeyValueOptions,
+        from_obj_alias: Option<&Ident>,
+        into_reference: &TableReference,
+        into_provider: &Arc<dyn TableProvider>,
+    ) -> Result<u64> {
+        let config = self
+            .build_listing_table_config(file_format.clone(), into_provider, file_url)
+            .await?;
+        let table_provider = ListingTable::try_new(config).context(ex_error::DataFusionSnafu)?;
+
+        let mut builder = LogicalPlanBuilder::scan(
+            "external_location",
+            Arc::new(DefaultTableSource::new(Arc::new(table_provider))),
+            None,
+        )
+        .context(ex_error::DataFusionSnafu)?;
+        if let Some(alias) = from_obj_alias {
+            builder = builder
+                .alias(alias.to_string())
+                .context(ex_error::DataFusionSnafu)?;
+        }
+        let input = builder.build().context(ex_error::DataFusionSnafu)?;
+        let input = if input.schema().as_arrow() == &*into_provider.schema() {
+            input
+        } else {
+            cast_input_to_target_schema(Arc::new(input), &into_provider.schema())?
+        };
+        let plan = LogicalPlanBuilder::insert_into(
+            input,
+            into_reference.clone(),
+            Arc::new(DefaultTableSource::new(into_provider.clone())),
+            InsertOp::Append,
+        )
+        .context(ex_error::DataFusionSnafu)?
+        .build()
+        .context(ex_error::DataFusionSnafu)?;
+        let result = self.execute_logical_plan(plan).await?;
+        Ok(copy_loaded_rows(&result))
     }
 
     #[instrument(name = "UserQuery::merge_query", level = "trace", skip(self), err)]
@@ -3798,9 +3893,16 @@ impl UserQuery {
                         .trim_start_matches("s3://")
                         .trim_end_matches('/');
 
-                    let region = resolve_bucket_region(bucket, &ClientOptions::default())
-                        .await
-                        .context(ex_error::ObjectStoreSnafu)?;
+                    // Region discovery HEADs the bucket on real AWS. With a
+                    // custom ENDPOINT (self-hosted / S3-compatible store such
+                    // as MinIO or a test S3), the bucket only exists there —
+                    // skip discovery and use the default region.
+                    let region = match &stage_params.endpoint {
+                        Some(_) => "us-east-1".to_string(),
+                        None => resolve_bucket_region(bucket, &ClientOptions::default())
+                            .await
+                            .context(ex_error::ObjectStoreSnafu)?,
+                    };
 
                     let credentials = if let Some(token) = session_token {
                         Some(AwsCredentials::Token(token.to_string()))
@@ -4395,6 +4497,97 @@ fn get_field<'a>(
     Ok((reference, input_field))
 }
 
+/// One `COPY INTO` result row, mirroring the Snowflake result columns.
+///
+/// (file, status, rows_parsed, rows_loaded, error_limit, errors_seen,
+///  first_error, first_error_line)
+type CopyReportRows = Vec<(
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+)>;
+
+/// Extracts the appended-row count from an `INSERT` plan result (the first
+/// row of the first column, whatever integer representation the count
+/// projection produced).
+fn copy_loaded_rows(result: &QueryResult) -> u64 {
+    let Some(batch) = result.records.first() else {
+        return 0;
+    };
+    let Some(col) = batch.columns().first() else {
+        return 0;
+    };
+    let any = col.as_any();
+    if let Some(a) = any.downcast_ref::<Int64Array>() {
+        return a.value(0).max(0) as u64;
+    }
+    if let Some(a) = any.downcast_ref::<UInt64Array>() {
+        return a.value(0);
+    }
+    if let Some(a) = any.downcast_ref::<UInt32Array>() {
+        return u64::from(a.value(0));
+    }
+    if let Some(a) = any.downcast_ref::<StringArray>() {
+        return a.value(0).parse().unwrap_or(0);
+    }
+    0
+}
+
+/// Builds the Snowflake-shaped `COPY INTO` result:
+/// (file, status, rows_parsed, rows_loaded, error_limit, errors_seen,
+///  first_error, first_error_line).
+fn copy_report_result(rows: CopyReportRows) -> Result<QueryResult> {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("file", DataType::Utf8, false),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("rows_parsed", DataType::Int64, true),
+        Field::new("rows_loaded", DataType::Int64, true),
+        Field::new("error_limit", DataType::Int64, true),
+        Field::new("errors_seen", DataType::Int64, true),
+        Field::new("first_error", DataType::Utf8, true),
+        Field::new("first_error_line", DataType::Int64, true),
+    ]));
+    let mut file: Vec<&str> = Vec::with_capacity(rows.len());
+    let mut status: Vec<&str> = Vec::with_capacity(rows.len());
+    let mut rows_parsed: Vec<Option<i64>> = Vec::with_capacity(rows.len());
+    let mut rows_loaded: Vec<Option<i64>> = Vec::with_capacity(rows.len());
+    let mut error_limit: Vec<Option<i64>> = Vec::with_capacity(rows.len());
+    let mut errors_seen: Vec<Option<i64>> = Vec::with_capacity(rows.len());
+    let mut first_error: Vec<Option<String>> = Vec::with_capacity(rows.len());
+    let mut first_error_line: Vec<Option<i64>> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        file.push(row.0.as_str());
+        status.push(row.1.as_str());
+        rows_parsed.push(row.2);
+        rows_loaded.push(row.3);
+        error_limit.push(row.4);
+        errors_seen.push(row.5);
+        first_error.push(row.6.clone());
+        first_error_line.push(row.7);
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(file)),
+            Arc::new(StringArray::from(status)),
+            Arc::new(Int64Array::from(rows_parsed)),
+            Arc::new(Int64Array::from(rows_loaded)),
+            Arc::new(Int64Array::from(error_limit)),
+            Arc::new(Int64Array::from(errors_seen)),
+            Arc::new(StringArray::from(first_error)),
+            Arc::new(Int64Array::from(first_error_line)),
+        ],
+    )
+    .map_err(|e| DataFusionError::External(Box::new(e)))
+    .context(ex_error::DataFusionSnafu)?;
+    Ok(QueryResult::new(vec![batch], schema))
+}
+
 /// Checks if the `ObjectName` indicates an external location for a Snowflake COPY INTO statement.
 ///
 /// This function validates that the object name represents a valid external location by checking:
@@ -4472,6 +4665,21 @@ pub fn get_kv_option(options: &KeyValueOptions, key: &str) -> Option<String> {
             KeyValueOptionKind::Single(v) => Some(v.value.to_string()),
             _ => None,
         })
+        .map(|raw| {
+            // Single/double-quoted literals keep their quotes through
+            // `Display` (e.g. `ON_ERROR = 'CONTINUE'` renders as
+            // `'CONTINUE'`), so callers comparing against bare values need
+            // them stripped.
+            let v = raw.trim();
+            if v.len() >= 2
+                && ((v.starts_with('\'') && v.ends_with('\''))
+                    || (v.starts_with('"') && v.ends_with('"')))
+            {
+                v[1..v.len() - 1].to_string()
+            } else {
+                v.to_string()
+            }
+        })
 }
 
 fn create_file_format(
@@ -4483,8 +4691,12 @@ fn create_file_format(
         } else if format_type.eq_ignore_ascii_case("csv") {
             let infer_schema = get_kv_option(file_format, "parse_header")
                 .is_some_and(|x| x.to_lowercase() == "true");
-            let has_header =
-                get_kv_option(file_format, "skip_header").is_some_and(|x| x.to_lowercase() == "1");
+            // PARSE_HEADER = TRUE means the first row carries the column
+            // names, so the reader must treat it as a header; SKIP_HEADER
+            // is the legacy way to say the same thing (skip N rows).
+            let has_header = get_kv_option(file_format, "skip_header")
+                .is_some_and(|x| x.to_lowercase() == "1")
+                || infer_schema;
 
             let mut csv_format = CsvFormat::default().with_has_header(has_header);
 

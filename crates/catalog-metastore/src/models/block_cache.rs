@@ -311,7 +311,7 @@ impl CacheCore {
             let meta = self.index.get(key)?;
             meta.len
         };
-        self.read_block(&self.block_path(store_dir, key), len).await
+        self.read_block(&Self::block_path(store_dir, key), len).await
     }
 
     fn next_clock(&self) -> u64 {

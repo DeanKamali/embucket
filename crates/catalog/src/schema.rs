@@ -3,6 +3,8 @@ use crate::df_error::CatalogSnafu;
 use crate::table::{CachingTable, IcebergTableBuilder};
 use crate::{block_on_with_timeout, error};
 use async_trait::async_trait;
+use catalog_metastore::metastore::Metastore;
+use catalog_metastore::models::table::{TableIdent, REPLICA_PROPERTY};
 use dashmap::DashMap;
 use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion_common::DataFusionError;
@@ -16,11 +18,36 @@ use snafu::ResultExt;
 use std::sync::Arc;
 use tracing::error;
 
+/// A cached table provider plus the identity of the metastore record it was
+/// built from: `(metadata_location, replica stamp)`. The catalog's caching
+/// assumption ("users interact with Iceberg exclusively through Embucket")
+/// breaks when a record is re-stamped outside the session — a replication
+/// refresh re-registers the replica record (M15.5) and a failover promotion
+/// clears its stamp — so hits are validated against the live record.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedEntry {
+    table: Arc<CachingTable>,
+    fingerprint: Option<(String, Option<String>)>,
+}
+
+impl CachedEntry {
+    pub(crate) fn new(
+        table: Arc<CachingTable>,
+        fingerprint: Option<(String, Option<String>)>,
+    ) -> Self {
+        Self { table, fingerprint }
+    }
+}
+
 pub struct CachingSchema {
     pub schema: Arc<dyn SchemaProvider>,
     pub iceberg_catalog: Option<Arc<dyn Catalog>>,
     pub name: String,
-    pub tables_cache: DashMap<String, Arc<CachingTable>>,
+    pub tables_cache: DashMap<String, CachedEntry>,
+    /// Metastore + owning database for cache validation (`None` when
+    /// unknown — entries are then trusted until dropped).
+    pub metastore: Option<Arc<dyn Metastore>>,
+    pub database: Option<String>,
     pub config: CatalogConfig,
 }
 
@@ -32,6 +59,32 @@ impl std::fmt::Debug for CachingSchema {
             .field("name", &self.name)
             .field("tables_cache", &self.tables_cache)
             .finish()
+    }
+}
+
+impl CachingSchema {
+    /// Fingerprint of the table's current metastore record (`None` when the
+    /// record is missing, the metastore is unknown, or the lookup fails —
+    /// an `Err` is deliberately indistinguishable so a transient failure
+    /// invalidates rather than serves a possibly stale provider).
+    pub(crate) async fn record_fingerprint(&self, name: &str) -> Option<(String, Option<String>)> {
+        let (Some(metastore), Some(database)) = (&self.metastore, &self.database) else {
+            return None;
+        };
+        let ident = TableIdent::new(database, &self.name, name);
+        match metastore.get_table(&ident).await {
+            Ok(Some(record)) => Some((
+                record.data.metadata_location.clone(),
+                record.data.properties.get(REPLICA_PROPERTY).cloned(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether a cache hit must be rebuilt: the live record's identity no
+    /// longer matches the fingerprint the provider was built from.
+    async fn entry_is_stale(&self, name: &str, entry: &CachedEntry) -> bool {
+        self.record_fingerprint(name).await != entry.fingerprint
     }
 }
 
@@ -81,18 +134,29 @@ impl SchemaProvider for CachingSchema {
         // However, since we assume that users will interact with the Iceberg catalog
         // exclusively through Embucket, we can safely enable caching — in this case,
         // the data will remain consistent across all queries.
-        if let Some(table) = self.tables_cache.get(name) {
-            return Ok(Some(Arc::clone(table.value()) as Arc<dyn TableProvider>));
+        if let Some(entry) = self.tables_cache.get(name) {
+            if self.entry_is_stale(name, &entry).await {
+                // The record changed outside this session (M15.5 replica
+                // refresh / promotion): drop the entry and re-resolve.
+                drop(entry);
+                self.tables_cache.remove(name);
+            } else {
+                return Ok(Some(Arc::clone(&entry.value().table) as Arc<dyn TableProvider>));
+            }
         }
 
         if let Some(table) = self.schema.table(name).await? {
-            let caching_table = Arc::new(CachingTable::new(name.to_string(), Arc::clone(&table)));
+            let fingerprint = self.record_fingerprint(name).await;
+            let caching_table = Arc::new(CachedEntry::new(
+                Arc::new(CachingTable::new(name.to_string(), Arc::clone(&table))),
+                fingerprint,
+            ));
 
             // Optionally update the cache for reuse (not as source of truth)
             self.tables_cache
-                .insert(name.to_string(), Arc::clone(&caching_table));
+                .insert(name.to_string(), (*caching_table).clone());
 
-            Ok(Some(caching_table as Arc<dyn TableProvider>))
+            Ok(Some(Arc::clone(&caching_table.table) as Arc<dyn TableProvider>))
         } else {
             Ok(None)
         }
@@ -135,7 +199,15 @@ impl SchemaProvider for CachingSchema {
             table
         };
 
-        let caching_table = Arc::new(CachingTable::new(name.clone(), Arc::clone(&table_provider)));
+        // Fingerprint is filled in on the first validated hit (this method is
+        // sync; the async metastore lookup is unavailable here).
+        let caching_table = CachedEntry::new(
+            Arc::new(CachingTable::new(
+                name.clone(),
+                Arc::clone(&table_provider),
+            )),
+            None,
+        );
         self.tables_cache.insert(name, caching_table);
         Ok(Some(table_provider))
     }
@@ -148,7 +220,7 @@ impl SchemaProvider for CachingSchema {
         let table = self.tables_cache.remove(name);
 
         if let Some((_, caching_table)) = table {
-            if caching_table.table_type() != TableType::View {
+            if caching_table.table.table_type() != TableType::View {
                 if let Some(catalog) = &self.iceberg_catalog {
                     let catalog = Arc::clone(catalog);
                     let namespace = vec![self.name.clone()];
@@ -170,7 +242,7 @@ impl SchemaProvider for CachingSchema {
                     return self.schema.deregister_table(name);
                 }
             }
-            return Ok(Some(caching_table as Arc<dyn TableProvider>));
+            return Ok(Some(caching_table.table as Arc<dyn TableProvider>));
         }
         Ok(None)
     }

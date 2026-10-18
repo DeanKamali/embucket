@@ -100,6 +100,12 @@ impl From<String> for TableFormat {
     }
 }
 
+/// Table property marking a read-only replica (M15.5, design §21.5): the
+/// value is the replication group that refreshed it. Set by the executor's
+/// replication refresh; enforced at the query boundary and used by the
+/// catalog cache to invalidate stale replica providers.
+pub const REPLICA_PROPERTY: &str = "avalanche.replica";
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Table {
     pub ident: TableIdent,

@@ -33,8 +33,10 @@ use snafu::Location;
 use std::sync::Arc;
 
 /// Table property marking a read-only replica (M15.5): the value is the
-/// replication group that refreshed it.
-pub const REPLICA_PROPERTY: &str = "avalanche.replica";
+/// replication group that refreshed it. Defined in `catalog-metastore` so
+/// the catalog cache can validate stale replica providers; re-exported here
+/// as the executor-side seam.
+pub use catalog_metastore::models::table::REPLICA_PROPERTY;
 
 fn external_error(context: &str, err: impl std::fmt::Display) -> Error {
     Error::DataFusion {

@@ -262,6 +262,8 @@ impl CatalogProvider for CachingCatalog {
                 schema: Arc::clone(&schema),
                 tables_cache: DashMap::new(),
                 iceberg_catalog: self.iceberg_catalog.clone(),
+                metastore: self.metastore.clone(),
+                database: Some(self.name.clone()),
                 config: self.config.clone(),
             });
 
@@ -331,6 +333,8 @@ impl CatalogProvider for CachingCatalog {
             schema: schema_provider,
             tables_cache: DashMap::new(),
             iceberg_catalog: self.iceberg_catalog.clone(),
+            metastore: self.metastore.clone(),
+            database: Some(self.name.clone()),
             config: self.config.clone(),
         });
         self.schemas_cache

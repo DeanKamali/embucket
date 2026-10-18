@@ -8,7 +8,7 @@ use crate::error::{
     self as catalog_error, InvalidCacheSnafu, MetastoreSnafu, MissingVolumeSnafu,
     NotImplementedSnafu, Result, UnsupportedFeature,
 };
-use crate::schema::CachingSchema;
+use crate::schema::{CachingSchema, CachedEntry};
 use crate::table::CachingTable;
 use crate::utils::fetch_table_providers;
 #[cfg(not(feature = "rest-catalog"))]
@@ -285,6 +285,8 @@ impl EmbucketCatalogList {
                             iceberg_catalog: caching.iceberg_catalog.clone(),
                             name: schema_name,
                             tables_cache: DashMap::new(),
+                            metastore: caching.metastore.clone(),
+                            database: Some(caching.name.clone()),
                             config: caching.config.clone(),
                         }),
                     );
@@ -503,6 +505,8 @@ impl EmbucketCatalogList {
                             tables_cache: DashMap::default(),
                             name: schema.clone(),
                             iceberg_catalog: catalog.iceberg_catalog.clone(),
+                            metastore: catalog.metastore.clone(),
+                            database: Some(catalog.name.clone()),
                             config: catalog.config.clone(),
                         };
                         let table_providers = fetch_table_providers(
@@ -513,13 +517,17 @@ impl EmbucketCatalogList {
                         .context(catalog_error::DataFusionSnafu)?;
 
                         for (table_name, table_provider) in table_providers {
+                            let fingerprint = schema.record_fingerprint(&table_name).await;
                             schema.tables_cache.insert(
                                 table_name.clone(),
-                                Arc::new(CachingTable::new_with_schema(
-                                    table_name,
-                                    table_provider.schema(),
-                                    Arc::clone(&table_provider),
-                                )),
+                                CachedEntry::new(
+                                    Arc::new(CachingTable::new_with_schema(
+                                        table_name,
+                                        table_provider.schema(),
+                                        Arc::clone(&table_provider),
+                                    )),
+                                    fingerprint,
+                                ),
                             );
                         }
                         catalog

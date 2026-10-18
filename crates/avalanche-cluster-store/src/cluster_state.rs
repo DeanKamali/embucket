@@ -23,7 +23,8 @@ use ballista_core::serde::scheduler::{
 };
 use ballista_scheduler::cluster::event::ClusterEventSender;
 use ballista_scheduler::cluster::{
-    BoundTask, ClusterState, ClusterStateEvent, ClusterStateEventStream, ExecutorSlot,
+    BoundTask, ClusterState, ClusterStateEvent, ClusterStateEventStream, ExecutorLoss,
+    ExecutorSlot,
 };
 use ballista_scheduler::config::TaskDistributionPolicy;
 use ballista_scheduler::state::task_manager::JobInfoCache;
@@ -72,6 +73,15 @@ const DDL: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS ballista_executor_vcores (
         executor_id TEXT PRIMARY KEY,
         free_vcores INT  NOT NULL)",
+    // Durable executor-loss tombstones (M7.4 phase 2): whichever replica's
+    // reaper removes a dead executor records the loss here; every replica
+    // sharing this state consumes new rows and posts ExecutorLost on its
+    // own event loop, so the job-owning replica recovers its jobs.
+    "CREATE TABLE IF NOT EXISTS ballista_executor_losses (
+        id          BIGSERIAL PRIMARY KEY,
+        executor_id TEXT NOT NULL UNIQUE,
+        reason      TEXT,
+        ts          TIMESTAMPTZ NOT NULL DEFAULT now())",
 ];
 
 struct Inner {
@@ -288,6 +298,15 @@ async fn refresh_once(inner: &Inner) -> BallistaResult<()> {
         .query("SELECT id FROM ballista_executors", &[])
         .await
         .map_err(pg_err("select executor ids"))?;
+    // Tombstones are consumed by every replica within seconds of being
+    // written; prune old ones so the table cannot grow unbounded and so a
+    // replica restarting never replays stale losses.
+    let _ = conn
+        .execute(
+            "DELETE FROM ballista_executor_losses WHERE ts < now() - INTERVAL '10 minutes'",
+            &[],
+        )
+        .await;
     drop(conn);
 
     let pg_ids: HashSet<String> = id_rows.iter().map(|r| r.get::<_, String>(0)).collect();
@@ -583,6 +602,47 @@ impl ClusterState for PostgresClusterState {
             executor_id: executor_id.to_string(),
         });
         Ok(())
+    }
+
+    async fn record_executor_loss(
+        &self,
+        executor_id: &str,
+        reason: Option<&str>,
+    ) -> BallistaResult<()> {
+        let conn = self.conn().await?;
+        conn.execute(
+            "INSERT INTO ballista_executor_losses (executor_id, reason)
+             VALUES ($1, $2)
+             ON CONFLICT (executor_id) DO NOTHING",
+            &[&executor_id, &reason],
+        )
+        .await
+        .map_err(pg_err("record executor loss"))?;
+        Ok(())
+    }
+
+    async fn pending_executor_losses(
+        &self,
+        since_loss_id: i64,
+    ) -> BallistaResult<Vec<ExecutorLoss>> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT id, executor_id, reason FROM ballista_executor_losses
+                 WHERE id > $1 ORDER BY id LIMIT 1000",
+                &[&since_loss_id],
+            )
+            .await
+            .map_err(pg_err("select executor losses"))?;
+        drop(conn);
+        Ok(rows
+            .iter()
+            .map(|r| ExecutorLoss {
+                id: r.get::<_, i64>(0),
+                executor_id: r.get(1),
+                reason: r.get(2),
+            })
+            .collect())
     }
 
     fn executor_heartbeats(&self) -> HashMap<String, ExecutorHeartbeat> {

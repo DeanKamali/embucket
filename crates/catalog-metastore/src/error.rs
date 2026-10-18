@@ -252,6 +252,24 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Sequence {sequence} already exists in schema {schema} in database {db}"))]
+    SequenceAlreadyExists {
+        sequence: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Sequence {sequence} not found in {db}.{schema}"))]
+    SequenceNotFound {
+        sequence: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Task {task} already exists in schema {schema} in database {db}"))]
     TaskAlreadyExists {
         task: String,

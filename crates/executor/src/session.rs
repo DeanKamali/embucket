@@ -110,6 +110,11 @@ pub struct UserSession {
     /// an uncommitted transaction is lost on restart, matching crash
     /// semantics.
     pub txn: std::sync::Mutex<Option<crate::transaction::TxnState>>,
+    /// Per-session sequence value state (design §22.8): reserved `NEXTVAL`
+    /// ranges and last-delivered values (CURRVAL). Deliberately not
+    /// persisted — reserved-but-undelivered values are skipped on restart,
+    /// matching Snowflake CACHE semantics.
+    pub sequence_state: Arc<crate::sequences::SequenceSessionState>,
 }
 
 impl UserSession {
@@ -242,6 +247,12 @@ impl UserSession {
         register_udfs(&mut ctx, &session_params_arc).context(ex_error::RegisterUDFSnafu)?;
         register_udafs(&mut ctx).context(ex_error::RegisterUDAFSnafu)?;
         register_udtfs(&ctx);
+        // Sequences (design §22.8): hidden NEXTVAL/CURRVAL UDFs carry the
+        // session's reserved-range state; the SHOW SEQUENCES TVF reads the
+        // metastore.
+        let sequence_state = Arc::new(crate::sequences::SequenceSessionState::default());
+        crate::sequences::register_sequence_udfs(&ctx, Arc::clone(&sequence_state));
+        crate::sequences::register_sequences_tvf(&ctx, Arc::clone(&metastore));
         // metering history table function (M5) — reads the warehouse
         // manager's executor-seconds ledger
         ctx.register_udtf(
@@ -308,6 +319,7 @@ impl UserSession {
             attrs: DashMap::new(),
             metadata,
             warehouse,
+            sequence_state,
         };
         Ok(session)
     }

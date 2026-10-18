@@ -72,6 +72,30 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Sequence cache exhausted mid-query; rerun the query to reserve more values"))]
+    SequenceCacheExhausted {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Sequence value overflow"))]
+    SequenceOverflow {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Sequence state lock poisoned"))]
+    SequenceStatePoisoned {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("CURRVAL not yet defined for this sequence in the session; call NEXTVAL first"))]
+    CurrvalNotDefined {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("Invalid schema identifier: {ident}"))]
     InvalidSchemaIdentifier {
         ident: String,
@@ -409,6 +433,25 @@ pub enum Error {
     },
     #[snafu(display("Only CREATE STAGE statements are supported"))]
     OnlyCreateStageStatements {
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Only sequence statements are supported"))]
+    OnlySequenceStatements {
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Sequence {sequence} not found in {db}.{schema}"))]
+    SequenceNotFound {
+        sequence: String,
+        schema: String,
+        db: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Invalid sequence option: {message}"))]
+    InvalidSequenceOption {
+        message: String,
         #[snafu(implicit)]
         location: Location,
     },

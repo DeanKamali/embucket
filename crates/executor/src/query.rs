@@ -111,10 +111,11 @@ use sqlparser::ast::helpers::key_value_options::KeyValueOptionKind;
 use sqlparser::ast::helpers::key_value_options::KeyValueOptions;
 use sqlparser::ast::helpers::stmt_data_loading::StageParamsObject;
 use sqlparser::ast::{
-    AlterTableOperation, AssignmentTarget, CloudProviderParams, MergeAction, MergeClause,
-    MergeClauseKind, MergeInsertKind, MergeUpdateKind, ObjectType, PivotValueSource, ShowObjects,
-    ShowStatementFilter, ShowStatementIn, ShowStatementInParentType as ShowType,
-    ShowStatementInParentType, TruncateTableTarget, Use, Value, visit_relations_mut,
+    AlterSequenceOperation, AlterTableOperation, AssignmentTarget, CloudProviderParams,
+    MergeAction, MergeClause, MergeClauseKind, MergeInsertKind, MergeUpdateKind, ObjectType,
+    PivotValueSource, ShowObjects, ShowStatementFilter, ShowStatementIn,
+    ShowStatementInParentType as ShowType, ShowStatementInParentType, TruncateTableTarget, Use,
+    Value, visit_relations_mut,
 };
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -291,6 +292,12 @@ impl UserQuery {
                 }
                 Statement::CreateSchema { .. } => save(QueryType::Ddl(DdlStType::CreateSchema)),
                 Statement::CreateStage { .. } => save(QueryType::Ddl(DdlStType::CreateStage)),
+                Statement::CreateSequence { .. } => {
+                    save(QueryType::Ddl(DdlStType::CreateSequence));
+                }
+                Statement::AlterSequence { .. } => {
+                    save(QueryType::Ddl(DdlStType::AlterSequence));
+                }
                 Statement::CopyIntoSnowflake { .. } => {
                     save(QueryType::Ddl(DdlStType::CopyIntoSnowflake));
                 }
@@ -303,6 +310,7 @@ impl UserQuery {
                     ObjectType::Schema => save(QueryType::Ddl(DdlStType::DropSchema)),
                     ObjectType::Database => save(QueryType::Ddl(DdlStType::DropDatabase)),
                     ObjectType::Stage => save(QueryType::Ddl(DdlStType::DropStage)),
+                    ObjectType::Sequence => save(QueryType::Ddl(DdlStType::DropSequence)),
                     _ => {}
                 },
                 // match other statements:
@@ -320,6 +328,9 @@ impl UserQuery {
                 Statement::ShowSchemas { .. } => save(QueryType::Misc(MiscStType::ShowSchemas)),
                 Statement::ShowTables { .. } => save(QueryType::Misc(MiscStType::ShowTables)),
                 Statement::ShowViews { .. } => save(QueryType::Misc(MiscStType::ShowViews)),
+                Statement::ShowSequences { .. } => {
+                    save(QueryType::Misc(MiscStType::ShowSequences));
+                }
                 Statement::ExplainTable { .. } => save(QueryType::Misc(MiscStType::ExplainTable)),
                 Statement::Explain { .. } => save(QueryType::Misc(MiscStType::Explain)),
                 Statement::Analyze { .. } => save(QueryType::Misc(MiscStType::Analyze)),
@@ -407,7 +418,17 @@ impl UserQuery {
         if let Some(warehouse) = self.session.get_session_variable("warehouse") {
             self.session.warehouse.ensure_running(&warehouse).await;
         }
-        let statement = self.parse_query().context(ex_error::DataFusionSnafu)?;
+        let mut statement = self.parse_query().context(ex_error::DataFusionSnafu)?;
+        // Sequences (design §22.8): rewrite `seq.NEXTVAL`/`CURRVAL` compound
+        // identifiers into the hidden `__nextval`/`__currval` UDF calls and
+        // reserve value chunks at parse time, before the text re-serializes
+        // (the rewritten text is what actually plans/executes).
+        if let DFStatement::Statement(stmt) = &mut statement {
+            crate::sequences::rewrite_sequences(&self.session, stmt, |parts| {
+                Self::normalized_to_table_ident(self.resolve_table_object_name(parts)?)
+            })
+            .await?;
+        }
         // Re-serialize with string literals re-escaped for the session
         // dialect: the AST holds decoded values and `to_string()` only
         // re-escapes quotes, so a backslash-escape dialect (snowflake) would
@@ -530,6 +551,12 @@ impl UserQuery {
                     // We support only CSV uploads for now
                     return Box::pin(self.create_stage_query(*s)).await;
                 }
+                Statement::CreateSequence { .. } => {
+                    return Box::pin(self.create_sequence_query(*s)).await;
+                }
+                Statement::AlterSequence { .. } => {
+                    return Box::pin(self.alter_sequence_query(*s)).await;
+                }
                 Statement::CopyIntoSnowflake { .. } => {
                     return Box::pin(self.copy_into_snowflake_query(*s)).await;
                 }
@@ -566,7 +593,8 @@ impl UserQuery {
                 | Statement::ShowObjects { .. }
                 | Statement::ShowVariables { .. }
                 | Statement::ShowVariable { .. }
-                | Statement::ShowParameters { .. } => {
+                | Statement::ShowParameters { .. }
+                | Statement::ShowSequences { .. } => {
                     return Box::pin(self.show_query(*s)).await;
                 }
                 Statement::Truncate(truncate) => {
@@ -954,6 +982,37 @@ impl UserQuery {
                 ident: database_name,
             }
             .fail();
+        }
+
+        // DROP SEQUENCE is metastore-level (design §22.8): no iceberg entity.
+        if object_type == ObjectType::Sequence {
+            let Some(sequence) = names.first() else {
+                return ex_error::OnlyDropStatementsSnafu.fail();
+            };
+            let ident = self.sequence_ident(sequence.clone())?;
+            let exists = self
+                .metastore
+                .get_sequence(&ident)
+                .await
+                .context(ex_error::MetastoreSnafu)?
+                .is_some();
+            if !exists {
+                if if_exists {
+                    return self.status_response();
+                }
+                return ex_error::SequenceNotFoundSnafu {
+                    sequence: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .fail();
+            }
+            self.metastore
+                .delete_sequence(&ident)
+                .await
+                .context(ex_error::MetastoreSnafu)?;
+            crate::sequences::invalidate_session_range(&self.session, &ident);
+            return self.status_response();
         }
 
         // DROP EXTERNAL VOLUME is metastore-level (no iceberg catalog
@@ -2622,6 +2681,37 @@ impl UserQuery {
                 }
                 apply_show_filters(sql, &filters)
             }
+            Statement::ShowSequences { show_options } => {
+                // Sequences are metastore records (design §22.8) — the TVF
+                // reads them directly; scope + STARTS WITH become SQL
+                // filters over it.
+                let reference =
+                    self.resolve_show_in_name(show_options.show_in, ShowType::Schema)?;
+                let catalog: String = reference
+                    .catalog()
+                    .map_or_else(|| self.current_database(), ToString::to_string);
+                let mut filters = vec![format!("database_name = '{catalog}'")];
+                if let Some(schema) = reference.schema().filter(|s| !s.is_empty()) {
+                    filters.push(format!("schema_name = '{schema}'"));
+                }
+                if let Some(filter) =
+                    build_starts_with_filter(show_options.starts_with, "name")
+                {
+                    filters.push(filter);
+                }
+                apply_show_filters(
+                    r#"
+                    SELECT
+                        created_on,
+                        name,
+                        database_name,
+                        schema_name,
+                        comment
+                    FROM __sequences_catalog()"#
+                    .to_string(),
+                    &filters,
+                )
+            }
             _ => {
                 return ex_error::UnsupportedShowStatementSnafu {
                     statement: statement.to_string(),
@@ -2716,6 +2806,205 @@ impl UserQuery {
             QueryContext::default(),
         );
         query.execute().await
+    }
+
+    /// CREATE SEQUENCE (design §22.8, M16.4 deferred item). Persists the
+    /// sequence record (start, increment, comment) with the reservation
+    /// cursor initialized to `start - increment` so the first `NEXTVAL`
+    /// yields `start`. `IF NOT EXISTS` / `OR REPLACE` follow container DDL
+    /// semantics.
+    #[instrument(
+        name = "UserQuery::create_sequence_query",
+        level = "trace",
+        skip(self, statement),
+        err
+    )]
+    pub async fn create_sequence_query(&self, statement: Statement) -> Result<QueryResult> {
+        let Statement::CreateSequence {
+            or_replace,
+            temporary,
+            if_not_exists,
+            name,
+            sequence_options,
+            ..
+        } = statement
+        else {
+            return ex_error::OnlySequenceStatementsSnafu.fail();
+        };
+        if temporary {
+            return ex_error::InvalidSequenceOptionSnafu {
+                message: "temporary sequences are not supported".to_string(),
+            }
+            .fail();
+        }
+        let ident = self.sequence_ident(name)?;
+        let (start_opt, increment_opt, comment) =
+            crate::sequences::parse_sequence_options(&sequence_options)?;
+        let start = start_opt.unwrap_or(1);
+        let increment = increment_opt.unwrap_or(1);
+        let exists = self
+            .metastore
+            .get_sequence(&ident)
+            .await
+            .context(ex_error::MetastoreSnafu)?
+            .is_some();
+        if exists {
+            if if_not_exists {
+                return self.status_response();
+            }
+            if !or_replace {
+                // Let the metastore produce the Snowflake-shaped
+                // "already exists" error.
+                let model = catalog_metastore::models::Sequence {
+                    ident: ident.clone(),
+                    start,
+                    increment,
+                    current: start.saturating_sub(increment),
+                    comment,
+                };
+                self.metastore
+                    .create_sequence(&ident, model)
+                    .await
+                    .context(ex_error::MetastoreSnafu)?;
+                return self.status_response();
+            }
+            self.metastore
+                .delete_sequence(&ident)
+                .await
+                .context(ex_error::MetastoreSnafu)?;
+        }
+        let model = catalog_metastore::models::Sequence {
+            ident: ident.clone(),
+            start,
+            increment,
+            current: crate::sequences::initial_current(start, increment)?,
+            comment,
+        };
+        self.metastore
+            .create_sequence(&ident, model)
+            .await
+            .context(ex_error::MetastoreSnafu)?;
+        self.status_response()
+    }
+
+    /// ALTER SEQUENCE (design §22.8): `RENAME TO`, `SET <options>` (START
+    /// restarts the reservation cursor; INCREMENT/COMMENT apply), `UNSET
+    /// COMMENT`.
+    #[instrument(
+        name = "UserQuery::alter_sequence_query",
+        level = "trace",
+        skip(self, statement),
+        err
+    )]
+    pub async fn alter_sequence_query(&self, statement: Statement) -> Result<QueryResult> {
+        let Statement::AlterSequence {
+            if_exists,
+            name,
+            operation,
+        } = statement
+        else {
+            return ex_error::OnlySequenceStatementsSnafu.fail();
+        };
+        let ident = self.sequence_ident(name)?;
+        let Some(row) = self
+            .metastore
+            .get_sequence(&ident)
+            .await
+            .context(ex_error::MetastoreSnafu)?
+        else {
+            if if_exists {
+                return self.status_response();
+            }
+            return ex_error::SequenceNotFoundSnafu {
+                sequence: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        };
+        match operation {
+            AlterSequenceOperation::RenameTo { new_name } => {
+                let new_ident = self.sequence_ident(new_name)?;
+                // Rename = create-new (same state) + delete-old; if the new
+                // name is occupied the create fails with the metastore's
+                // already-exists error and the original stays intact.
+                let model = catalog_metastore::models::Sequence {
+                    ident: new_ident.clone(),
+                    start: row.data.start,
+                    increment: row.data.increment,
+                    current: row.data.current,
+                    comment: row.data.comment.clone(),
+                };
+                self.metastore
+                    .create_sequence(&new_ident, model)
+                    .await
+                    .context(ex_error::MetastoreSnafu)?;
+                self.metastore
+                    .delete_sequence(&ident)
+                    .await
+                    .context(ex_error::MetastoreSnafu)?;
+                crate::sequences::invalidate_session_range(&self.session, &ident);
+            }
+            AlterSequenceOperation::SetOptions(options) => {
+                let (start, increment, comment) =
+                    crate::sequences::parse_sequence_options(&options)?;
+                let start = start.unwrap_or(row.data.start);
+                let increment = increment.unwrap_or(row.data.increment);
+                let comment = comment.or(row.data.comment.clone());
+                let updated = catalog_metastore::models::Sequence {
+                    ident: ident.clone(),
+                    start,
+                    increment,
+                    current: if start != row.data.start {
+                        // Snowflake: `ALTER SEQUENCE … SET START` restarts
+                        // the sequence.
+                        crate::sequences::initial_current(start, increment)?
+                    } else {
+                        row.data.current
+                    },
+                    comment,
+                };
+                self.metastore
+                    .update_sequence(&ident, updated)
+                    .await
+                    .context(ex_error::MetastoreSnafu)?;
+                // A changed INCREMENT/START invalidates held ranges so the
+                // next NEXTVAL re-reserves against the new state.
+                crate::sequences::invalidate_session_range(&self.session, &ident);
+            }
+            AlterSequenceOperation::UnsetComment => {
+                let updated = catalog_metastore::models::Sequence {
+                    ident: ident.clone(),
+                    start: row.data.start,
+                    increment: row.data.increment,
+                    current: row.data.current,
+                    comment: None,
+                };
+                self.metastore
+                    .update_sequence(&ident, updated)
+                    .await
+                    .context(ex_error::MetastoreSnafu)?;
+            }
+        }
+        self.status_response()
+    }
+
+/// Resolve a (possibly partial) sequence name against the session's
+/// current database/schema with identifier normalization.
+fn sequence_ident(&self, name: ObjectName) -> Result<catalog_metastore::models::TableIdent> {
+        Self::normalized_to_table_ident(self.resolve_table_object_name(name.0)?)
+    }
+
+    /// A normalized 3-part object name → metastore [`TableIdent`].
+    fn normalized_to_table_ident(
+        resolved: crate::utils::NormalizedIdent,
+    ) -> Result<catalog_metastore::models::TableIdent> {
+        let mut idents = resolved.0.iter();
+        Ok(catalog_metastore::models::TableIdent {
+            database: idents.next().map(|i| i.value.clone()).unwrap_or_default(),
+            schema: idents.next().map(|i| i.value.clone()).unwrap_or_default(),
+            table: idents.next().map(|i| i.value.clone()).unwrap_or_default(),
+        })
     }
 
     pub fn resolve_show_in_name(
@@ -4439,6 +4728,11 @@ fn is_session_local_table_function(sql: &str) -> bool {
         || lower.contains("login_history")
         || lower.contains("grants_to_users")
         || lower.contains("grants_to_roles")
+        // Sequences (design §22.8): reservation state lives on the router
+        // session — NEXTVAL/CURRVAL queries never ship to the cluster.
+        || lower.contains("__nextval")
+        || lower.contains("__currval")
+        || lower.contains("__sequences_catalog")
 }
 
 /// Converts merge clauses into projection expressions for copy-on-write operations.

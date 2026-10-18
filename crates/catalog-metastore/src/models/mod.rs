@@ -7,12 +7,14 @@ pub mod automation;
 pub mod block_cache;
 pub mod database;
 pub mod schema;
+pub mod sequence;
 pub mod table;
 pub mod volumes;
 
 pub use automation::*;
 pub use database::*;
 pub use schema::*;
+pub use sequence::*;
 pub use table::*;
 
 pub use volumes::*;

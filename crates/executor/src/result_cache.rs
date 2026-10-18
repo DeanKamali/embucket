@@ -54,6 +54,11 @@ const NON_DETERMINISTIC: &[&str] = &[
     "LOCALTIME",
     "LOCALTIMESTAMP",
     "NEXTVAL",
+    // Sequence UDFs (design §22.8): the pre-parse rewrite renames
+    // `seq.NEXTVAL`/`CURRVAL` into these hidden calls, which change value
+    // between identical queries — never cached.
+    "__NEXTVAL",
+    "__CURRVAL",
 ];
 
 #[derive(Debug)]

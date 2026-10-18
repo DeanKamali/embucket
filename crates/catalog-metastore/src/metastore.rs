@@ -6,6 +6,7 @@ use crate::models::{
     automation::{DynamicTable, Stream, Task},
     database::{Database, DatabaseIdent},
     schema::{Schema, SchemaIdent},
+    sequence::Sequence,
     table::{Table, TableCreateRequest, TableFormat, TableIdent, TableRequirementExt, TableUpdate},
     volumes::{Volume, VolumeIdent},
 };
@@ -333,6 +334,25 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
     async fn update_task(&self, ident: &TableIdent, task: Task) -> Result<RwObject<Task>>;
     async fn delete_task(&self, ident: &TableIdent) -> Result<()>;
 
+    /// Sequences (design §22.8, M16.4 deferred item). The record's `current`
+    /// field is the reservation cursor; `NEXTVAL` evaluation advances it in
+    /// chunks and journals the update like any other mutation.
+    async fn create_sequence(
+        &self,
+        ident: &TableIdent,
+        sequence: Sequence,
+    ) -> Result<RwObject<Sequence>>;
+    async fn get_sequence(&self, ident: &TableIdent) -> Result<Option<RwObject<Sequence>>>;
+    async fn list_sequences(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Sequence>>>;
+    /// Every sequence across the metastore (SHOW SEQUENCES without a scope).
+    async fn list_all_sequences(&self) -> Result<Vec<RwObject<Sequence>>>;
+    async fn update_sequence(
+        &self,
+        ident: &TableIdent,
+        sequence: Sequence,
+    ) -> Result<RwObject<Sequence>>;
+    async fn delete_sequence(&self, ident: &TableIdent) -> Result<()>;
+
     /// Dynamic-table definition records (design §18, M11). The target table
     /// itself is a regular metastore table.
     async fn create_dynamic_table(
@@ -373,6 +393,7 @@ struct MetastoreState {
     streams: HashMap<(DatabaseIdent, String, String), RwObject<Stream>>,
     tasks: HashMap<(DatabaseIdent, String, String), RwObject<Task>>,
     dynamic_tables: HashMap<(DatabaseIdent, String, String), RwObject<DynamicTable>>,
+    sequences: HashMap<(DatabaseIdent, String, String), RwObject<Sequence>>,
 }
 
 #[derive(Debug, Default)]
@@ -505,6 +526,11 @@ impl InMemoryMetastore {
             CatalogRecord::DynamicTable(row) => {
                 state
                     .dynamic_tables
+                    .insert(Self::table_key(&row.data.ident), row);
+            }
+            CatalogRecord::Sequence(row) => {
+                state
+                    .sequences
                     .insert(Self::table_key(&row.data.ident), row);
             }
         }
@@ -2161,6 +2187,111 @@ impl Metastore for InMemoryMetastore {
     }
 
     #[instrument(
+        name = "Metastore::create_sequence",
+        level = "debug",
+        skip(self, sequence),
+        err
+    )]
+    async fn create_sequence(
+        &self,
+        ident: &TableIdent,
+        sequence: Sequence,
+    ) -> Result<RwObject<Sequence>> {
+        let mut state = self.state.write().await;
+        if !state
+            .schemas
+            .contains_key(&Self::schema_key(&ident.clone().into()))
+        {
+            return metastore_error::SchemaNotFoundSnafu {
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        Self::assert_object_name_free(&state, ident)?;
+        let row = RwObject::new(sequence);
+        self.journal_put(&CatalogRecord::Sequence(row.clone()))
+            .await?;
+        state.sequences.insert(Self::table_key(ident), row.clone());
+        Ok(row)
+    }
+
+    #[instrument(name = "Metastore::get_sequence", level = "debug", skip(self), err)]
+    async fn get_sequence(&self, ident: &TableIdent) -> Result<Option<RwObject<Sequence>>> {
+        let state = self.state.read().await;
+        Ok(state.sequences.get(&Self::table_key(ident)).cloned())
+    }
+
+    #[instrument(name = "Metastore::list_sequences", level = "debug", skip(self), err)]
+    async fn list_sequences(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Sequence>>> {
+        let state = self.state.read().await;
+        Ok(state
+            .sequences
+            .iter()
+            .filter(|((db, sch, _), _)| db == &schema.database && sch == &schema.schema)
+            .map(|(_, sequence)| sequence.clone())
+            .collect())
+    }
+
+    #[instrument(name = "Metastore::list_all_sequences", level = "debug", skip(self), err)]
+    async fn list_all_sequences(&self) -> Result<Vec<RwObject<Sequence>>> {
+        let state = self.state.read().await;
+        Ok(state.sequences.values().cloned().collect())
+    }
+
+    #[instrument(
+        name = "Metastore::update_sequence",
+        level = "debug",
+        skip(self, sequence),
+        err
+    )]
+    async fn update_sequence(
+        &self,
+        ident: &TableIdent,
+        sequence: Sequence,
+    ) -> Result<RwObject<Sequence>> {
+        let mut state = self.state.write().await;
+        let row = state
+            .sequences
+            .get_mut(&Self::table_key(ident))
+            .ok_or_else(|| {
+                metastore_error::SequenceNotFoundSnafu {
+                    sequence: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .build()
+            })?;
+        row.update(sequence);
+        self.journal_put(&CatalogRecord::Sequence(row.clone()))
+            .await?;
+        Ok(row.clone())
+    }
+
+    #[instrument(name = "Metastore::delete_sequence", level = "debug", skip(self), err)]
+    async fn delete_sequence(&self, ident: &TableIdent) -> Result<()> {
+        let mut state = self.state.write().await;
+        let removed = state
+            .sequences
+            .remove(&Self::table_key(ident))
+            .ok_or_else(|| {
+                metastore_error::SequenceNotFoundSnafu {
+                    sequence: ident.table.clone(),
+                    schema: ident.schema.clone(),
+                    db: ident.database.clone(),
+                }
+                .build()
+            })?;
+        drop(removed);
+        self.journal_delete(
+            journal::domain::SEQUENCES,
+            &Self::table_journal_key(&ident.database, &ident.schema, &ident.table),
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[instrument(
         name = "Metastore::create_dynamic_table",
         level = "debug",
         skip(self, dynamic_table),
@@ -2340,6 +2471,14 @@ impl InMemoryMetastore {
         if state.dynamic_tables.contains_key(&key) {
             return metastore_error::DynamicTableAlreadyExistsSnafu {
                 table: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .fail();
+        }
+        if state.sequences.contains_key(&key) {
+            return metastore_error::SequenceAlreadyExistsSnafu {
+                sequence: ident.table.clone(),
                 schema: ident.schema.clone(),
                 db: ident.database.clone(),
             }

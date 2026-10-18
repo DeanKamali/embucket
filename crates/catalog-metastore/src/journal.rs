@@ -19,6 +19,7 @@ use crate::models::{
     automation::{DynamicTable, Stream, Task},
     database::Database,
     schema::Schema,
+    sequence::Sequence,
     table::{Table, TableIdent},
     volumes::Volume,
 };
@@ -44,11 +45,13 @@ pub mod domain {
     pub const STREAMS: &str = "streams";
     pub const TASKS: &str = "tasks";
     pub const DYNAMIC_TABLES: &str = "dynamic_tables";
+    /// Sequence objects (design §22.8, M16.4 deferred item).
+    pub const SEQUENCES: &str = "sequences";
 
     /// Replay order: tombstones are applied before live records so a record
     /// present in both (crash between the two journal writes of an undrop,
     /// or a re-create over a drop) resolves to live.
-    pub const REPLAY_ORDER: [&str; 10] = [
+    pub const REPLAY_ORDER: [&str; 11] = [
         DROPPED_DATABASES,
         DROPPED_SCHEMAS,
         DROPPED_TABLES,
@@ -59,6 +62,7 @@ pub mod domain {
         STREAMS,
         TASKS,
         DYNAMIC_TABLES,
+        SEQUENCES,
     ];
 }
 
@@ -79,6 +83,10 @@ pub enum CatalogRecord {
     Stream(RwObject<Stream>),
     Task(RwObject<Task>),
     DynamicTable(RwObject<DynamicTable>),
+    /// Sequence objects (design §22.8): the record carries the reservation
+    /// cursor, so `NEXTVAL` chunk reservations are journaled like any other
+    /// catalog mutation.
+    Sequence(RwObject<Sequence>),
 }
 
 impl CatalogRecord {
@@ -97,6 +105,7 @@ impl CatalogRecord {
             Self::Stream(_) => domain::STREAMS,
             Self::Task(_) => domain::TASKS,
             Self::DynamicTable(_) => domain::DYNAMIC_TABLES,
+            Self::Sequence(_) => domain::SEQUENCES,
         }
     }
 
@@ -121,6 +130,7 @@ impl CatalogRecord {
             Self::Stream(s) => table_key_string(&s.data.ident),
             Self::Task(t) => table_key_string(&t.data.ident),
             Self::DynamicTable(d) => table_key_string(&d.data.ident),
+            Self::Sequence(s) => table_key_string(&s.data.ident),
         }
     }
 

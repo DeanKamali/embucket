@@ -11,8 +11,8 @@
 
 use crate::error::{self as account_error, Result};
 use crate::models::{
-    Account, AccountObject, Grant, LoginEvent, Privilege, Role, RoleRole, Share, ShareGrant, User,
-    UserRole, ACCOUNTADMIN, DEFAULT_ACCOUNT,
+    Account, AccountObject, Grant, GroupKind, LoginEvent, Privilege, ReplicationGroup, Role,
+    RoleRole, Share, ShareGrant, User, UserRole, ACCOUNTADMIN, DEFAULT_ACCOUNT,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -141,6 +141,31 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
     async fn list_accounts(&self) -> Result<Vec<Account>>;
     async fn get_account(&self, name: &str) -> Result<Option<Account>>;
 
+    /// Replication/failover groups (M15.5, design §21.5). `accounts` are
+    /// validated to exist; v1 replicates tables only.
+    async fn create_replication_group(
+        &self,
+        name: &str,
+        kind: GroupKind,
+        accounts: Vec<String>,
+    ) -> Result<ReplicationGroup>;
+    async fn drop_replication_group(&self, name: &str) -> Result<()>;
+    async fn get_replication_group(&self, name: &str) -> Result<Option<ReplicationGroup>>;
+    async fn list_replication_groups(&self) -> Result<Vec<ReplicationGroup>>;
+    /// Add/remove replicated tables (full `db.schema.table` objects; add is
+    /// idempotent, remove requires an exact match of a listed table).
+    async fn alter_replication_group_tables(
+        &self,
+        name: &str,
+        add: Vec<AccountObject>,
+        remove: Vec<AccountObject>,
+    ) -> Result<()>;
+    /// Stamp a completed refresh (epoch ms).
+    async fn alter_replication_group_refreshed(&self, name: &str, at_ms: u64) -> Result<()>;
+    /// Mark the group failed-over (failover promotion, design §21.5):
+    /// further refreshes are refused.
+    async fn alter_replication_group_failed_over(&self, name: &str) -> Result<()>;
+
     /// A session-scoped view of `account` (M15.4): users, roles, grants,
     /// shares and logins are stamped with and filtered by the account.
     /// `None` when the account does not exist. Org-level operations
@@ -181,6 +206,7 @@ struct StoreState {
     shares: HashMap<String, Share>,
     share_grants: Vec<ShareGrant>,
     logins: Vec<LoginEvent>,
+    replication_groups: HashMap<String, ReplicationGroup>,
 }
 
 /// In-memory [`AccountStore`] over the default account (raw, org-level
@@ -259,6 +285,9 @@ impl InMemoryAccountStore {
                     }
                     crate::journal::AccountRecord::ShareGrant(g) => state.share_grants.push(g),
                     crate::journal::AccountRecord::Login(e) => logins.push(e),
+                    crate::journal::AccountRecord::ReplicationGroup(g) => {
+                        state.replication_groups.insert(akey(&g.account, &g.name), g);
+                    }
                 }
             }
         }
@@ -1131,6 +1160,7 @@ impl InMemoryAccountStore {
         let users = self.list_users_in(name).await?;
         let roles = self.list_roles_in(name).await?;
         let shares = self.list_shares_in(name).await?;
+        let groups = self.list_replication_groups_in(name).await?;
         for u in users {
             self.drop_user_in(name, &u.name).await?;
         }
@@ -1139,6 +1169,9 @@ impl InMemoryAccountStore {
         }
         for s in shares {
             self.drop_share_in(name, &s.name).await?;
+        }
+        for g in groups {
+            self.drop_replication_group_in(name, &g.name).await?;
         }
         self.journal_delete(&crate::journal::AccountRecord::Account(Account {
             name: name.to_string(),
@@ -1168,6 +1201,200 @@ impl InMemoryAccountStore {
             }));
         }
         Ok(state.accounts.get(&key(name)).cloned())
+    }
+
+    // ================= replication groups (M15.5) =================
+
+    async fn create_replication_group_in(
+        &self,
+        account: &str,
+        name: &str,
+        kind: GroupKind,
+        accounts: Vec<String>,
+    ) -> Result<ReplicationGroup> {
+        bump_account_epoch();
+        let mut state = self.state.write().await;
+        if state
+            .replication_groups
+            .contains_key(&akey(account, name))
+        {
+            return account_error::ReplicationGroupAlreadyExistsSnafu {
+                group: name.to_string(),
+            }
+            .fail();
+        }
+        if accounts.is_empty() {
+            return account_error::NotAllowedSnafu {
+                message: format!(
+                    "CREATE {} GROUP requires at least one allowed account",
+                    kind.to_string().to_ascii_uppercase()
+                ),
+            }
+            .fail();
+        }
+        for target in &accounts {
+            let exists = target.eq_ignore_ascii_case(account)
+                || state.accounts.contains_key(&key(target))
+                || target.eq_ignore_ascii_case(DEFAULT_ACCOUNT);
+            if !exists {
+                return account_error::AccountNotFoundSnafu {
+                    account: target.clone(),
+                }
+                .fail();
+            }
+        }
+        let group = ReplicationGroup {
+            account: account.to_string(),
+            name: name.to_string(),
+            kind,
+            accounts,
+            tables: Vec::new(),
+            last_refresh_ms: 0,
+            failed_over: false,
+        };
+        state
+            .replication_groups
+            .insert(akey(account, name), group.clone());
+        self.journal_put(&crate::journal::AccountRecord::ReplicationGroup(
+            group.clone(),
+        ))
+        .await?;
+        Ok(group)
+    }
+
+    async fn drop_replication_group_in(&self, account: &str, name: &str) -> Result<()> {
+        bump_account_epoch();
+        let mut state = self.state.write().await;
+        if state
+            .replication_groups
+            .remove(&akey(account, name))
+            .is_none()
+        {
+            return account_error::ReplicationGroupNotFoundSnafu {
+                group: name.to_string(),
+            }
+            .fail();
+        }
+        drop(state);
+        self.journal_delete(&crate::journal::AccountRecord::ReplicationGroup(
+            ReplicationGroup {
+                account: account.to_string(),
+                name: name.to_string(),
+                kind: GroupKind::Replication,
+                accounts: Vec::new(),
+                tables: Vec::new(),
+                last_refresh_ms: 0,
+                failed_over: false,
+            },
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn get_replication_group_in(
+        &self,
+        account: &str,
+        name: &str,
+    ) -> Result<Option<ReplicationGroup>> {
+        let state = self.state.read().await;
+        Ok(state
+            .replication_groups
+            .get(&akey(account, name))
+            .cloned())
+    }
+
+    async fn list_replication_groups_in(
+        &self,
+        account: &str,
+    ) -> Result<Vec<ReplicationGroup>> {
+        let state = self.state.read().await;
+        let mut out: Vec<ReplicationGroup> = state
+            .replication_groups
+            .values()
+            .filter(|g| g.account.eq_ignore_ascii_case(account))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+        Ok(out)
+    }
+
+    async fn alter_replication_group_tables_in(
+        &self,
+        account: &str,
+        name: &str,
+        add: Vec<AccountObject>,
+        remove: Vec<AccountObject>,
+    ) -> Result<()> {
+        bump_account_epoch();
+        let mut state = self.state.write().await;
+        let Some(group) = state.replication_groups.get_mut(&akey(account, name)) else {
+            return account_error::ReplicationGroupNotFoundSnafu {
+                group: name.to_string(),
+            }
+            .fail();
+        };
+        for object in add {
+            if !group.tables.contains(&object) {
+                group.tables.push(object);
+            }
+        }
+        if !remove.is_empty() {
+            group.tables.retain(|t| !remove.contains(t));
+        }
+        let updated = group.clone();
+        drop(state);
+        self.journal_put(&crate::journal::AccountRecord::ReplicationGroup(
+            updated,
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn alter_replication_group_refreshed_in(
+        &self,
+        account: &str,
+        name: &str,
+        at_ms: u64,
+    ) -> Result<()> {
+        bump_account_epoch();
+        let mut state = self.state.write().await;
+        let Some(group) = state.replication_groups.get_mut(&akey(account, name)) else {
+            return account_error::ReplicationGroupNotFoundSnafu {
+                group: name.to_string(),
+            }
+            .fail();
+        };
+        group.last_refresh_ms = at_ms;
+        let updated = group.clone();
+        drop(state);
+        self.journal_put(&crate::journal::AccountRecord::ReplicationGroup(
+            updated,
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn alter_replication_group_failed_over_in(
+        &self,
+        account: &str,
+        name: &str,
+    ) -> Result<()> {
+        bump_account_epoch();
+        let mut state = self.state.write().await;
+        let Some(group) = state.replication_groups.get_mut(&akey(account, name)) else {
+            return account_error::ReplicationGroupNotFoundSnafu {
+                group: name.to_string(),
+            }
+            .fail();
+        };
+        group.failed_over = true;
+        let updated = group.clone();
+        drop(state);
+        self.journal_put(&crate::journal::AccountRecord::ReplicationGroup(
+            updated,
+        ))
+        .await?;
+        Ok(())
     }
 }
 
@@ -1317,6 +1544,48 @@ impl AccountStore for InMemoryAccountStore {
 
     async fn get_account(&self, name: &str) -> Result<Option<Account>> {
         self.get_account_in(name).await
+    }
+
+    async fn create_replication_group(
+        &self,
+        name: &str,
+        kind: GroupKind,
+        accounts: Vec<String>,
+    ) -> Result<ReplicationGroup> {
+        self.create_replication_group_in(DEFAULT_ACCOUNT, name, kind, accounts)
+            .await
+    }
+
+    async fn drop_replication_group(&self, name: &str) -> Result<()> {
+        self.drop_replication_group_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn get_replication_group(&self, name: &str) -> Result<Option<ReplicationGroup>> {
+        self.get_replication_group_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn list_replication_groups(&self) -> Result<Vec<ReplicationGroup>> {
+        self.list_replication_groups_in(DEFAULT_ACCOUNT).await
+    }
+
+    async fn alter_replication_group_tables(
+        &self,
+        name: &str,
+        add: Vec<AccountObject>,
+        remove: Vec<AccountObject>,
+    ) -> Result<()> {
+        self.alter_replication_group_tables_in(DEFAULT_ACCOUNT, name, add, remove)
+            .await
+    }
+
+    async fn alter_replication_group_refreshed(&self, name: &str, at_ms: u64) -> Result<()> {
+        self.alter_replication_group_refreshed_in(DEFAULT_ACCOUNT, name, at_ms)
+            .await
+    }
+
+    async fn alter_replication_group_failed_over(&self, name: &str) -> Result<()> {
+        self.alter_replication_group_failed_over_in(DEFAULT_ACCOUNT, name)
+            .await
     }
 
     async fn account_scope(self: Arc<Self>, account: &str) -> Result<Option<Arc<dyn AccountStore>>> {
@@ -1476,6 +1745,58 @@ impl AccountStore for ScopedAccountStore {
 
     async fn get_account(&self, name: &str) -> Result<Option<Account>> {
         self.inner.get_account(name).await
+    }
+
+    async fn create_replication_group(
+        &self,
+        name: &str,
+        kind: GroupKind,
+        accounts: Vec<String>,
+    ) -> Result<ReplicationGroup> {
+        self.inner
+            .create_replication_group_in(&self.account, name, kind, accounts)
+            .await
+    }
+
+    async fn drop_replication_group(&self, name: &str) -> Result<()> {
+        self.inner
+            .drop_replication_group_in(&self.account, name)
+            .await
+    }
+
+    async fn get_replication_group(&self, name: &str) -> Result<Option<ReplicationGroup>> {
+        self.inner
+            .get_replication_group_in(&self.account, name)
+            .await
+    }
+
+    async fn list_replication_groups(&self) -> Result<Vec<ReplicationGroup>> {
+        self.inner
+            .list_replication_groups_in(&self.account)
+            .await
+    }
+
+    async fn alter_replication_group_tables(
+        &self,
+        name: &str,
+        add: Vec<AccountObject>,
+        remove: Vec<AccountObject>,
+    ) -> Result<()> {
+        self.inner
+            .alter_replication_group_tables_in(&self.account, name, add, remove)
+            .await
+    }
+
+    async fn alter_replication_group_refreshed(&self, name: &str, at_ms: u64) -> Result<()> {
+        self.inner
+            .alter_replication_group_refreshed_in(&self.account, name, at_ms)
+            .await
+    }
+
+    async fn alter_replication_group_failed_over(&self, name: &str) -> Result<()> {
+        self.inner
+            .alter_replication_group_failed_over_in(&self.account, name)
+            .await
     }
 
     async fn account_scope(self: Arc<Self>, account: &str) -> Result<Option<Arc<dyn AccountStore>>> {
@@ -2213,5 +2534,115 @@ role: "r1".into(),
         assert!(scope.get_role(ACCOUNTADMIN).await.unwrap().is_some());
         // Same-named user in default account stays separate.
         assert!(s2.authenticate("acmeadmin", "pw1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn replication_groups_crud_and_isolation() {
+        let s = Arc::new(store());
+        s.create_account("acme", "acmeadmin", "pw1").await.unwrap();
+        let acme = Arc::clone(&s).account_scope("acme").await.unwrap().unwrap();
+
+        // Unknown target accounts are rejected.
+        assert!(s
+            .create_replication_group("g1", GroupKind::Replication, vec!["ghost".into()])
+            .await
+            .is_err());
+        // Empty allowed list rejected.
+        assert!(s
+            .create_replication_group("g1", GroupKind::Replication, vec![])
+            .await
+            .is_err());
+
+        let t = AccountObject::Table("db".into(), "public".into(), "t".into());
+        let g = s
+            .create_replication_group("g1", GroupKind::Replication, vec!["acme".into()])
+            .await
+            .unwrap();
+        assert_eq!(g.kind, GroupKind::Replication);
+        assert_eq!(g.tables, Vec::<AccountObject>::new());
+        assert!(!g.failed_over);
+        assert!(s
+            .create_replication_group("g1", GroupKind::Failover, vec!["acme".into()])
+            .await
+            .is_err());
+
+        // Table list mutations: add idempotent, remove exact-match.
+        s.alter_replication_group_tables("g1", vec![t.clone()], vec![])
+            .await
+            .unwrap();
+        s.alter_replication_group_tables("g1", vec![t.clone()], vec![])
+            .await
+            .unwrap();
+        let got = s.get_replication_group("g1").await.unwrap().unwrap();
+        assert_eq!(got.tables, vec![t.clone()]);
+        s.alter_replication_group_refreshed("g1", 1_000).await.unwrap();
+        let got = s.get_replication_group("g1").await.unwrap().unwrap();
+        assert_eq!(got.last_refresh_ms, 1_000);
+        s.alter_replication_group_failed_over("g1").await.unwrap();
+        let got = s.get_replication_group("g1").await.unwrap().unwrap();
+        assert!(got.failed_over);
+
+        // Scoped isolation: same name in acme is a different group.
+        let gt = acme
+            .create_replication_group("g1", GroupKind::Failover, vec!["embucket".into()])
+            .await
+            .unwrap();
+        assert_eq!(gt.kind, GroupKind::Failover);
+        assert!(!gt.failed_over && gt.last_refresh_ms == 0);
+        assert_eq!(acme.list_replication_groups().await.unwrap().len(), 1);
+        assert_eq!(s.list_replication_groups().await.unwrap().len(), 1);
+        // Self-reference as target is allowed; unknown account is not.
+        assert!(acme
+            .create_replication_group("g2", GroupKind::Replication, vec!["acme".into()])
+            .await
+            .is_ok());
+        // Unknown groups error.
+        assert!(s.get_replication_group("nope").await.unwrap().is_none());
+        assert!(s.drop_replication_group("nope").await.is_err());
+
+        // Dropping the account cascades its groups.
+        s.drop_account("acme").await.unwrap();
+        assert!(s.get_replication_group("g1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn journal_replays_replication_groups() {
+        let journal = Arc::new(MockJournal::default());
+        let s = Arc::new(
+            InMemoryAccountStore::new_with_journal(journal.clone())
+                .await
+                .unwrap(),
+        );
+        s.ensure_admin("embucket", "embucket").await.unwrap();
+        s.create_account("acme", "acmeadmin", "pw1").await.unwrap();
+        let t = AccountObject::Table("db".into(), "public".into(), "t".into());
+        s.create_replication_group("g1", GroupKind::Failover, vec!["acme".into()])
+            .await
+            .unwrap();
+        s.alter_replication_group_tables("g1", vec![t.clone()], vec![])
+            .await
+            .unwrap();
+        s.alter_replication_group_refreshed("g1", 5_000).await.unwrap();
+
+        // "Restart": groups replay with their table list and refresh stamp.
+        let s2 = InMemoryAccountStore::new_with_journal(journal.clone())
+            .await
+            .unwrap();
+        let got = s2.get_replication_group("g1").await.unwrap().unwrap();
+        assert_eq!(got.kind, GroupKind::Failover);
+        assert_eq!(got.tables, vec![t]);
+        assert_eq!(got.last_refresh_ms, 5_000);
+        assert!(!got.failed_over);
+        assert_eq!(got.accounts, vec!["acme".to_string()]);
+
+        // Delete replays too.
+        let s3 = Arc::new(
+            InMemoryAccountStore::new_with_journal(journal.clone())
+                .await
+                .unwrap(),
+        );
+        s3.drop_replication_group("g1").await.unwrap();
+        let s4 = InMemoryAccountStore::new_with_journal(journal).await.unwrap();
+        assert!(s4.get_replication_group("g1").await.unwrap().is_none());
     }
 }

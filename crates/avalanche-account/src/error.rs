@@ -81,6 +81,20 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+
+    #[snafu(display("Replication group {group} already exists"))]
+    ReplicationGroupAlreadyExists {
+        group: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Replication group {group} does not exist"))]
+    ReplicationGroupNotFound {
+        group: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -109,5 +123,10 @@ impl Error {
     #[must_use]
     pub fn is_account_not_found(&self) -> bool {
         matches!(self, Self::AccountNotFound { .. })
+    }
+
+    #[must_use]
+    pub fn is_replication_group_already_exists(&self) -> bool {
+        matches!(self, Self::ReplicationGroupAlreadyExists { .. })
     }
 }

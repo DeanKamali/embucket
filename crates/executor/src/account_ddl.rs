@@ -16,6 +16,11 @@
 //!   `DESC SHARE <s>`, `SHOW GRANTS TO SHARE <s>`
 //! - Accounts (design §21.4, M15.4): `CREATE ACCOUNT <name> ADMIN_NAME =
 //!   'u' ADMIN_PASSWORD = 'p'`, `DROP ACCOUNT <name>`, `SHOW ACCOUNTS`
+//! - Replication (design §21.5, M15.5): `CREATE [IF NOT EXISTS]
+//!   REPLICATION|FAILOVER GROUP <name> OBJECT_TYPES = TABLES
+//!   ALLOWED_ACCOUNTS = (a1, a2)`, `DROP …`, `ALTER … ADD|REMOVE TABLES`,
+//!   `ALTER … REFRESH`, `ALTER FAILOVER GROUP … FAILOVER TO <account>`,
+//!   `SHOW [FAILOVER] GROUPS`, `DESC … GROUP <name>`
 //!
 //! All account DDL is `ACCOUNTADMIN`-only in v1: the session must be
 //! authorized with the built-in role active. Data-plane DDL (CREATE/DROP
@@ -26,10 +31,11 @@ use crate::error::{self as ex_error, Error, Result};
 use crate::models::QueryResult;
 use crate::session::UserSession;
 use avalanche_account::models::{
-    AccountObject, Grant, Privilege, ShareGrant, ShareKind, User, ACCOUNTADMIN,
+    AccountObject, Grant, GroupKind, Privilege, ShareGrant, ShareKind, User, ACCOUNTADMIN,
 };
 use avalanche_account::store::AccountStore;
 use avalanche_account::SessionAuthz;
+use catalog_metastore::models::TableIdent;
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use snafu::Location;
@@ -126,6 +132,49 @@ pub enum AccountStatement {
     DescribeShare {
         share: String,
     },
+    /// M15.5: `CREATE [IF NOT EXISTS] REPLICATION|FAILOVER GROUP <name>
+    /// OBJECT_TYPES = TABLES ALLOWED_ACCOUNTS = (a1, a2)`.
+    CreateReplicationGroup {
+        name: String,
+        kind: GroupKind,
+        accounts: Vec<String>,
+        if_not_exists: bool,
+    },
+    /// M15.5: `DROP REPLICATION|FAILOVER GROUP <name>`.
+    DropReplicationGroup {
+        name: String,
+    },
+    /// M15.5: `ALTER … GROUP <name> ADD TABLES <db.s.t, …>`.
+    AlterReplicationGroupAddTables {
+        name: String,
+        kind: GroupKind,
+        tables: Vec<AccountObject>,
+    },
+    /// M15.5: `ALTER … GROUP <name> REMOVE TABLES <db.s.t, …>`.
+    AlterReplicationGroupRemoveTables {
+        name: String,
+        kind: GroupKind,
+        tables: Vec<AccountObject>,
+    },
+    /// M15.5: `ALTER … GROUP <name> REFRESH`.
+    AlterReplicationGroupRefresh {
+        name: String,
+        kind: GroupKind,
+    },
+    /// M15.5: `ALTER FAILOVER GROUP <name> FAILOVER TO <account>`.
+    AlterReplicationGroupFailover {
+        name: String,
+        kind: GroupKind,
+        account: String,
+    },
+    /// M15.5: `SHOW REPLICATION GROUPS` / `SHOW FAILOVER GROUPS`.
+    ShowReplicationGroups {
+        kind: Option<GroupKind>,
+    },
+    /// M15.5: `DESC REPLICATION|FAILOVER GROUP <name>`.
+    DescribeReplicationGroup {
+        name: String,
+    },
 }
 
 /// Lower-case token, quotes and trailing `;` stripped.
@@ -195,6 +244,108 @@ fn parse_on_grant(tok: &[&str], from: usize) -> Option<(Privilege, AccountObject
     Some((privilege, object, grantee_kind, grantee))
 }
 
+/// Parse a parenthesized (or bare) comma-separated name list from `toks`.
+/// Returns the names and the number of tokens consumed. `None` = malformed.
+fn parse_name_list(toks: &[&str]) -> Option<(Vec<String>, usize)> {
+    if toks.is_empty() {
+        return None;
+    }
+    let mut end = toks.len();
+    if toks[0].starts_with('(') {
+        end = toks.iter().position(|t| t.contains(')'))? + 1;
+        // No closer before the final one.
+        if toks[..end - 1].iter().any(|t| t.contains(')')) {
+            return None;
+        }
+    }
+    let mut names = Vec::new();
+    for (idx, raw) in toks[..end].iter().enumerate() {
+        let mut piece = raw.to_string();
+        if idx == 0 {
+            piece = piece.trim_start_matches('(').to_string();
+        }
+        if idx == end - 1 {
+            piece = piece.trim_end_matches(')').to_string();
+        }
+        for part in piece.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            names.push(token(part).to_string());
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some((names, end))
+    }
+}
+
+/// Parse `CREATE|DROP REPLICATION|FAILOVER GROUP …` (`i` at the kind token).
+#[allow(clippy::too_many_lines)]
+fn parse_replication_group(tok: &[&str], create: bool, mut i: usize) -> Option<AccountStatement> {
+    let kind = match tok[i].to_ascii_uppercase().as_str() {
+        "REPLICATION" => GroupKind::Replication,
+        _ => GroupKind::Failover,
+    };
+    if !tok.get(i + 1)?.eq_ignore_ascii_case("group") {
+        return None;
+    }
+    i += 2;
+    let mut if_not_exists = false;
+    if create
+        && tok.get(i).is_some_and(|t| t.eq_ignore_ascii_case("if"))
+        && tok.get(i + 1).is_some_and(|t| t.eq_ignore_ascii_case("not"))
+        && tok.get(i + 2).is_some_and(|t| t.eq_ignore_ascii_case("exists"))
+    {
+        if_not_exists = true;
+        i += 3;
+    }
+    let name = (*tok.get(i)?).to_string();
+    if !create {
+        if tok.get(i + 1).is_some() {
+            return None;
+        }
+        return Some(AccountStatement::DropReplicationGroup { name });
+    }
+    // Options: OBJECT_TYPES = TABLES (required) and ALLOWED_ACCOUNTS = (…)
+    // (required). Unknown keys → planner error.
+    let mut object_types = false;
+    let mut accounts = None;
+    let mut j = i + 1;
+    while j < tok.len() {
+        let key = tok[j].to_ascii_uppercase();
+        if !tok.get(j + 1)?.eq_ignore_ascii_case("=") {
+            return None;
+        }
+        match key.as_str() {
+            "OBJECT_TYPES" => {
+                if !tok.get(j + 2)?.eq_ignore_ascii_case("tables") {
+                    return None; // v1: OBJECT_TYPES = TABLES only
+                }
+                object_types = true;
+                j += 3;
+            }
+            "ALLOWED_ACCOUNTS" => {
+                let (list, used) = parse_name_list(&tok[j + 2..])?;
+                accounts = Some(list);
+                j += 2 + used;
+            }
+            _ => return None,
+        }
+    }
+    if !object_types {
+        return None;
+    }
+    Some(AccountStatement::CreateReplicationGroup {
+        name,
+        kind,
+        accounts: accounts?,
+        if_not_exists,
+    })
+}
+
 /// Match the grammar prefix; `None` when this is not an account statement
 /// (falls through to the normal planner).
 #[allow(clippy::too_many_lines)]
@@ -203,6 +354,79 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
     let tok: Vec<&str> = raw.split_whitespace().map(token).collect();
     match tok.first()?.to_ascii_uppercase().as_str() {
         "CREATE" | "DROP" => {}
+        "ALTER" => {
+            // M15.5: ALTER REPLICATION|FAILOVER GROUP <name> ADD|REMOVE
+            // TABLES <list> | REFRESH | FAILOVER TO <account>.
+            let kind = match tok.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+                Some("REPLICATION") => GroupKind::Replication,
+                Some("FAILOVER") => GroupKind::Failover,
+                _ => return None,
+            };
+            if !tok.get(2)?.eq_ignore_ascii_case("group") {
+                return None;
+            }
+            let name = tok.get(3)?.to_string();
+            return match tok.get(4)?.to_ascii_uppercase().as_str() {
+                "ADD" | "REMOVE" => {
+                    if !tok.get(5)?.eq_ignore_ascii_case("tables") {
+                        return None;
+                    }
+                    let (names, _) = parse_name_list(&tok[6..])?;
+                    let mut tables = Vec::new();
+                    for n in names {
+                        let parts: Vec<&str> = n.split('.').collect();
+                        if parts.len() != 3 {
+                            return None;
+                        }
+                        tables.push(AccountObject::Table(
+                            parts[0].to_string(),
+                            parts[1].to_string(),
+                            parts[2].to_string(),
+                        ));
+                    }
+                    if tables.is_empty() {
+                        return None;
+                    }
+                    if tok[4].eq_ignore_ascii_case("add") {
+                        Some(AccountStatement::AlterReplicationGroupAddTables {
+                            name,
+                            kind,
+                            tables,
+                        })
+                    } else {
+                        Some(AccountStatement::AlterReplicationGroupRemoveTables {
+                            name,
+                            kind,
+                            tables,
+                        })
+                    }
+                }
+                "REFRESH" => {
+                    if tok.get(5).is_some() {
+                        return None;
+                    }
+                    Some(AccountStatement::AlterReplicationGroupRefresh {
+                        name,
+                        kind,
+                    })
+                }
+                "FAILOVER" => {
+                    if !tok.get(5)?.eq_ignore_ascii_case("to") {
+                        return None;
+                    }
+                    let account = tok.get(6)?.to_string();
+                    if tok.get(7).is_some() {
+                        return None;
+                    }
+                    Some(AccountStatement::AlterReplicationGroupFailover {
+                        name,
+                        kind,
+                        account,
+                    })
+                }
+                _ => None,
+            }
+        }
         "GRANT" | "REVOKE" => {
             let is_grant = tok[0].eq_ignore_ascii_case("grant");
             // Object grant: `GRANT|REVOKE <priv> ON <kind> <name> TO|FROM ROLE|SHARE <g>`
@@ -282,12 +506,31 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
             if tok.len() == 2 && tok[1].eq_ignore_ascii_case("accounts") {
                 return Some(AccountStatement::ShowAccounts);
             }
+            if tok.len() == 3 && tok[2].eq_ignore_ascii_case("groups") {
+                if tok[1].eq_ignore_ascii_case("replication") {
+                    return Some(AccountStatement::ShowReplicationGroups { kind: None });
+                }
+                if tok[1].eq_ignore_ascii_case("failover") {
+                    return Some(AccountStatement::ShowReplicationGroups {
+                        kind: Some(GroupKind::Failover),
+                    });
+                }
+            }
             return None;
         }
         "DESC" | "DESCRIBE" => {
             if tok.len() == 3 && tok[1].eq_ignore_ascii_case("share") {
                 return Some(AccountStatement::DescribeShare {
                     share: tok[2].to_string(),
+                });
+            }
+            if tok.len() == 4
+                && (tok[1].eq_ignore_ascii_case("replication")
+                    || tok[1].eq_ignore_ascii_case("failover"))
+                && tok[2].eq_ignore_ascii_case("group")
+            {
+                return Some(AccountStatement::DescribeReplicationGroup {
+                    name: tok[3].to_string(),
                 });
             }
             return None;
@@ -297,6 +540,13 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
 
     let create = tok[0].eq_ignore_ascii_case("create");
     let mut i = 1;
+    // M15.5: CREATE|DROP [IF NOT EXISTS] REPLICATION|FAILOVER GROUP …
+    if matches!(
+        tok.get(i).map(|t| t.to_ascii_uppercase()).as_deref(),
+        Some("REPLICATION") | Some("FAILOVER")
+    ) {
+        return parse_replication_group(&tok, create, i);
+    }
     // M15.2: `CREATE INBOUND SHARE [IF NOT EXISTS] <name>` — INBOUND SHARE
     // occupies the kind position (two tokens).
     let mut inbound_share = false;
@@ -932,6 +1182,237 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             .context(ex_error::ArrowSnafu)?;
             Ok(QueryResult::new(vec![batch], schema))
         }
+        AccountStatement::CreateReplicationGroup {
+            name,
+            kind,
+            accounts,
+            if_not_exists,
+        } => {
+            let name = norm(name);
+            let accounts: Vec<String> = accounts.iter().map(|a| norm(a)).collect();
+            match store.create_replication_group(&name, *kind, accounts).await {
+                Ok(_) => crate::clone_ddl::status_row(),
+                Err(e) if e.is_replication_group_already_exists() && *if_not_exists => {
+                    crate::clone_ddl::status_row()
+                }
+                Err(e) => Err(external_error("account", e)),
+            }
+        }
+        AccountStatement::DropReplicationGroup { name } => {
+            let name = norm(name);
+            store
+                .drop_replication_group(&name)
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::AlterReplicationGroupAddTables { name, tables, .. } => {
+            let name = norm(name);
+            let tables = normalize_tables(tables.clone(), session);
+            // Source-account existence check (the session's scoped view).
+            for t in &tables {
+                let AccountObject::Table(db, s, tbl) = t else {
+                    continue;
+                };
+                let exists = session
+                    .metastore
+                    .get_table(&TableIdent::new(db, s, tbl))
+                    .await
+                    .map_err(|e| external_error("account", e))?
+                    .is_some();
+                if !exists {
+                    return Err(external_error(
+                        "account",
+                        format!("table '{db}.{s}.{tbl}' does not exist"),
+                    ));
+                }
+            }
+            store
+                .alter_replication_group_tables(&name, tables, vec![])
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::AlterReplicationGroupRemoveTables { name, tables, .. } => {
+            let name = norm(name);
+            let tables = normalize_tables(tables.clone(), session);
+            store
+                .alter_replication_group_tables(&name, vec![], tables)
+                .await
+                .map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::AlterReplicationGroupRefresh { name, kind } => {
+            let name = norm(name);
+            let Some(group) = store
+                .get_replication_group(&name)
+                .await
+                .map_err(|e| external_error("account", e))?
+            else {
+                return Err(external_error(
+                    "account",
+                    format!("replication group '{name}' does not exist"),
+                ));
+            };
+            if group.kind != *kind {
+                return Err(external_error(
+                    "account",
+                    format!(
+                        "replication group '{name}' is not a {} group",
+                        kind.to_string().to_ascii_uppercase()
+                    ),
+                ));
+            }
+            if group.failed_over {
+                return Err(external_error(
+                    "account",
+                    format!(
+                        "replication group '{name}' has failed over and cannot be refreshed"
+                    ),
+                ));
+            }
+            crate::replication::refresh_group(session, &group, &store).await?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::AlterReplicationGroupFailover { name, kind, account } => {
+            let name = norm(name);
+            let Some(group) = store
+                .get_replication_group(&name)
+                .await
+                .map_err(|e| external_error("account", e))?
+            else {
+                return Err(external_error(
+                    "account",
+                    format!("replication group '{name}' does not exist"),
+                ));
+            };
+            if group.kind != GroupKind::Failover || *kind != GroupKind::Failover {
+                return Err(external_error(
+                    "account",
+                    format!("replication group '{name}' is not a failover group"),
+                ));
+            }
+            if group.failed_over {
+                return Err(external_error(
+                    "account",
+                    format!("replication group '{name}' has already failed over"),
+                ));
+            }
+            let account = norm(account);
+            if !group
+                .accounts
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&account))
+            {
+                return Err(external_error(
+                    "account",
+                    format!(
+                        "account '{account}' is not in the allowed accounts of replication group '{name}'"
+                    ),
+                ));
+            }
+            crate::replication::failover_group(session, &group, &account, &store).await?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::ShowReplicationGroups { kind } => {
+            let mut groups = store
+                .list_replication_groups()
+                .await
+                .map_err(|e| external_error("account", e))?;
+            if let Some(k) = kind {
+                groups.retain(|g| g.kind == *k);
+            }
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("created_on", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("kind", DataType::Utf8, false),
+                Field::new("object_types", DataType::Utf8, false),
+                Field::new("allowed_accounts", DataType::Utf8, false),
+            ]));
+            let mut created_on_col = Vec::new();
+            let mut name_col = Vec::new();
+            let mut kind_col = Vec::new();
+            let mut object_types_col = Vec::new();
+            let mut accounts_col = Vec::new();
+            for g in groups {
+                // Timestamps are not tracked in the v1 in-memory store.
+                created_on_col.push(String::new());
+                name_col.push(g.name);
+                kind_col.push(g.kind.to_string());
+                object_types_col.push(if g.tables.is_empty() {
+                    String::new()
+                } else {
+                    "TABLES".to_string()
+                });
+                accounts_col.push(g.accounts.join(", "));
+            }
+            if created_on_col.is_empty() {
+                created_on_col.push(String::new());
+                name_col.push(String::new());
+                kind_col.push(String::new());
+                object_types_col.push(String::new());
+                accounts_col.push(String::new());
+            }
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(created_on_col)),
+                    Arc::new(StringArray::from(name_col)),
+                    Arc::new(StringArray::from(kind_col)),
+                    Arc::new(StringArray::from(object_types_col)),
+                    Arc::new(StringArray::from(accounts_col)),
+                ],
+            )
+            .context(ex_error::ArrowSnafu)?;
+            Ok(QueryResult::new(vec![batch], schema))
+        }
+        AccountStatement::DescribeReplicationGroup { name } => {
+            let name = norm(name);
+            let Some(g) = store
+                .get_replication_group(&name)
+                .await
+                .map_err(|e| external_error("account", e))?
+            else {
+                return Err(external_error(
+                    "account",
+                    format!("replication group '{name}' does not exist"),
+                ));
+            };
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("kind", DataType::Utf8, false),
+                Field::new("object_types", DataType::Utf8, false),
+                Field::new("allowed_accounts", DataType::Utf8, false),
+                Field::new("tables", DataType::Utf8, false),
+                Field::new("failed_over", DataType::Utf8, false),
+            ]));
+            let tables: Vec<String> = g
+                .tables
+                .iter()
+                .map(|t| t.to_string())
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![g.name])),
+                    Arc::new(StringArray::from(vec![g.kind.to_string()])),
+                    Arc::new(StringArray::from(vec![if tables.is_empty() {
+                        String::new()
+                    } else {
+                        "TABLES".to_string()
+                    }])),
+                    Arc::new(StringArray::from(vec![g.accounts.join(", ")])),
+                    Arc::new(StringArray::from(vec![tables.join(", ")])),
+                    Arc::new(StringArray::from(vec![if g.failed_over {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }])),
+                ],
+            )
+            .context(ex_error::ArrowSnafu)?;
+            Ok(QueryResult::new(vec![batch], schema))
+        }
     }
 }
 
@@ -954,6 +1435,25 @@ fn normalize_grant(
         AccountObject::Warehouse(wh) => AccountObject::Warehouse(normalized(session, wh)),
     };
     (privilege, object)
+}
+
+/// Normalize replication-group table parts through the session ident
+/// normalizer (only `Table` objects are v1-replicable).
+fn normalize_tables(
+    tables: Vec<AccountObject>,
+    session: &UserSession,
+) -> Vec<AccountObject> {
+    tables
+        .into_iter()
+        .map(|o| match o {
+            AccountObject::Table(db, s, t) => AccountObject::Table(
+                normalized(session, &db),
+                normalized(session, &s),
+                normalized(session, &t),
+            ),
+            other => other,
+        })
+        .collect()
 }
 
 /// Validate `USE ROLE` against the account store (design §17): the session's
@@ -1005,7 +1505,7 @@ pub fn check_current_warehouse(session: &UserSession) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, AccountStatement, AccountObject, Privilege, ShareKind};
+    use super::{parse, AccountStatement, AccountObject, GroupKind, Privilege, ShareKind};
 
     fn parsed(sql: &str) -> AccountStatement {
         parse(sql).unwrap_or_else(|| panic!("expected account statement: {sql}"))
@@ -1272,5 +1772,133 @@ mod tests {
             }
         );
         assert!(parse("SHOW SHARES ALL").is_none());
+    }
+
+    #[test]
+    fn parses_replication_groups() {
+        assert_eq!(
+            parsed(
+                "CREATE REPLICATION GROUP rg1 OBJECT_TYPES = TABLES ALLOWED_ACCOUNTS = (acme, globex)"
+            ),
+            AccountStatement::CreateReplicationGroup {
+                name: "rg1".into(),
+                kind: GroupKind::Replication,
+                accounts: vec!["acme".into(), "globex".into()],
+                if_not_exists: false
+            }
+        );
+        assert_eq!(
+            parsed("CREATE FAILOVER GROUP IF NOT EXISTS \"Fg1\" OBJECT_TYPES = TABLES ALLOWED_ACCOUNTS = (acme);"),
+            AccountStatement::CreateReplicationGroup {
+                name: "Fg1".into(),
+                kind: GroupKind::Failover,
+                accounts: vec!["acme".into()],
+                if_not_exists: true
+            }
+        );
+        // Single-token parenthesized list (spaces around `=` required, matching
+        // the other account DDL options).
+        assert_eq!(
+            parsed("CREATE FAILOVER GROUP fg2 OBJECT_TYPES = TABLES ALLOWED_ACCOUNTS = (acme,globex)"),
+            AccountStatement::CreateReplicationGroup {
+                name: "fg2".into(),
+                kind: GroupKind::Failover,
+                accounts: vec!["acme".into(), "globex".into()],
+                if_not_exists: false
+            }
+        );
+        // Required options missing / wrong OBJECT_TYPES → planner error.
+        assert!(parse("CREATE REPLICATION GROUP rg2").is_none());
+        assert!(parse(
+            "CREATE REPLICATION GROUP rg2 ALLOWED_ACCOUNTS = (acme)"
+        )
+        .is_none());
+        assert!(parse(
+            "CREATE REPLICATION GROUP rg2 OBJECT_TYPES = DATABASES ALLOWED_ACCOUNTS = (acme)"
+        )
+        .is_none());
+        // Unknown option → planner error.
+        assert!(parse(
+            "CREATE REPLICATION GROUP rg2 OBJECT_TYPES = TABLES ALLOWED_DBS = (d)"
+        )
+        .is_none());
+        // DROP for both kinds.
+        assert_eq!(
+            parsed("DROP REPLICATION GROUP rg1"),
+            AccountStatement::DropReplicationGroup { name: "rg1".into() }
+        );
+        assert_eq!(
+            parsed("drop failover group \"Fg1\";"),
+            AccountStatement::DropReplicationGroup { name: "Fg1".into() }
+        );
+        assert!(parse("DROP REPLICATION GROUP rg1 EXTRA").is_none());
+    }
+
+    #[test]
+    fn parses_replication_group_alters() {
+        assert_eq!(
+            parsed("ALTER REPLICATION GROUP rg1 ADD TABLES db.s.t1, db.s.t2"),
+            AccountStatement::AlterReplicationGroupAddTables {
+                name: "rg1".into(),
+                kind: GroupKind::Replication,
+                tables: vec![
+                    AccountObject::Table("db".into(), "s".into(), "t1".into()),
+                    AccountObject::Table("db".into(), "s".into(), "t2".into())
+                ]
+            }
+        );
+        assert_eq!(
+            parsed("ALTER FAILOVER GROUP fg1 REMOVE TABLES (db.s.t1)"),
+            AccountStatement::AlterReplicationGroupRemoveTables {
+                name: "fg1".into(),
+                kind: GroupKind::Failover,
+                tables: vec![AccountObject::Table("db".into(), "s".into(), "t1".into())]
+            }
+        );
+        assert_eq!(
+            parsed("ALTER REPLICATION GROUP rg1 REFRESH"),
+            AccountStatement::AlterReplicationGroupRefresh {
+                name: "rg1".into(),
+                kind: GroupKind::Replication
+            }
+        );
+        assert_eq!(
+            parsed("ALTER FAILOVER GROUP fg1 FAILOVER TO acme;"),
+            AccountStatement::AlterReplicationGroupFailover {
+                name: "fg1".into(),
+                kind: GroupKind::Failover,
+                account: "acme".into()
+            }
+        );
+        // Malformed verbs fall through.
+        assert!(parse("ALTER REPLICATION GROUP rg1 ADD DATABASES db").is_none());
+        assert!(parse("ALTER REPLICATION GROUP rg1 REFRESH NOW").is_none());
+        assert!(parse("ALTER FAILOVER GROUP fg1 FAILOVER").is_none());
+        assert!(parse("ALTER REPLICATION GROUP rg1").is_none());
+        assert!(parse("ALTER TABLE t ADD COLUMN c int").is_none());
+    }
+
+    #[test]
+    fn parses_replication_group_show_desc() {
+        assert_eq!(
+            parsed("SHOW REPLICATION GROUPS"),
+            AccountStatement::ShowReplicationGroups { kind: None }
+        );
+        assert_eq!(
+            parsed("show failover groups;"),
+            AccountStatement::ShowReplicationGroups {
+                kind: Some(GroupKind::Failover)
+            }
+        );
+        assert_eq!(
+            parsed("DESC REPLICATION GROUP rg1"),
+            AccountStatement::DescribeReplicationGroup { name: "rg1".into() }
+        );
+        assert_eq!(
+            parsed("DESCRIBE FAILOVER GROUP \"Fg1\""),
+            AccountStatement::DescribeReplicationGroup { name: "Fg1".into() }
+        );
+        assert!(parse("SHOW REPLICATION GROUPS EXTRA").is_none());
+        assert!(parse("DESC REPLICATION GROUPS").is_none());
     }
 }

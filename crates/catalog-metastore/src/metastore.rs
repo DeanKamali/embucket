@@ -65,6 +65,13 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         table: TableCreateRequest,
     ) -> Result<RwObject<Table>>;
     async fn register_table(&self, ident: &TableIdent, table: Table) -> Result<RwObject<Table>>;
+    /// The un-scoped metastore behind a wrapper view (M15.5, cross-account
+    /// replication refresh): `None` for plain metastores (they are already
+    /// raw).
+    fn inner_raw(&self) -> Option<std::sync::Arc<dyn Metastore>> {
+        None
+    }
+
     /// Zero-copy clone (M8, design §14): creates `to` as a metadata-only
     /// copy of `from` — the clone shares the source's table location,
     /// volume and current metadata lineage (zero data or metadata copy).

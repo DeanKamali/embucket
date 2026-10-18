@@ -12,7 +12,9 @@
 //! idempotent per key, so replay order across domains does not matter
 //! (unlike the catalog journal, there are no cascading tombstones).
 
-use crate::models::{Account, Grant, LoginEvent, Role, RoleRole, Share, ShareGrant, User, UserRole};
+use crate::models::{
+    Account, Grant, LoginEvent, ReplicationGroup, Role, RoleRole, Share, ShareGrant, User, UserRole,
+};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -36,10 +38,11 @@ pub mod domain {
     pub const SHARES: &str = "account_shares";
     pub const SHARE_GRANTS: &str = "account_share_grants";
     pub const LOGINS: &str = "account_logins";
+    pub const REPLICATION_GROUPS: &str = "account_replication_groups";
 
     /// All domains (no ordering requirement — records are idempotent per
     /// key; see module docs).
-    pub const ALL: [&str; 9] = [
+    pub const ALL: [&str; 10] = [
         ACCOUNTS,
         USERS,
         ROLES,
@@ -49,6 +52,7 @@ pub mod domain {
         SHARES,
         SHARE_GRANTS,
         LOGINS,
+        REPLICATION_GROUPS,
     ];
 }
 
@@ -87,6 +91,7 @@ pub enum AccountRecord {
     Share(Share),
     ShareGrant(ShareGrant),
     Login(LoginEvent),
+    ReplicationGroup(ReplicationGroup),
 }
 
 impl AccountRecord {
@@ -103,6 +108,7 @@ impl AccountRecord {
             Self::Share(_) => domain::SHARES,
             Self::ShareGrant(_) => domain::SHARE_GRANTS,
             Self::Login(_) => domain::LOGINS,
+            Self::ReplicationGroup(_) => domain::REPLICATION_GROUPS,
         }
     }
 
@@ -150,6 +156,9 @@ impl AccountRecord {
             // the key sorts chronologically (`list_logins` is oldest-first).
             // The account rides in the record for scoped listing.
             Self::Login(e) => format!("{:020}{sep}{:010}", e.timestamp_ms, e.sequence),
+            Self::ReplicationGroup(g) => {
+                account_key(&g.account, g.name.to_ascii_lowercase())
+            }
         }
     }
 

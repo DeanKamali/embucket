@@ -450,6 +450,9 @@ impl UserQuery {
         // Inbound shares (design §21, M15.2) mount read-only: deny DML
         // whose target resolves into a mounted share catalog.
         crate::share_catalog::deny_dml(&statement, &self.session)?;
+        // Replicas (design §21.5, M15.5) are read-only: deny DML whose
+        // target table carries the `avalanche.replica` stamp.
+        crate::replication::deny_replica_dml(&statement, &self.session).await?;
 
         // Record the result as part of the current span.
         tracing::Span::current().record("statement", format!("{statement:#?}"));

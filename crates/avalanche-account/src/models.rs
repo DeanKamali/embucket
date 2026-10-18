@@ -231,3 +231,40 @@ pub struct ShareGrant {
     pub privilege: Privilege,
     pub object: AccountObject,
 }
+
+/// Replication-group kind (M15.5, design §21.5): `REPLICATION` groups keep
+/// replicas read-only forever; `FAILOVER` groups can promote a replica to
+/// writable (`ALTER … FAILOVER TO <account>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[strum(serialize_all = "UPPERCASE")]
+pub enum GroupKind {
+    Replication,
+    Failover,
+}
+
+/// A replication/failover group (M15.5, design §21.5): a named set of
+/// tables in the owning account replicated into every allowed target
+/// account's *same-named* database. Zero data copy — refresh is a
+/// cross-account metadata clone over the shared Iceberg storage; replica
+/// tables are stamped `avalanche.replica` and deny DML until a failover
+/// promotion lifts the stamp (failover groups only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationGroup {
+    /// Owning (source) account.
+    #[serde(default = "default_account")]
+    pub account: String,
+    pub name: String,
+    pub kind: GroupKind,
+    /// Allowed target accounts — refresh propagates to each.
+    pub accounts: Vec<String>,
+    /// Replicated objects (v1: `OBJECT_TYPES = TABLES`, so `Table`
+    /// variants only).
+    pub tables: Vec<AccountObject>,
+    /// Epoch ms of the last refresh (0 = never refreshed).
+    #[serde(default)]
+    pub last_refresh_ms: u64,
+    /// Set by a failover promotion: the promoted replica is writable and
+    /// the group refuses further refreshes (design §21.5).
+    #[serde(default)]
+    pub failed_over: bool,
+}

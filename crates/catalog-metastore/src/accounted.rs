@@ -52,6 +52,13 @@ impl AccountedMetastore {
         &self.inner
     }
 
+    /// The raw (un-scoped) metastore — cross-account operations (M15.5
+    /// replication refresh) build both endpoint views over it.
+    #[must_use]
+    pub fn raw(&self) -> Arc<dyn Metastore> {
+        Arc::clone(&self.inner)
+    }
+
     /// True for the default account (identity passthrough).
     #[must_use]
     pub fn is_default(&self) -> bool {
@@ -175,6 +182,10 @@ impl AccountedMetastore {
 
 #[async_trait]
 impl Metastore for AccountedMetastore {
+    fn inner_raw(&self) -> Option<std::sync::Arc<dyn Metastore>> {
+        Some(Arc::clone(&self.inner))
+    }
+
     // ---- volumes: global, pass through unchanged ----
     async fn list_volumes(&self) -> Result<Vec<RwObject<Volume>>> {
         self.inner.list_volumes().await

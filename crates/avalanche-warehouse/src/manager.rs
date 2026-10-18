@@ -795,7 +795,9 @@ impl WarehouseManager {
         // a docker network alias so executors dial one name for the whole
         // replica set, and the alias keeps resolving while one replica lives.
         // Replicas >1 share executor/job state through Postgres (validated at
-        // create/ALTER time); the env hands each replica its URL.
+        // create/ALTER time); the env hands each replica its URL. A single
+        // replica uses the shared state too when configured, so cluster
+        // state stays durable/observable regardless of replica count.
         let replicas = record
             .as_ref()
             .map_or(1, |r| r.scheduler_replicas.max(1));
@@ -812,7 +814,7 @@ impl WarehouseManager {
                 }
             }
         } else {
-            Vec::new()
+            self.shared_state_env().await.into_iter().collect()
         };
         for cluster in 0..clusters {
             let cluster_base = scheduler_cluster_name(name, cluster);

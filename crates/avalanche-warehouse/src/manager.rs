@@ -841,6 +841,11 @@ impl WarehouseManager {
                             // ghost executor stays schedulable.
                             "--executor-timeout-seconds".to_string(),
                             "30".to_string(),
+                            // Reaper tick (M7.4): detection is timeout + up to
+                            // one interval, so 5s keeps a lost executor's stall
+                            // inside ~35s instead of ~45s.
+                            "--expire-dead-executor-interval-seconds".to_string(),
+                            "5".to_string(),
                         ],
                         env: sched_env,
                         volumes: container_volumes.clone(),

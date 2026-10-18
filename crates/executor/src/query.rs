@@ -3020,6 +3020,40 @@ impl UserQuery {
         scheduler_url: String,
         span: tracing::Span,
     ) -> Result<QueryResult> {
+        // One whole-query retry when the scheduler fails the job because
+        // adaptive planning cannot re-run a stage an executor loss finalised
+        // (M7.4, `ballista_core::AQE_EXECUTOR_LOSS_MARKER`). Writes are not
+        // retried. `AVALANCHE_DISTRIBUTED_RETRY_ON_EXECUTOR_LOSS=0` disables it.
+        let retry_plan = if Self::executor_loss_retry_enabled() && !Self::plan_contains_dml(&plan) {
+            Some(plan.clone())
+        } else {
+            None
+        };
+        match Self::run_distributed_once(
+            Arc::clone(&session),
+            plan,
+            scheduler_url.clone(),
+            span.clone(),
+        )
+        .await
+        {
+            Err(err) if retry_plan.is_some() && Self::is_aqe_executor_loss(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "distributed query failed after executor loss under adaptive planning; retrying once"
+                );
+                Self::run_distributed_once(session, retry_plan.unwrap(), scheduler_url, span).await
+            }
+            other => other,
+        }
+    }
+
+    async fn run_distributed_once(
+        session: Arc<UserSession>,
+        plan: LogicalPlan,
+        scheduler_url: String,
+        span: tracing::Span,
+    ) -> Result<QueryResult> {
         let fallback_schema = plan.schema().as_arrow().clone();
         // Unwrap catalog caching providers: the Ballista plan serializer must
         // downcast scan sources to concrete providers (ListingTable, ...),
@@ -3073,6 +3107,30 @@ impl UserQuery {
             Arc::new(schema),
             metrics,
         ))
+    }
+
+    fn executor_loss_retry_enabled() -> bool {
+        match std::env::var("AVALANCHE_DISTRIBUTED_RETRY_ON_EXECUTOR_LOSS") {
+            Ok(value) => !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    }
+
+    fn plan_contains_dml(plan: &LogicalPlan) -> bool {
+        if matches!(plan, LogicalPlan::Dml(_)) {
+            return true;
+        }
+        plan.inputs().iter().any(|input| Self::plan_contains_dml(input))
+    }
+
+    /// Same text as `ballista_core::AQE_EXECUTOR_LOSS_MARKER`.
+    fn is_aqe_executor_loss(err: &Error) -> bool {
+        const MARKER: &str =
+            "ExecutorLost: stage finalised; rerun unsupported under adaptive planning";
+        err.to_string().contains(MARKER) || format!("{err:?}").contains(MARKER)
     }
 
     async fn execute_logical_plan(&self, plan: LogicalPlan) -> Result<QueryResult> {

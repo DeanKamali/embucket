@@ -67,6 +67,78 @@ pub fn registry_from_env() -> object_store::Result<Arc<dyn ObjectStoreRegistry>>
     Ok(registry)
 }
 
+/// Object-store registry that also resolves datafusion_iceberg's fake
+/// per-table store URLs (`iceberg-rust://<escaped-table-path>`, see
+/// `fake_object_store_url` in the datafusion_iceberg fork).
+///
+/// Stage plans produced by the scheduler keep those URLs in their
+/// `DataSourceExec` file groups, but the executor's runtime registry is a
+/// plain `DefaultObjectStoreRegistry` — it only knows `file://` plus the
+/// warehouse `s3://<bucket>` store from env, so stage execution fails with
+/// `No suitable object store found for iceberg-rust://...`.
+///
+/// Resolution order: any exact registration (including `iceberg-rust://`
+/// URLs registered by a decoded provider's own `table_scan` during FLATTEN
+/// sub-plan creation) first; unknown `iceberg-rust://` URLs fall back to the
+/// warehouse store from env (the managed-table volume store — same bucket
+/// the scheduler-side scan would have registered), or the local filesystem
+/// when there is no warehouse env. Everything else delegates to the default
+/// registry unchanged.
+struct IcebergSchemeRegistry {
+    inner: DefaultObjectStoreRegistry,
+    fallback: Arc<dyn ObjectStore>,
+}
+
+impl std::fmt::Debug for IcebergSchemeRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IcebergSchemeRegistry")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectStoreRegistry for IcebergSchemeRegistry {
+    fn register_store(
+        &self,
+        url: &Url,
+        store: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        self.inner.register_store(url, store)
+    }
+
+    fn get_store(&self, url: &Url) -> DfResult<Arc<dyn ObjectStore>> {
+        if let Ok(store) = self.inner.get_store(url) {
+            return Ok(store);
+        }
+        if url.scheme() == "iceberg-rust" {
+            return Ok(Arc::clone(&self.fallback));
+        }
+        self.inner.get_store(url)
+    }
+}
+
+/// Builds [`IcebergSchemeRegistry`] with the warehouse store from env when
+/// present, else the local filesystem default.
+///
+/// # Errors
+///
+/// Returns an error if the storage env is invalid (see [`s3_store_from_env`]).
+pub fn registry_from_env_with_iceberg() -> object_store::Result<Arc<dyn ObjectStoreRegistry>> {
+    let store = s3_store_from_env()?;
+    let fallback: Arc<dyn ObjectStore> = match &store {
+        Some((_, store)) => Arc::clone(store),
+        None => Arc::new(object_store::local::LocalFileSystem::default()),
+    };
+    let registry = IcebergSchemeRegistry {
+        inner: DefaultObjectStoreRegistry::new(),
+        fallback,
+    };
+    if let Some((url, store)) = store {
+        registry.register_store(&url, store);
+    }
+    Ok(Arc::new(registry))
+}
+
 /// Executor-side hook: a `RuntimeEnv` whose registry carries the warehouse
 /// store from env. Reproduces ballista's default base env (temp path +
 /// default registry) so the override is a drop-in.
@@ -76,9 +148,10 @@ pub fn registry_from_env() -> object_store::Result<Arc<dyn ObjectStoreRegistry>>
 /// Returns an error if the storage env is invalid (see [`registry_from_env`])
 /// or the runtime env fails to build.
 pub fn runtime_env_from_env(work_dir: &str) -> DfResult<RuntimeEnv> {
-    let registry = registry_from_env().map_err(|e| datafusion_common::DataFusionError::External(
-        format!("invalid warehouse storage env: {e}").into(),
-    ))?;
+    let registry =
+        registry_from_env_with_iceberg().map_err(|e| datafusion_common::DataFusionError::External(
+            format!("invalid warehouse storage env: {e}").into(),
+        ))?;
     RuntimeEnvBuilder::new()
         .with_temp_file_path(work_dir.to_string())
         .with_object_store_registry(registry)
@@ -94,7 +167,7 @@ pub fn runtime_env_from_env(work_dir: &str) -> DfResult<RuntimeEnv> {
 pub fn register_storage_in_session(
     state: datafusion::execution::context::SessionState,
 ) -> DfResult<datafusion::execution::context::SessionState> {
-    let registry = registry_from_env().map_err(|e| {
+    let registry = registry_from_env_with_iceberg().map_err(|e| {
         datafusion_common::DataFusionError::External(format!(
             "invalid warehouse storage env: {e}"
         )
@@ -134,7 +207,7 @@ mod tests {
     fn registry_without_env_is_plain_default() {
         // No AVALANCHE_S3_* env in the test process → plain default registry.
         remove_env("AVALANCHE_S3_BUCKET");
-        let registry = registry_from_env().expect("default registry");
+        let registry = registry_from_env_with_iceberg().expect("default registry");
         // local file system default still resolvable
         let url = Url::parse("file:///tmp").expect("valid url");
         registry
@@ -150,7 +223,7 @@ mod tests {
         set_env("AWS_SECRET_ACCESS_KEY", "test-secret");
         set_env("AWS_ENDPOINT", "http://127.0.0.1:9");
         set_env("AWS_ALLOW_HTTP", "true");
-        let registry = registry_from_env().expect("registry with env");
+        let registry = registry_from_env_with_iceberg().expect("registry with env");
         let url = Url::parse("s3://test-bucket-m71").expect("valid url");
         registry
             .get_store(&url)
@@ -160,5 +233,33 @@ mod tests {
         remove_env("AWS_SECRET_ACCESS_KEY");
         remove_env("AWS_ENDPOINT");
         remove_env("AWS_ALLOW_HTTP");
+    }
+
+    /// Unknown `iceberg-rust://` URLs (datafusion_iceberg's fake per-table
+    /// store URLs) resolve to the fallback store from env — the gap that
+    /// made distributed managed-table scans fail on executors.
+    #[test]
+    fn registry_resolves_iceberg_rust_scheme() {
+        set_env("AVALANCHE_S3_BUCKET", "test-bucket-m71");
+        set_env("AWS_ACCESS_KEY_ID", "test-key");
+        set_env("AWS_SECRET_ACCESS_KEY", "test-secret");
+        set_env("AWS_ENDPOINT", "http://127.0.0.1:9");
+        set_env("AWS_ALLOW_HTTP", "true");
+        let registry = registry_from_env_with_iceberg().expect("registry with env");
+        let url = Url::parse("iceberg-rust://udfdb-2Fpub-2Fmr/").expect("valid url");
+        registry
+            .get_store(&url)
+            .expect("iceberg-rust URL resolves to env store");
+        remove_env("AVALANCHE_S3_BUCKET");
+        remove_env("AWS_ACCESS_KEY_ID");
+        remove_env("AWS_SECRET_ACCESS_KEY");
+        remove_env("AWS_ENDPOINT");
+        remove_env("AWS_ALLOW_HTTP");
+
+        // Without env the scheme falls back to the local filesystem.
+        let registry = registry_from_env_with_iceberg().expect("default registry");
+        registry
+            .get_store(&url)
+            .expect("iceberg-rust URL resolves to local fallback");
     }
 }

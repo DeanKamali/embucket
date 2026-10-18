@@ -160,12 +160,15 @@ mod tests {
         let maps = FunctionMaps::embucket();
         assert!(!maps.scalar.is_empty(), "no scalar UDFs collected");
         assert!(!maps.aggregate.is_empty(), "no aggregate UDFs collected");
-        // Spot-check a semi-structured function that must exist.
-        let resolved = maps.scalar.keys().cloned().collect::<Vec<_>>();
-        assert!(
-            resolved.iter().any(|n| n.contains("json") || n.contains("object")),
-            "expected semi-structured UDFs among {resolved:?}"
-        );
+        // Spot-checks: semi-structured + conditional functions that appear in
+        // distributed plans and must resolve on executors.
+        for name in ["variant_element", "decode", "get_path", "as_char"] {
+            assert!(
+                maps.scalar.contains_key(name),
+                "FunctionMaps missing '{name}' among {} keys",
+                maps.scalar.len()
+            );
+        }
     }
 
     #[test]

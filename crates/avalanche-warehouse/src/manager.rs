@@ -157,6 +157,14 @@ impl WarehouseManager {
         Arc::clone(&self.ledger)
     }
 
+    /// Docker-network gateway IP of the warehouse containers' shared
+    /// network (`None` when unknown — fake driver in tests, unconfigured
+    /// network). Used to rewrite host-dialing URLs (e.g. S3 endpoints
+    /// embedded in distributed-plan payloads) into container reachability.
+    pub async fn network_gateway(&self) -> Option<String> {
+        self.driver.network_gateway(self.network.as_deref()).await
+    }
+
     /// Case-tolerant record lookup (session variables may differ in case
     /// from the stored key): `USE WAREHOUSE etl` vs stored `ETL`.
     pub async fn find_record(&self, name: &str) -> Option<WarehouseRecord> {

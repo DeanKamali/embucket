@@ -21,7 +21,7 @@ use datafusion_common::{
 };
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{BinaryExpr, LogicalPlanBuilder, Subquery, TableType};
+use datafusion_expr::{BinaryExpr, LogicalPlan, LogicalPlanBuilder, Subquery, TableType};
 use datafusion_physical_plan::common::collect;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::memory::MemoryStream;
@@ -80,10 +80,23 @@ pub struct Out {
 pub struct FlattenTableProvider {
     pub args: FlattenArgs,
     pub schema: Arc<DFSchema>,
+    /// Optional pre-built input plan (a scan over the input table projecting
+    /// the input expression). When set, `FlattenExec` executes this plan
+    /// directly instead of re-resolving the input table via
+    /// `schema_for_ref` — required for distributed execution, where the
+    /// executor session has no Embucket catalog.
+    pub input_plan: Option<Arc<LogicalPlan>>,
 }
 
 impl FlattenTableProvider {
     pub fn new(args: FlattenArgs) -> DFResult<Self> {
+        Self::new_with_plan(args, None)
+    }
+
+    pub fn new_with_plan(
+        args: FlattenArgs,
+        input_plan: Option<Arc<LogicalPlan>>,
+    ) -> DFResult<Self> {
         let schema_fields = vec![
             Field::new("SEQ", DataType::UInt64, false),
             Field::new("KEY", DataType::Utf8, true),
@@ -100,7 +113,11 @@ impl FlattenTableProvider {
             qualified_fields,
             HashMap::default(),
         )?);
-        Ok(Self { args, schema })
+        Ok(Self {
+            args,
+            schema,
+            input_plan,
+        })
     }
 }
 
@@ -141,6 +158,7 @@ impl TableProvider for FlattenTableProvider {
             args: self.args.clone(),
             schema: self.schema.inner().clone(),
             session_state: Arc::new(session_state.clone()),
+            input_plan: self.input_plan.clone(),
             projection: projection.cloned(),
             filters: filters.to_vec(),
             limit,
@@ -153,6 +171,7 @@ pub struct FlattenExec {
     args: FlattenArgs,
     schema: Arc<Schema>,
     session_state: Arc<SessionState>,
+    input_plan: Option<Arc<LogicalPlan>>,
     properties: Arc<PlanProperties>,
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
@@ -201,6 +220,7 @@ impl ExecutionPlan for FlattenExec {
             session_state: self.session_state.clone(),
             args: self.args.clone(),
             schema: self.schema.clone(),
+            input_plan: self.input_plan.clone(),
             properties: self.properties.clone(),
             projection: self.projection.clone(),
             filters: self.filters.clone(),
@@ -217,10 +237,18 @@ impl ExecutionPlan for FlattenExec {
         let args = self.args.clone();
         let limit = self.limit;
         let session_state = Arc::clone(&self.session_state);
+        let input_plan = self.input_plan.clone();
         let projection = self.projection.clone();
 
         let stream = futures::stream::once(async move {
-            let batches = if let Expr::Literal(ScalarValue::Utf8(Some(s)), _) = &args.input_expr {
+            let batches = if let Some(plan) = input_plan {
+                // Pre-built input plan (distributed path): execute it
+                // directly — its table scans carry inline providers, so no
+                // session catalog resolution is needed.
+                let physical_plan = session_state.create_physical_plan(plan.as_ref()).await?;
+                let input_stream = physical_plan.execute(0, session_state.task_ctx())?;
+                collect(input_stream).await?
+            } else if let Expr::Literal(ScalarValue::Utf8(Some(s)), _) = &args.input_expr {
                 let array: ArrayRef = Arc::new(StringArray::from(vec![s.clone()]));
                 let batch = RecordBatch::try_from_iter(vec![("input", array)])?;
                 vec![batch]
@@ -356,7 +384,7 @@ pub fn empty_record_batch(
     RecordBatch::try_new(schema, arrays).unwrap()
 }
 
-fn extract_table_ref(expr: &Expr) -> Option<TableReference> {
+pub fn extract_table_ref(expr: &Expr) -> Option<TableReference> {
     let mut table_ref: Option<TableReference> = None;
     let _ = expr.apply(&mut |e: &Expr| {
         if let Expr::Column(Column {

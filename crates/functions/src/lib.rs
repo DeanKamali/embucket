@@ -33,7 +33,7 @@ pub mod crypto;
 pub mod encryption;
 mod errors;
 pub mod expr_planner;
-mod json;
+pub mod json;
 pub mod numeric;
 pub mod regexp;
 #[path = "semi-structured/mod.rs"]

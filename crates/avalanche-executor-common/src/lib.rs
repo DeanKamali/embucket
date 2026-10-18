@@ -15,12 +15,17 @@ pub mod storage;
 pub mod tls;
 pub mod udf_registry;
 
-pub use codecs::{EmbucketLogicalExtensionCodec, EmbucketPhysicalExtensionCodec};
+pub use codecs::{
+    EmbucketLogicalExtensionCodec, EmbucketPhysicalExtensionCodec, FlattenInput, FlattenPayload,
+    ManagedIcebergPayload, ManagedVolumeSpec, PathTokenDto, TABLE_PAYLOAD_MAGIC, TablePayload,
+    encode_table_payload,
+};
 pub use storage::{register_storage_in_session, runtime_env_from_env, s3_store_from_env};
 pub use tls::{TlsError, TlsMaterial, TLS_DIR_ENV};
 pub use tls::CONTAINER_TLS_DIR;
 pub use udf_registry::FunctionMaps;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ballista_core::extension::{SessionConfigExt, SessionStateExt};
@@ -32,6 +37,14 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 /// Fresh Embucket logical codec (client encode + scheduler/executor decode).
 pub fn logical_codec() -> Arc<dyn LogicalExtensionCodec> {
     Arc::new(EmbucketLogicalExtensionCodec::new())
+}
+
+/// Fresh Embucket logical codec carrying the router-collected table payloads
+/// for one distributed query (managed Iceberg tables, LATERAL FLATTEN).
+pub fn logical_codec_with_encoded_tables(
+    encoded_tables: HashMap<String, Vec<u8>>,
+) -> Arc<dyn LogicalExtensionCodec> {
+    Arc::new(EmbucketLogicalExtensionCodec::with_encoded_tables(encoded_tables))
 }
 
 /// Fresh Embucket physical codec (executor stage decode).
@@ -52,11 +65,25 @@ pub fn upgrade_session_for_warehouse(
     state: SessionState,
     scheduler_url: impl Into<String>,
 ) -> datafusion_common::Result<SessionState> {
+    upgrade_session_for_warehouse_with_codec(state, scheduler_url, logical_codec())
+}
+
+/// Same as [`upgrade_session_for_warehouse`], but with a caller-provided
+/// logical codec (e.g. one carrying encoded managed-table payloads).
+///
+/// # Errors
+///
+/// Returns an error if the Ballista state upgrade fails.
+pub fn upgrade_session_for_warehouse_with_codec(
+    state: SessionState,
+    scheduler_url: impl Into<String>,
+    logical: Arc<dyn LogicalExtensionCodec>,
+) -> datafusion_common::Result<SessionState> {
     let scheduler_url = scheduler_url.into();
     let mut config = state
         .config()
         .clone()
-        .with_ballista_logical_extension_codec(logical_codec())
+        .with_ballista_logical_extension_codec(logical)
         .with_ballista_physical_extension_codec(physical_codec());
     // Mutual TLS (M7.2, design §13.2): an `https://` scheduler URL dials the
     // scheduler and executors with a client identity and verifies servers

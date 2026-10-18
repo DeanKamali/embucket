@@ -25,6 +25,8 @@ avalanche-account = { path = "../avalanche-account" }
 avalanche-executor-common = { path = "../avalanche-executor-common" }
 avalanche-warehouse = { path = "../avalanche-warehouse" }
 catalog-metastore = { path = "../catalog-metastore" }
+datafusion-proto = "55.0.0"
+prost = "0.14.1"
 state-store = { path = "../state-store" }
 catalog = { path = "../catalog" }
 functions = { path = "../functions" } # features = ["geospatial"] 

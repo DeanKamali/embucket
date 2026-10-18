@@ -5,14 +5,22 @@ edition = "2024"
 license-file = { workspace = true }
 
 [dependencies]
+async-trait = { workspace = true }
 ballista-core = "55.0.0"
 catalog = { path = "../catalog" }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-proto = "55.0.0"
+datafusion_iceberg = { workspace = true }
 functions = { path = "../functions" }
+futures = { workspace = true }
+iceberg-rust = { workspace = true }
+iceberg-rust-spec = { workspace = true }
 object_store = { workspace = true }
+prost = "0.14.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 # mTLS (M7.2): shared material loading for scheduler/executor/router.
 rustls = { version = "0.23", features = ["aws-lc-rs", "logging", "std", "tls12"] }
 rustls-pki-types = "1"

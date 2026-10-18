@@ -22,9 +22,9 @@ use crate::models::{QueryContext, QueryMetric, QueryResult, metrics_set_to_json}
 use crate::query_types::{DdlStType, DmlStType, MiscStType, QueryStats, QueryType};
 use catalog::table::{CachingTable, IcebergTableBuilder};
 use catalog_metastore::{
-    AwsAccessKeyCredentials, AwsCredentials, FileVolume, Metastore, S3TablesVolume, S3Volume,
-    TableCreateRequest as MetastoreTableCreateRequest, TableFormat as MetastoreTableFormat,
-    TableIdent as MetastoreTableIdent, Volume, VolumeType,
+    AwsAccessKeyCredentials, AwsCredentials, FileVolume, Metastore, RwObject, S3TablesVolume,
+    S3Volume, TableCreateRequest as MetastoreTableCreateRequest,
+    TableFormat as MetastoreTableFormat, TableIdent as MetastoreTableIdent, Volume, VolumeType,
     models::volumes::create_object_store_from_url,
 };
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
@@ -59,10 +59,15 @@ use datafusion::sql::sqlparser::ast::{
     TableFactor, ValueWithSpan,
 };
 use datafusion::sql::statement::object_name_to_string;
+use datafusion_proto::logical_plan::to_proto::serialize_expr;
+use datafusion_proto::logical_plan::AsLogicalPlan;
+use datafusion_proto::protobuf::LogicalPlanNode;
+use prost::Message;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
     Column, DFSchema, DataFusionError, ParamValues, ResolvedTableReference, SchemaReference,
-    TableReference, ToDFSchema, plan_datafusion_err, tree_node::TreeNode, tree_node::Transformed,
+    TableReference, ToDFSchema, plan_datafusion_err, tree_node::TreeNode,
+    tree_node::TreeNodeRecursion, tree_node::Transformed,
 };
 use datafusion_expr::conditional_expressions::CaseBuilder;
 use datafusion_expr::logical_plan::dml::{DmlStatement, InsertOp, WriteOp};
@@ -75,8 +80,13 @@ use datafusion_expr::{
 use datafusion_iceberg::DataFusionTable;
 use datafusion_iceberg::table::DataFusionTableConfigBuilder;
 use datafusion_physical_plan::{ExecutionPlan, collect};
+use avalanche_executor_common::{
+    FlattenInput, FlattenPayload, ManagedIcebergPayload, ManagedVolumeSpec, PathTokenDto,
+};
+use functions::json::PathToken;
 use functions::semi_structured::variant::visitors::visit_all;
 use functions::session_params::SessionProperty;
+use functions::table::flatten::provider::{FlattenMode, FlattenTableProvider, extract_table_ref};
 use functions::visitors::{
     copy_into_identifiers, fetch_to_limit, flatten_correlation, functions_rewriter,
     inline_aliases_in_query, like_ilike_any, rlike_regexp_expr_rewriter, select_expr_aliases,
@@ -3009,15 +3019,344 @@ impl UserQuery {
         ))
     }
 
+    // -------------------------------------------------------------------
+    // Distributed table payloads (design §6.3): before a plan ships to the
+    // warehouse, every managed-Iceberg scan and LATERAL FLATTEN scan is
+    // encoded as a self-contained payload — snapshot metadata + volume
+    // storage config, or the FLATTEN provider's pre-built input plan — so
+    // executors rebuild the scans without metastore or session-catalog
+    // access. The payloads travel through the query's logical codec
+    // (`EmbucketLogicalExtensionCodec::with_encoded_tables`).
+    // -------------------------------------------------------------------
+
+    /// Walks the plan's table scans and encodes payloads for the ones that
+    /// need router-side reconstruction on warehouse executors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a scan needs a payload the router cannot build
+    /// (e.g. in-memory volumes, unsupported input tables) — distributed
+    /// execution fails loudly instead of producing wrong results.
+    async fn collect_encoded_tables(
+        &self,
+        plan: &LogicalPlan,
+    ) -> std::result::Result<HashMap<String, Vec<u8>>, DataFusionError> {
+        // Gather scan sources first (unwrapping CachingTable layers): the
+        // `apply` closure is sync while resolution below is async.
+        let mut scans: Vec<(TableReference, Arc<dyn TableProvider>)> = Vec::new();
+        let _ = plan.apply(&mut |node: &LogicalPlan| {
+            if let LogicalPlan::TableScan(scan) = node {
+                let Ok(source) = source_as_provider(&scan.source) else {
+                    return Ok(TreeNodeRecursion::Continue);
+                };
+                let mut provider = source;
+                for _ in 0..4 {
+                    let Some(caching) = provider.downcast_ref::<CachingTable>() else {
+                        break;
+                    };
+                    provider = Arc::clone(&caching.table);
+                }
+                scans.push((scan.table_name.clone(), provider));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+
+        let mut map: HashMap<String, Vec<u8>> = HashMap::new();
+        // Warehouse containers reach host services (moto, PG) through the
+        // docker bridge gateway, not `127.0.0.1` — the same rewrite the
+        // manager applies to container env URLs.
+        let gateway = self.session.warehouse.network_gateway().await;
+        for (table_ref, provider) in scans {
+            if let Some(dft) = provider.downcast_ref::<DataFusionTable>() {
+                let payload = self.managed_iceberg_payload(dft, &table_ref, gateway.as_deref()).await?;
+                let bytes = avalanche_executor_common::encode_table_payload(
+                    &avalanche_executor_common::TablePayload::ManagedIceberg(payload),
+                )?;
+                map.insert(table_ref.to_string(), bytes.clone());
+                // Bare-name alias: FLATTEN input plans are built by table
+                // name, so their scan encodes under `Bare(name)`.
+                map.entry(table_ref.table().to_string()).or_insert(bytes);
+            } else if let Some(ftp) = provider.downcast_ref::<FlattenTableProvider>() {
+                let (flatten_bytes, input_bytes) =
+                    self.flatten_payload(ftp, gateway.as_deref()).await?;
+                map.insert(table_ref.to_string(), flatten_bytes);
+                if let Some((key, bytes)) = input_bytes {
+                    map.insert(key, bytes);
+                }
+            }
+            // Everything else (external ListingTable scans, memory tables,
+            // values) delegates to the Ballista codec at encode time.
+        }
+        Ok(map)
+    }
+
+    /// Builds the self-contained payload for a managed-Iceberg scan: the
+    /// table's snapshot metadata plus its volume's storage config.
+    async fn managed_iceberg_payload(
+        &self,
+        dft: &DataFusionTable,
+        table_ref: &TableReference,
+        gateway: Option<&str>,
+    ) -> std::result::Result<ManagedIcebergPayload, DataFusionError> {
+        if dft.config.is_some() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "table '{table_ref}' carries session-local scan config (e.g. \
+                 write-buffer overlays or metadata columns) and is not supported in \
+                 distributed execution yet"
+            )));
+        }
+        let tabular = match dft.tabular.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                return Err(DataFusionError::Internal(
+                    "managed table provider lock poisoned".to_string(),
+                ));
+            }
+        };
+        let Tabular::Table(table) = tabular else {
+            return Err(DataFusionError::NotImplemented(format!(
+                "table '{table_ref}' resolves to an Embucket view or materialized view, \
+                 which is not executed on warehouses yet"
+            )));
+        };
+        let metadata_json = serde_json::to_value(table.metadata()).map_err(|e| {
+            DataFusionError::Internal(format!(
+                "failed to serialize managed table metadata for '{table_ref}': {e}"
+            ))
+        })?;
+        let identifier = table.identifier().clone();
+        let table_name = identifier.name().to_string();
+        let Some(schema_name) = identifier.namespace().first().cloned() else {
+            return Err(DataFusionError::Internal(format!(
+                "managed table '{table_ref}' has an empty iceberg namespace"
+            )));
+        };
+        let database = match table_ref {
+            TableReference::Full { catalog, .. } => catalog.to_string(),
+            _ => self.current_database(),
+        };
+        let ident = MetastoreTableIdent {
+            database,
+            schema: schema_name,
+            table: table_name.clone(),
+        };
+        let volume = self
+            .metastore
+            .volume_for_table(&ident)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "no volume found for managed table '{ident}' while encoding it for \
+                     distributed execution"
+                ))
+            })?;
+        let volume_spec = Self::managed_volume_spec(&volume, &ident, gateway)?;
+        Ok(ManagedIcebergPayload {
+            namespace: identifier.namespace().to_vec(),
+            name: table_name,
+            metadata: metadata_json,
+            snapshot_start: dft.snapshot_range.0,
+            snapshot_end: dft.snapshot_range.1,
+            branch: dft.branch.clone(),
+            volume: volume_spec,
+        })
+    }
+
+    /// Builds the plan payload for a LATERAL FLATTEN scan: either the input
+    /// expression (no table reference) or the full input plan (scan over the
+    /// input table projecting the input expression), mirroring what
+    /// `FlattenExec` builds locally. Returns the FLATTEN payload bytes plus,
+    /// for plan inputs over managed tables, a `(key, bytes)` pair to
+    /// register the input table's payload under its bare name.
+    async fn flatten_payload(
+        &self,
+        ftp: &FlattenTableProvider,
+        gateway: Option<&str>,
+    ) -> std::result::Result<(Vec<u8>, Option<(String, Vec<u8>)>), DataFusionError> {
+        let args = ftp.args.clone();
+        let mode = match args.mode {
+            FlattenMode::Object => "object",
+            FlattenMode::Array => "array",
+            FlattenMode::Both => "both",
+        };
+        let path_dto: Vec<PathTokenDto> = args
+            .path
+            .iter()
+            .map(|token| match token {
+                PathToken::Key(key) => PathTokenDto::Key(key.clone()),
+                PathToken::Index(index) => PathTokenDto::Index(*index),
+            })
+            .collect();
+        let Some(input_ref) = extract_table_ref(&args.input_expr) else {
+            // No table reference: the input is a scalar expression, encoded
+            // directly and evaluated on the executor without catalog access.
+            let codec = avalanche_executor_common::EmbucketLogicalExtensionCodec::new();
+            let node = serialize_expr(&args.input_expr, &codec)?;
+            let payload = FlattenPayload {
+                path: path_dto,
+                is_outer: args.is_outer,
+                is_recursive: args.is_recursive,
+                mode: mode.to_string(),
+                input: FlattenInput::Expr {
+                    proto: node.encode_to_vec(),
+                },
+            };
+            let bytes = avalanche_executor_common::encode_table_payload(
+                &avalanche_executor_common::TablePayload::Flatten(payload),
+            )?;
+            return Ok((bytes, None));
+        };
+        // Resolve the input table through the router session and pre-build
+        // the same input plan `FlattenExec` builds locally.
+        let state = self.session.ctx.state();
+        let input_provider = state
+            .schema_for_ref(input_ref.clone())?
+            .table(input_ref.table())
+            .await?
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "LATERAL FLATTEN input table '{input_ref}' not found while encoding \
+                     the plan for distributed execution"
+                ))
+            })?;
+        let mut codec_tables: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut input_provider_ref = input_provider.clone();
+        for _ in 0..4 {
+            let Some(caching) = input_provider_ref.downcast_ref::<CachingTable>() else {
+                break;
+            };
+            input_provider_ref = Arc::clone(&caching.table);
+        }
+        if let Some(dft) = input_provider_ref.downcast_ref::<DataFusionTable>() {
+            let payload = self
+                .managed_iceberg_payload(dft, &input_ref, gateway)
+                .await?;
+            let bytes = avalanche_executor_common::encode_table_payload(
+                &avalanche_executor_common::TablePayload::ManagedIceberg(payload),
+            )?;
+            codec_tables.insert(input_ref.table().to_string(), bytes);
+        }
+        let codec = avalanche_executor_common::EmbucketLogicalExtensionCodec::with_encoded_tables(
+            codec_tables,
+        );
+        let plan = LogicalPlanBuilder::scan(
+            input_ref.table(),
+            provider_as_source(input_provider),
+            None,
+        )?
+        .project(vec![args.input_expr.clone().alias("input")])?
+        .build()?;
+        let node = LogicalPlanNode::try_from_logical_plan(&plan, &codec)?;
+        let mut proto = Vec::new();
+        node.try_encode(&mut proto)?;
+        let payload = FlattenPayload {
+            path: path_dto,
+            is_outer: args.is_outer,
+            is_recursive: args.is_recursive,
+            mode: mode.to_string(),
+            input: FlattenInput::Plan { proto },
+        };
+        let bytes = avalanche_executor_common::encode_table_payload(
+            &avalanche_executor_common::TablePayload::Flatten(payload),
+        )?;
+        Ok((bytes, None))
+    }
+
+    /// Rewrites a host-dialing (`127.0.0.1`/`localhost`) URL to the docker
+/// bridge gateway so warehouse containers can reach host services. URLs
+/// that do not dial host loopback pass through unchanged.
+fn rewrite_localhost_url(url: &str, gateway: Option<&str>) -> String {
+    let Some(gateway) = gateway else {
+        return url.to_string();
+    };
+    let Ok(parsed) = Url::parse(url) else {
+        return url.to_string();
+    };
+    let is_loopback = matches!(
+        parsed.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    );
+    if !is_loopback {
+        return url.to_string();
+    }
+    match parsed.port() {
+        Some(port) => format!(
+            "{}://{gateway}:{port}{}",
+            parsed.scheme(),
+            parsed.path()
+        ),
+        None => format!("{}://{gateway}{}", parsed.scheme(), parsed.path()),
+    }
+}
+
+/// Extracts the volume's storage config for a managed table payload.
+    fn managed_volume_spec(
+        volume: &RwObject<Volume>,
+        ident: &MetastoreTableIdent,
+        gateway: Option<&str>,
+    ) -> std::result::Result<ManagedVolumeSpec, DataFusionError> {
+        match &volume.data.volume {
+            VolumeType::S3(s3) => {
+                let (access_key_id, secret_access_key, session_token) = match &s3.credentials {
+                    Some(AwsCredentials::AccessKey(creds)) => (
+                        Some(creds.aws_access_key_id.clone()),
+                        Some(creds.aws_secret_access_key.clone()),
+                        creds.aws_session_token.clone(),
+                    ),
+                    Some(AwsCredentials::Token(token)) => (None, None, Some(token.clone())),
+                    None => (None, None, None),
+                };
+                Ok(ManagedVolumeSpec::S3 {
+                    region: s3.region.clone(),
+                    bucket: s3.bucket.clone().ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "volume for managed table '{ident}' has no bucket configured"
+                        ))
+                    })?,
+                    endpoint: s3
+                        .endpoint
+                        .as_ref()
+                        .map(|endpoint| Self::rewrite_localhost_url(endpoint, gateway)),
+                    access_key_id,
+                    secret_access_key,
+                    session_token,
+                    allow_http: s3
+                        .endpoint
+                        .as_ref()
+                        .is_some_and(|endpoint| endpoint.starts_with("http:")),
+                })
+            }
+            VolumeType::File(file) => Ok(ManagedVolumeSpec::File {
+                path: file.path.clone(),
+            }),
+            VolumeType::Memory => Err(DataFusionError::NotImplemented(format!(
+                "managed table '{ident}' is stored on an in-memory volume, whose data \
+                 lives only in this process and cannot be read on warehouse executors; \
+                 use an external-volume database for distributed queries"
+            ))),
+            VolumeType::S3Tables(_) => Err(DataFusionError::NotImplemented(format!(
+                "managed table '{ident}' is stored on an S3 Tables volume, which is not \
+                 supported for distributed execution yet"
+            ))),
+        }
+    }
+
     /// Distributed path (design §6.3): upgrade the Embucket session state for
     /// Ballista (Embucket codecs attached, BallistaQueryPlanner installed) and
     /// run the plan through it. The planner's `create_physical_plan` returns a
     /// `DistributedQueryExec`, whose `execute` submits the job to the
     /// warehouse scheduler and streams partitions back from the cluster.
+    ///
+    /// `encoded_tables` carries the router-collected payloads for managed
+    /// Iceberg scans and LATERAL FLATTEN scans (see
+    /// [`Self::collect_encoded_tables`]); the Ballista planner's table
+    /// serialization consumes them via the query's logical codec.
     async fn _execute_logical_plan_distributed(
         session: Arc<UserSession>,
         plan: LogicalPlan,
         scheduler_url: String,
+        encoded_tables: HashMap<String, Vec<u8>>,
         span: tracing::Span,
     ) -> Result<QueryResult> {
         // One whole-query retry when the scheduler fails the job because
@@ -3033,6 +3372,7 @@ impl UserQuery {
             Arc::clone(&session),
             plan,
             scheduler_url.clone(),
+            encoded_tables.clone(),
             span.clone(),
         )
         .await
@@ -3042,7 +3382,14 @@ impl UserQuery {
                     error = %err,
                     "distributed query failed after executor loss under adaptive planning; retrying once"
                 );
-                Self::run_distributed_once(session, retry_plan.unwrap(), scheduler_url, span).await
+                Self::run_distributed_once(
+                    session,
+                    retry_plan.unwrap(),
+                    scheduler_url,
+                    encoded_tables,
+                    span,
+                )
+                .await
             }
             other => other,
         }
@@ -3052,6 +3399,7 @@ impl UserQuery {
         session: Arc<UserSession>,
         plan: LogicalPlan,
         scheduler_url: String,
+        encoded_tables: HashMap<String, Vec<u8>>,
         span: tracing::Span,
     ) -> Result<QueryResult> {
         let fallback_schema = plan.schema().as_arrow().clone();
@@ -3076,9 +3424,10 @@ impl UserQuery {
             })
             .context(ex_error::DataFusionSnafu)?
             .data;
-        let state = avalanche_executor_common::upgrade_session_for_warehouse(
+        let state = avalanche_executor_common::upgrade_session_for_warehouse_with_codec(
             session.ctx.state().clone(),
             scheduler_url,
+            avalanche_executor_common::logical_codec_with_encoded_tables(encoded_tables),
         )
         .context(ex_error::DataFusionSnafu)?;
         let ctx = SessionContext::new_with_state(state);
@@ -3162,6 +3511,14 @@ impl UserQuery {
         plan: LogicalPlan,
         scheduler_url: String,
     ) -> Result<QueryResult> {
+        // Collect self-contained payloads for managed-Iceberg scans and
+        // LATERAL FLATTEN scans before the plan ships to the warehouse
+        // cluster (design §6.3): executors rebuild them from the payloads
+        // without metastore or session-catalog access.
+        let encoded_tables = self
+            .collect_encoded_tables(&plan)
+            .await
+            .context(ex_error::DataFusionSnafu)?;
         let session = self.session.clone();
         let span = tracing::debug_span!("UserQuery::execute_logical_plan_distributed");
 
@@ -3171,14 +3528,27 @@ impl UserQuery {
                     .session
                     .executor
                     .spawn(async move {
-                        Self::_execute_logical_plan_distributed(session, plan, scheduler_url, span)
-                            .await
+                        Self::_execute_logical_plan_distributed(
+                            session,
+                            plan,
+                            scheduler_url,
+                            encoded_tables,
+                            span,
+                        )
+                        .await
                     })
                     .await
                     .context(ex_error::JobSnafu)??;
                 Ok(stream)
             } else {
-                Self::_execute_logical_plan_distributed(session, plan, scheduler_url, span).await
+                Self::_execute_logical_plan_distributed(
+                    session,
+                    plan,
+                    scheduler_url,
+                    encoded_tables,
+                    span,
+                )
+                .await
             }
         }
     }

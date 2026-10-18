@@ -22,7 +22,8 @@ use avalanche_account::SessionAuthz;
 use crate::account_usage::{
     GrantsToRolesTableFunc, GrantsToUsersTableFunc, LoginHistoryTableFunc, QueryHistoryTableFunc,
 };
-use catalog::catalog_list::{DEFAULT_CATALOG, EmbucketCatalogList};
+use catalog::account_catalog::IntoAccountCatalogList;
+use catalog::catalog_list::DEFAULT_CATALOG;
 use catalog_metastore::Metastore;
 use datafusion::catalog::CatalogProviderList;
 #[cfg(feature = "state-store")]
@@ -123,7 +124,7 @@ impl UserSession {
         metastore: Arc<dyn Metastore>,
         running_queries: Arc<dyn RunningQueries>,
         config: Arc<Config>,
-        catalog_list: Arc<EmbucketCatalogList>,
+        catalog_list: impl IntoAccountCatalogList,
         runtime_env: Arc<RuntimeEnv>,
         session_id: &str,
         metadata: SessionMetadata,
@@ -154,6 +155,7 @@ impl UserSession {
         // enforcement. Only sessions whose login maps to a known account
         // user get an authorization context; others (internal machinery)
         // keep the bare catalog list.
+        let catalog_list = catalog_list.into_account_catalog_list();
         let bare_catalog_list = Arc::clone(&catalog_list);
         let authz = match account.as_ref() {
             Some(store) => {

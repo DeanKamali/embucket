@@ -23,7 +23,7 @@
 use crate::error::{self as ex_error, Error, Result};
 use crate::session::UserSession;
 use catalog::catalog::CatalogConfig;
-use catalog::catalog_list::EmbucketCatalogList;
+use catalog::account_catalog::AccountCatalogList;
 use catalog::catalogs::embucket::iceberg_catalog::EmbucketIcebergCatalog;
 use catalog_metastore::models::{TableFormat, TableIdent};
 use catalog_metastore::Metastore;
@@ -382,14 +382,14 @@ pub(crate) fn resolve_snapshot(metadata: &TableMetadata, point_ms: i64) -> Optio
 }
 
 /// Get (or lazily create) the process-wide temp schema `__tt.__s`.
-fn temp_schema(list: &EmbucketCatalogList) -> Result<&'static Arc<MemorySchemaProvider>> {
+fn temp_schema(list: &AccountCatalogList) -> Result<&'static Arc<MemorySchemaProvider>> {
     let provider = TT_SCHEMA_PROVIDER.get_or_init(|| Arc::new(MemorySchemaProvider::default()));
     if list.catalog(TT_CATALOG).is_none() {
         let catalog = MemoryCatalogProvider::new();
         catalog
             .register_schema(TT_SCHEMA, Arc::clone(provider) as Arc<dyn SchemaProvider>)
             .map_err(|e| external_error("time travel", e))?;
-        <EmbucketCatalogList as CatalogProviderList>::register_catalog(
+        <AccountCatalogList as CatalogProviderList>::register_catalog(
             list,
             TT_CATALOG.to_string(),
             Arc::new(catalog),
@@ -528,9 +528,9 @@ pub async fn rewrite(raw: &mut String, session: &UserSession) -> Result<()> {
     let catalog_list: Arc<dyn CatalogProviderList> =
         Arc::clone(session.ctx.state().catalog_list());
     let list = crate::share_catalog::ShareCatalogList::unwrap_bare(&catalog_list).ok_or_else(|| {
-        external_error("time travel", "catalog list is not EmbucketCatalogList")
+        external_error("time travel", "catalog list is not an AccountCatalogList")
     })?;
-    let config: CatalogConfig = list.config.clone().into();
+    let config: CatalogConfig = list.shared_list().config.clone().into();
     let schema = temp_schema(&list)?;
 
     let mut replacements = Vec::with_capacity(plans.len());

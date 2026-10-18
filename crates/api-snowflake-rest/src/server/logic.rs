@@ -32,6 +32,8 @@ async fn record_login(
     let event = LoginEvent {
         timestamp_ms: current_epoch_ms(),
         sequence: 0,
+        // The store stamps the session's account (M15.4) on record.
+        account: String::new(),
         user_name: login_name.to_string(),
         client_app_id,
         client_ip,
@@ -72,35 +74,65 @@ pub async fn handle_login_request(
     // Account-plane login (design §17, M10): the account store is the primary
     // credential source when configured; the static demo credentials remain
     // the fallback for deployments without an account store.
-    match &state.config.account {
-        Some(store) => match store.authenticate(&login_name, &password).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                // LOGIN_HISTORY (M17.1): failed attempts are recorded too.
-                record_login(
-                    store,
-                    &login_name,
-                    Some(client_app_id.clone()),
-                    client_ip.clone(),
-                    false,
-                )
-                .await;
-                return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+    // M15.4 (design §21.4): `ACCOUNT_NAME` routes the login to that
+    // account's scoped store; an unknown account fails like bad
+    // credentials. Empty `ACCOUNT_NAME` = the built-in default account.
+    let session_store: Option<Arc<dyn avalanche_account::store::AccountStore>> =
+        match &state.config.account {
+            Some(store) => {
+                let scoped = if account_name.is_empty() {
+                    Some(Arc::clone(store))
+                } else {
+                    match Arc::clone(store).account_scope(&account_name).await {
+                        Ok(Some(s)) => Some(s),
+                        Ok(None) => None,
+                        Err(e) => {
+                            tracing::error!(error = %e, "account scope resolution failed");
+                            None
+                        }
+                    }
+                };
+                let Some(scoped) = scoped else {
+                    record_login(
+                        store,
+                        &login_name,
+                        Some(client_app_id.clone()),
+                        client_ip.clone(),
+                        false,
+                    )
+                    .await;
+                    return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+                };
+                match scoped.authenticate(&login_name, &password).await {
+                    Ok(Some(_)) => Some(scoped),
+                    Ok(None) => {
+                        // LOGIN_HISTORY (M17.1): failed attempts are recorded too.
+                        record_login(
+                            &scoped,
+                            &login_name,
+                            Some(client_app_id.clone()),
+                            client_ip.clone(),
+                            false,
+                        )
+                        .await;
+                        return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "account store authentication failed");
+                        return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!(error = %e, "account store authentication failed");
-                return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+            None => {
+                if login_name != *state.config.auth.demo_user
+                    || password != *state.config.auth.demo_password
+                {
+                    return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
+                }
+                None
             }
-        },
-        None => {
-            if login_name != *state.config.auth.demo_user
-                || password != *state.config.auth.demo_password
-            {
-                return api_snowflake_rest_error::InvalidAuthDataSnafu.fail();
-            }
-        }
-    }
-    if let Some(store) = &state.config.account {
+        };
+    if let Some(store) = &session_store {
         record_login(store, &login_name, Some(client_app_id.clone()), client_ip.clone(), true).await;
     }
 

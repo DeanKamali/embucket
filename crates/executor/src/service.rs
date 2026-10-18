@@ -27,7 +27,6 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 
 use super::error::{self as ex_error, Result};
-#[cfg(feature = "state-store")]
 use super::models::SessionMetadataAttr;
 use super::models::{QueryContext, QueryResult, SessionMetadata};
 use super::running_queries::{RunningQueries, RunningQueriesRegistry, RunningQuery};
@@ -42,8 +41,11 @@ use avalanche_account::store::AccountStore;
 use avalanche_warehouse::{
     BallistaImages, ContainerDriver, DockerCliDriver, FakeDriver, KubectlDriver, WarehouseManager,
 };
+use catalog::account_catalog::AccountCatalogList;
 use catalog::catalog_list::EmbucketCatalogList;
-use catalog_metastore::{InMemoryMetastore, Metastore, TableIdent as MetastoreTableIdent};
+use catalog_metastore::{
+    AccountedMetastore, InMemoryMetastore, Metastore, TableIdent as MetastoreTableIdent,
+};
 use state_store::StateStore;
 #[cfg(feature = "state-store")]
 use state_store::{PostgresStateStore, models::Query};
@@ -160,6 +162,13 @@ pub trait ExecutionService: Send + Sync {
     ) -> Result<usize>;
 
     async fn timeout_signal(&self, interval: Duration, idle_timeout: Duration) -> ();
+}
+
+/// Account-resolved pieces handed to `UserSession::new` (M15.4).
+struct SessionScope {
+    account_store: Option<Arc<dyn AccountStore>>,
+    metastore: Arc<dyn Metastore>,
+    catalog_list: Arc<AccountCatalogList>,
 }
 
 pub struct CoreExecutionService {
@@ -457,6 +466,69 @@ impl CoreExecutionService {
         Ok(())
     }
 
+    /// M15.4 (design §21.4): resolve a session's account scope from the
+    /// login's `ACCOUNT_NAME` metadata — a scoped account store (grants,
+    /// users and shares stay account-local) plus, for non-default accounts,
+    /// an account-scoped metastore and catalog list so databases are
+    /// namespaced per account. Default/empty accounts get exactly the
+    /// service's shared pieces. Unknown accounts reject the session (login
+    /// already validated them; this catches stale rehydrations and internal
+    /// calls).
+    async fn resolve_session_scope(&self, metadata: &SessionMetadata) -> Result<SessionScope> {
+        let acct = metadata
+            .attr(SessionMetadataAttr::AccountName)
+            .unwrap_or_default();
+        if acct.is_empty() || acct.eq_ignore_ascii_case(avalanche_account::models::DEFAULT_ACCOUNT)
+        {
+            return Ok(SessionScope {
+                account_store: self.account.clone(),
+                metastore: self.metastore.clone(),
+                catalog_list: AccountCatalogList::shared(self.catalog_list.clone()),
+            });
+        }
+        // Account names are case-insensitive (the account store lowercases
+        // them); tenancy prefixes must agree.
+        let acct = acct.to_ascii_lowercase();
+        let account_store: Option<Arc<dyn AccountStore>> = match self.account.as_ref() {
+            Some(raw) => match Arc::clone(raw).account_scope(&acct).await {
+                Ok(Some(s)) => Some(s),
+                Ok(None) => {
+                    return Err(crate::error::Error::DataFusion {
+                        error: Box::new(datafusion::common::DataFusionError::External(
+                            format!("account: account '{acct}' does not exist").into(),
+                        )),
+                        location: snafu::Location::default(),
+                    });
+                }
+                Err(e) => {
+                    return Err(crate::error::Error::DataFusion {
+                        error: Box::new(datafusion::common::DataFusionError::External(
+                            format!("account: scope lookup failed: {e}").into(),
+                        )),
+                        location: snafu::Location::default(),
+                    });
+                }
+            },
+            None => None,
+        };
+        let metastore: Arc<dyn Metastore> =
+            Arc::new(AccountedMetastore::new(self.metastore.clone(), &acct));
+        let catalog_list =
+            AccountCatalogList::for_account(&acct, self.catalog_list.clone(), self.metastore.clone())
+                .await
+                .map_err(|e| crate::error::Error::DataFusion {
+                    error: Box::new(datafusion::common::DataFusionError::External(
+                        format!("account: catalog scope build failed: {e}").into(),
+                    )),
+                    location: snafu::Location::default(),
+                })?;
+        Ok(SessionScope {
+            account_store,
+            metastore,
+            catalog_list,
+        })
+    }
+
     /// Recreates a `UserSession` from its persisted record, restoring session
     /// parameters and login context. Returns `Ok(false)` when no live record
     /// exists; stale (expired) records are cleaned up.
@@ -483,18 +555,19 @@ impl CoreExecutionService {
 
         tracing::info!(session_id, "Rehydrating session from state store");
         let metadata = SessionMetadata::from_map(record.metadata.clone());
+        let scope = self.resolve_session_scope(&metadata).await?;
         let user_session: Arc<UserSession> = Arc::new(
             UserSession::new(
-                self.metastore.clone(),
+                scope.metastore,
                 self.queries.clone(),
                 self.config.clone(),
-                self.catalog_list.clone(),
+                scope.catalog_list,
                 self.runtime_env.clone(),
                 session_id,
                 metadata,
                 self.state_store.clone(),
                 self.warehouse.clone(),
-                self.account.clone(),
+                scope.account_store,
             )
             .await?,
         );
@@ -541,19 +614,20 @@ impl ExecutionService for CoreExecutionService {
             }
         }
         let metadata = metadata.unwrap_or_default();
+        let scope = self.resolve_session_scope(&metadata).await?;
         let user_session: Arc<UserSession> = Arc::new(
             UserSession::new(
-                self.metastore.clone(),
+                scope.metastore,
                 self.queries.clone(),
                 self.config.clone(),
-                self.catalog_list.clone(),
+                scope.catalog_list,
                 self.runtime_env.clone(),
                 session_id,
                 metadata.clone(),
                 #[cfg(feature = "state-store")]
                 self.state_store.clone(),
                 self.warehouse.clone(),
-                self.account.clone(),
+                scope.account_store,
             )
             .await?,
         );

@@ -263,6 +263,7 @@ impl MetastoreBootstrapConfig {
                         volume: volume.to_string(),
                         properties: None,
                         should_refresh,
+                        account: crate::DEFAULT_DATABASE_ACCOUNT.to_string(),
                     },
                 )
                 .await

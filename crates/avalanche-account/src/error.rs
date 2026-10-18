@@ -47,6 +47,20 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Account {account} already exists"))]
+    AccountAlreadyExists {
+        account: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("Account {account} does not exist"))]
+    AccountNotFound {
+        account: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("{message}"))]
     GrantNotFound {
         message: String,
@@ -85,5 +99,15 @@ impl Error {
     #[must_use]
     pub fn is_share_already_exists(&self) -> bool {
         matches!(self, Self::ShareAlreadyExists { .. })
+    }
+
+    #[must_use]
+    pub fn is_account_already_exists(&self) -> bool {
+        matches!(self, Self::AccountAlreadyExists { .. })
+    }
+
+    #[must_use]
+    pub fn is_account_not_found(&self) -> bool {
+        matches!(self, Self::AccountNotFound { .. })
     }
 }

@@ -1,13 +1,18 @@
 //! Account store (design §17, M10.1): users, roles, grants.
 //!
-//! `InMemoryAccountStore` keeps process-lifetime state; with a journal
-//! (M17.3.1, design §23) it is also durable — every mutation is mirrored
-//! write-through and bootstrap replays the journal.
+//! M15.4 multi-account tenancy (design §21.4): every record belongs to an
+//! [`Account`](crate::models::Account). The raw store operates on the
+//! built-in [`crate::models::DEFAULT_ACCOUNT`] (back-compat with pre-M15.4
+//! journals); sessions use a [`ScopedAccountStore`] view that stamps and
+//! filters by the session's account. `InMemoryAccountStore` keeps
+//! process-lifetime state; with a journal (M17.3.1) it is also durable —
+//! every mutation is mirrored write-through and bootstrap replays the
+//! journal.
 
 use crate::error::{self as account_error, Result};
 use crate::models::{
-    AccountObject, Grant, LoginEvent, Privilege, Role, RoleRole, Share, ShareGrant, User, UserRole,
-    ACCOUNTADMIN,
+    Account, AccountObject, Grant, LoginEvent, Privilege, Role, RoleRole, Share, ShareGrant, User,
+    UserRole, ACCOUNTADMIN, DEFAULT_ACCOUNT,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -122,6 +127,27 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
     async fn revoke_from_share(&self, grant: &ShareGrant) -> Result<()>;
     async fn share_grants(&self, share: &str) -> Result<Vec<ShareGrant>>;
 
+    /// Accounts (M15.4, design §21.4): org-level CRUD. Creating an account
+    /// seeds its `ACCOUNTADMIN` role and the initial admin user
+    /// (`ADMIN_NAME`/`ADMIN_PASSWORD`); dropping one cascades every record
+    /// it owns. The built-in default account cannot be dropped.
+    async fn create_account(
+        &self,
+        name: &str,
+        admin_name: &str,
+        admin_password: &str,
+    ) -> Result<Account>;
+    async fn drop_account(&self, name: &str) -> Result<()>;
+    async fn list_accounts(&self) -> Result<Vec<Account>>;
+    async fn get_account(&self, name: &str) -> Result<Option<Account>>;
+
+    /// A session-scoped view of `account` (M15.4): users, roles, grants,
+    /// shares and logins are stamped with and filtered by the account.
+    /// `None` when the account does not exist. Org-level operations
+    /// (account CRUD) still pass through. Sessions must never see records
+    /// of another account through this view.
+    async fn account_scope(self: Arc<Self>, account: &str) -> Result<Option<Arc<dyn AccountStore>>>;
+
     /// Verify login credentials. `Ok(None)` = unknown login or wrong
     /// password (indistinguishable, no existence leak); `Err` is reserved
     /// for store failures. Disabled users also return `Ok(None)`.
@@ -143,6 +169,10 @@ pub trait AccountStore: std::fmt::Debug + Send + Sync {
 
 #[derive(Debug, Default)]
 struct StoreState {
+    /// Top-level accounts (M15.4), keyed by lowercase name. The default
+    /// account is implicit — it exists even with no record (pre-M15.4
+    /// deployments carry none).
+    accounts: HashMap<String, Account>,
     users: HashMap<String, User>,
     roles: HashMap<String, Role>,
     grants: Vec<Grant>,
@@ -153,16 +183,26 @@ struct StoreState {
     logins: Vec<LoginEvent>,
 }
 
-/// In-memory [`AccountStore`].
+/// In-memory [`AccountStore`] over the default account (raw, org-level
+/// view). Sessions receive [`ScopedAccountStore`] views instead.
 #[derive(Debug, Default)]
 pub struct InMemoryAccountStore {
-    state: RwLock<StoreState>,
+    state: Arc<RwLock<StoreState>>,
     /// Write-through journal (M17.3.1): every mutation is mirrored to the
     /// durable backend before the in-memory state changes; `None` for the
     /// plain process-lifetime store.
     journal: Option<Arc<dyn crate::journal::AccountJournal>>,
     /// Insertion sequence for login events (stable journal keys + ordering).
-    login_seq: AtomicU64,
+    login_seq: Arc<AtomicU64>,
+}
+
+/// A session-scoped [`AccountStore`] view of one account (M15.4, design
+/// §21.4). Reads filter to the account; writes stamp it. Org-level account
+/// CRUD passes through to the raw store.
+#[derive(Debug, Clone)]
+pub struct ScopedAccountStore {
+    inner: Arc<InMemoryAccountStore>,
+    account: String,
 }
 
 impl InMemoryAccountStore {
@@ -198,11 +238,14 @@ impl InMemoryAccountStore {
                         .build()
                     })?;
                 match record {
+                    crate::journal::AccountRecord::Account(a) => {
+                        state.accounts.insert(key(&a.name), a);
+                    }
                     crate::journal::AccountRecord::User(u) => {
-                        state.users.insert(key(&u.name), u);
+                        state.users.insert(akey(&u.account, &u.name), u);
                     }
                     crate::journal::AccountRecord::Role(r) => {
-                        state.roles.insert(key(&r.name), r);
+                        state.roles.insert(akey(&r.account, &r.name), r);
                     }
                     crate::journal::AccountRecord::UserRole(ur) => {
                         state.user_roles.push(ur);
@@ -212,7 +255,7 @@ impl InMemoryAccountStore {
                     }
                     crate::journal::AccountRecord::Grant(g) => state.grants.push(g),
                     crate::journal::AccountRecord::Share(s) => {
-                        state.shares.insert(key(&s.name), s);
+                        state.shares.insert(akey(&s.account, &s.name), s);
                     }
                     crate::journal::AccountRecord::ShareGrant(g) => state.share_grants.push(g),
                     crate::journal::AccountRecord::Login(e) => logins.push(e),
@@ -226,10 +269,31 @@ impl InMemoryAccountStore {
         });
         state.logins = logins;
         Ok(Self {
-            state: RwLock::new(state),
+            state: Arc::new(RwLock::new(state)),
             journal: Some(journal),
-            login_seq: AtomicU64::new(0),
+            login_seq: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// A scoped view of one account (M15.4). The default account always
+    /// resolves (pre-M15.4 records are implicitly default-owned); other
+    /// accounts must exist.
+    #[must_use]
+    pub fn scope(self: &Arc<Self>, account: &str) -> Option<ScopedAccountStore> {
+        let exists = account.eq_ignore_ascii_case(DEFAULT_ACCOUNT)
+            || try_lock_read_noio(&self.state)
+                .map(|s| s.accounts.contains_key(&key(account)))
+                .unwrap_or(false);
+        // Fall back to an async check when the lock is contended (the
+        // sync fast path is only an optimization).
+        if exists {
+            Some(ScopedAccountStore {
+                inner: Arc::clone(self),
+                account: account.to_string(),
+            })
+        } else {
+            None
+        }
     }
 
     /// Idempotently seed the built-in `ACCOUNTADMIN` role and a member user
@@ -249,6 +313,7 @@ impl InMemoryAccountStore {
             self.create_role(ACCOUNTADMIN).await?;
         }
         self.create_user(User {
+            account: DEFAULT_ACCOUNT.to_string(),
             name: name.to_string(),
             login_name: name.to_string(),
             password: password.to_string(),
@@ -304,9 +369,11 @@ impl InMemoryAccountStore {
     #[must_use]
     pub fn with_admin(self, name: &str, password: &str) -> Self {
         let role = Role {
+            account: DEFAULT_ACCOUNT.to_string(),
             name: ACCOUNTADMIN.to_string(),
         };
         let user = User {
+            account: DEFAULT_ACCOUNT.to_string(),
             name: name.to_string(),
             login_name: name.to_string(),
             password: password.to_string(),
@@ -315,45 +382,44 @@ impl InMemoryAccountStore {
             disabled: false,
         };
         let mut state = StoreState::default();
-        state.roles.insert(role.name.to_ascii_lowercase(), role);
-        state.users.insert(user.name.to_ascii_lowercase(), user);
+        state.roles.insert(akey(&role.account, &role.name), role);
+        state.users.insert(akey(&user.account, &user.name), user);
         state.user_roles.push(UserRole {
+            account: DEFAULT_ACCOUNT.to_string(),
             user: name.to_string(),
             role: ACCOUNTADMIN.to_string(),
         });
         Self {
-            state: RwLock::new(state),
+            state: Arc::new(RwLock::new(state)),
             journal: None,
-            login_seq: AtomicU64::new(0),
+            login_seq: Arc::new(AtomicU64::new(0)),
         }
     }
-}
 
-fn key(name: &str) -> String {
-    name.to_ascii_lowercase()
-}
+    // ================= per-account core (M15.4) =================
+    // Each operation takes the owning account explicitly; the raw trait
+    // impl passes DEFAULT_ACCOUNT and ScopedAccountStore passes its own.
 
-#[async_trait]
-impl AccountStore for InMemoryAccountStore {
-    async fn create_role(&self, name: &str) -> Result<Role> {
+    async fn create_role_in(&self, account: &str, name: &str) -> Result<Role> {
         bump_account_epoch();
         let mut state = self.state.write().await;
         let role = Role {
+            account: account.to_string(),
             name: name.to_string(),
         };
-        if state.roles.contains_key(&key(name)) {
+        if state.roles.contains_key(&akey(account, name)) {
             return account_error::RoleAlreadyExistsSnafu { role: name.to_string() }.fail();
         }
-        state.roles.insert(key(name), role.clone());
+        state.roles.insert(akey(account, name), role.clone());
         self.journal_put(&crate::journal::AccountRecord::Role(role.clone()))
             .await?;
         Ok(role)
     }
 
-    async fn drop_role(&self, name: &str) -> Result<()> {
+    async fn drop_role_in(&self, account: &str, name: &str) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
-        if state.roles.remove(&key(name)).is_none() {
+        if state.roles.remove(&akey(account, name)).is_none() {
             return account_error::RoleNotFoundSnafu { role: name.to_string() }.fail();
         }
         // Journal the cascades before mutating (keys computed from the
@@ -361,12 +427,14 @@ impl AccountStore for InMemoryAccountStore {
         let removed_grants: Vec<Grant> = state
             .grants
             .iter()
+            .filter(|g| g.account.eq_ignore_ascii_case(account))
             .filter(|g| key(&g.role).eq_ignore_ascii_case(&key(name)))
             .cloned()
             .collect();
         let removed_links: Vec<UserRole> = state
             .user_roles
             .iter()
+            .filter(|ur| ur.account.eq_ignore_ascii_case(account))
             .filter(|ur| key(&ur.role).eq_ignore_ascii_case(&key(name)))
             .cloned()
             .collect();
@@ -374,6 +442,7 @@ impl AccountStore for InMemoryAccountStore {
         let removed_role_links: Vec<RoleRole> = state
             .role_roles
             .iter()
+            .filter(|rr| rr.account.eq_ignore_ascii_case(account))
             .filter(|rr| key(&rr.child) == key(name) || key(&rr.parent) == key(name))
             .cloned()
             .collect();
@@ -390,50 +459,64 @@ impl AccountStore for InMemoryAccountStore {
                 .await?;
         }
         self.journal_delete(&crate::journal::AccountRecord::Role(Role {
+            account: account.to_string(),
             name: name.to_string(),
         }))
         .await?;
-        state.grants.retain(|g| !key(&g.role).eq_ignore_ascii_case(&key(name)));
-        state
-            .user_roles
-            .retain(|ur| !key(&ur.role).eq_ignore_ascii_case(&key(name)));
-        state
-            .role_roles
-            .retain(|rr| !(key(&rr.child) == key(name) || key(&rr.parent) == key(name)));
+        state.grants.retain(|g| {
+            !(g.account.eq_ignore_ascii_case(account)
+                && key(&g.role).eq_ignore_ascii_case(&key(name)))
+        });
+        state.user_roles.retain(|ur| {
+            !(ur.account.eq_ignore_ascii_case(account)
+                && key(&ur.role).eq_ignore_ascii_case(&key(name)))
+        });
+        state.role_roles.retain(|rr| {
+            !(rr.account.eq_ignore_ascii_case(account)
+                && (key(&rr.child) == key(name) || key(&rr.parent) == key(name)))
+        });
         Ok(())
     }
 
-    async fn get_role(&self, name: &str) -> Result<Option<Role>> {
+    async fn get_role_in(&self, account: &str, name: &str) -> Result<Option<Role>> {
         let state = self.state.read().await;
-        Ok(state.roles.get(&key(name)).cloned())
+        Ok(state.roles.get(&akey(account, name)).cloned())
     }
 
-    async fn list_roles(&self) -> Result<Vec<Role>> {
+    async fn list_roles_in(&self, account: &str) -> Result<Vec<Role>> {
         let state = self.state.read().await;
-        Ok(state.roles.values().cloned().collect())
+        Ok(state
+            .roles
+            .values()
+            .filter(|r| r.account.eq_ignore_ascii_case(account))
+            .cloned()
+            .collect())
     }
 
-    async fn create_user(&self, user: User) -> Result<User> {
+    async fn create_user_in(&self, account: &str, user: User) -> Result<User> {
         bump_account_epoch();
+        let mut user = user;
+        user.account = account.to_string();
         let mut state = self.state.write().await;
-        if state.users.contains_key(&key(&user.name)) {
+        if state.users.contains_key(&akey(account, &user.name)) {
             return account_error::UserAlreadyExistsSnafu { user: user.name.clone() }.fail();
         }
-        state.users.insert(key(&user.name), user.clone());
+        state.users.insert(akey(account, &user.name), user.clone());
         self.journal_put(&crate::journal::AccountRecord::User(user.clone()))
             .await?;
         Ok(user)
     }
 
-    async fn drop_user(&self, name: &str) -> Result<()> {
+    async fn drop_user_in(&self, account: &str, name: &str) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
-        if state.users.remove(&key(name)).is_none() {
+        if state.users.remove(&akey(account, name)).is_none() {
             return account_error::UserNotFoundSnafu { user: name.to_string() }.fail();
         }
         let removed_links: Vec<UserRole> = state
             .user_roles
             .iter()
+            .filter(|ur| ur.account.eq_ignore_ascii_case(account))
             .filter(|ur| key(&ur.user).eq_ignore_ascii_case(&key(name)))
             .cloned()
             .collect();
@@ -442,6 +525,7 @@ impl AccountStore for InMemoryAccountStore {
                 .await?;
         }
         self.journal_delete(&crate::journal::AccountRecord::User(User {
+            account: account.to_string(),
             name: name.to_string(),
             login_name: String::new(),
             password: String::new(),
@@ -450,43 +534,52 @@ impl AccountStore for InMemoryAccountStore {
             disabled: false,
         }))
         .await?;
-        state
-            .user_roles
-            .retain(|ur| !key(&ur.user).eq_ignore_ascii_case(&key(name)));
+        state.user_roles.retain(|ur| {
+            !(ur.account.eq_ignore_ascii_case(account)
+                && key(&ur.user).eq_ignore_ascii_case(&key(name)))
+        });
         Ok(())
     }
 
-    async fn get_user(&self, login_name: &str) -> Result<Option<User>> {
+    async fn get_user_in(&self, account: &str, login_name: &str) -> Result<Option<User>> {
         let state = self.state.read().await;
         Ok(state
             .users
             .values()
+            .filter(|u| u.account.eq_ignore_ascii_case(account))
             .find(|u| key(&u.login_name) == key(login_name))
             .cloned())
     }
 
-    async fn list_users(&self) -> Result<Vec<User>> {
+    async fn list_users_in(&self, account: &str) -> Result<Vec<User>> {
         let state = self.state.read().await;
-        Ok(state.users.values().cloned().collect())
+        Ok(state
+            .users
+            .values()
+            .filter(|u| u.account.eq_ignore_ascii_case(account))
+            .cloned()
+            .collect())
     }
 
-    async fn grant_role_to_user(&self, user: &str, role: &str) -> Result<()> {
+    async fn grant_role_to_user_in(&self, account: &str, user: &str, role: &str) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
-        if !state.users.contains_key(&key(user)) {
+        if !state.users.contains_key(&akey(account, user)) {
             return account_error::UserNotFoundSnafu { user: user.to_string() }.fail();
         }
-        if !state.roles.contains_key(&key(role)) {
+        if !state.roles.contains_key(&akey(account, role)) {
             return account_error::RoleNotFoundSnafu { role: role.to_string() }.fail();
         }
         let link = UserRole {
+            account: account.to_string(),
             user: user.to_string(),
             role: role.to_string(),
         };
-        let exists = state
-            .user_roles
-            .iter()
-            .any(|ur| key(&ur.user) == key(user) && key(&ur.role) == key(role));
+        let exists = state.user_roles.iter().any(|ur| {
+            ur.account.eq_ignore_ascii_case(account)
+                && key(&ur.user) == key(user)
+                && key(&ur.role) == key(role)
+        });
         if !exists {
             state.user_roles.push(link.clone());
             self.journal_put(&crate::journal::AccountRecord::UserRole(link))
@@ -495,13 +588,17 @@ impl AccountStore for InMemoryAccountStore {
         Ok(())
     }
 
-    async fn revoke_role_from_user(&self, user: &str, role: &str) -> Result<()> {
+    async fn revoke_role_from_user_in(&self, account: &str, user: &str, role: &str) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
         let removed: Vec<UserRole> = state
             .user_roles
             .iter()
-            .filter(|ur| key(&ur.user) == key(user) && key(&ur.role) == key(role))
+            .filter(|ur| {
+                ur.account.eq_ignore_ascii_case(account)
+                    && key(&ur.user) == key(user)
+                    && key(&ur.role) == key(role)
+            })
             .cloned()
             .collect();
         if removed.is_empty() {
@@ -514,29 +611,31 @@ impl AccountStore for InMemoryAccountStore {
             self.journal_delete(&crate::journal::AccountRecord::UserRole(ur.clone()))
                 .await?;
         }
-        state
-            .user_roles
-            .retain(|ur| !(key(&ur.user) == key(user) && key(&ur.role) == key(role)));
+        state.user_roles.retain(|ur| {
+            !(ur.account.eq_ignore_ascii_case(account)
+                && key(&ur.user) == key(user)
+                && key(&ur.role) == key(role))
+        });
         Ok(())
     }
 
-    async fn user_roles(&self, user: &str) -> Result<Vec<String>> {
+    async fn user_roles_in(&self, account: &str, user: &str) -> Result<Vec<String>> {
         let state = self.state.read().await;
         Ok(state
             .user_roles
             .iter()
-            .filter(|ur| key(&ur.user) == key(user))
+            .filter(|ur| ur.account.eq_ignore_ascii_case(account) && key(&ur.user) == key(user))
             .map(|ur| ur.role.clone())
             .collect())
     }
 
-    async fn grant_role_to_role(&self, child: &str, parent: &str) -> Result<()> {
+    async fn grant_role_to_role_in(&self, account: &str, child: &str, parent: &str) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
-        if !state.roles.contains_key(&key(child)) {
+        if !state.roles.contains_key(&akey(account, child)) {
             return account_error::RoleNotFoundSnafu { role: child.to_string() }.fail();
         }
-        if !state.roles.contains_key(&key(parent)) {
+        if !state.roles.contains_key(&akey(account, parent)) {
             return account_error::RoleNotFoundSnafu { role: parent.to_string() }.fail();
         }
         if key(child) == key(parent) {
@@ -548,7 +647,13 @@ impl AccountStore for InMemoryAccountStore {
         // A cycle forms when `parent` is already (transitively) beneath
         // `child` in the hierarchy: walk the children graph from `child`
         // and look for `parent` (Snowflake rejects circular hierarchies).
-        if role_graph_reachable(&state.role_roles, &key(child), &key(parent)) {
+        let links: Vec<RoleRole> = state
+            .role_roles
+            .iter()
+            .filter(|rr| rr.account.eq_ignore_ascii_case(account))
+            .cloned()
+            .collect();
+        if role_graph_reachable(&links, &key(child), &key(parent)) {
             return account_error::NotAllowedSnafu {
                 message: format!(
                     "circular role hierarchy detected: role '{parent}' \
@@ -558,13 +663,15 @@ impl AccountStore for InMemoryAccountStore {
             .fail();
         }
         let link = RoleRole {
+            account: account.to_string(),
             child: child.to_string(),
             parent: parent.to_string(),
         };
-        let exists = state
-            .role_roles
-            .iter()
-            .any(|rr| key(&rr.child) == key(child) && key(&rr.parent) == key(parent));
+        let exists = state.role_roles.iter().any(|rr| {
+            rr.account.eq_ignore_ascii_case(account)
+                && key(&rr.child) == key(child)
+                && key(&rr.parent) == key(parent)
+        });
         if !exists {
             state.role_roles.push(link.clone());
             self.journal_put(&crate::journal::AccountRecord::RoleRole(link))
@@ -573,13 +680,17 @@ impl AccountStore for InMemoryAccountStore {
         Ok(())
     }
 
-    async fn revoke_role_from_role(&self, child: &str, parent: &str) -> Result<()> {
+    async fn revoke_role_from_role_in(&self, account: &str, child: &str, parent: &str) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
         let removed: Vec<RoleRole> = state
             .role_roles
             .iter()
-            .filter(|rr| key(&rr.child) == key(child) && key(&rr.parent) == key(parent))
+            .filter(|rr| {
+                rr.account.eq_ignore_ascii_case(account)
+                    && key(&rr.child) == key(child)
+                    && key(&rr.parent) == key(parent)
+            })
             .cloned()
             .collect();
         if removed.is_empty() {
@@ -592,32 +703,39 @@ impl AccountStore for InMemoryAccountStore {
             self.journal_delete(&crate::journal::AccountRecord::RoleRole(rr.clone()))
                 .await?;
         }
-        state
-            .role_roles
-            .retain(|rr| !(key(&rr.child) == key(child) && key(&rr.parent) == key(parent)));
+        state.role_roles.retain(|rr| {
+            !(rr.account.eq_ignore_ascii_case(account)
+                && key(&rr.child) == key(child)
+                && key(&rr.parent) == key(parent))
+        });
         Ok(())
     }
 
-    async fn role_children(&self, parent: &str) -> Result<Vec<String>> {
+    async fn role_children_in(&self, account: &str, parent: &str) -> Result<Vec<String>> {
         let state = self.state.read().await;
         Ok(state
             .role_roles
             .iter()
-            .filter(|rr| key(&rr.parent) == key(parent))
+            .filter(|rr| rr.account.eq_ignore_ascii_case(account) && key(&rr.parent) == key(parent))
             .map(|rr| rr.child.clone())
             .collect())
     }
 
-    async fn effective_roles(&self, roles: &[String]) -> Result<Vec<String>> {
+    async fn effective_roles_in(&self, account: &str, roles: &[String]) -> Result<Vec<String>> {
         let state = self.state.read().await;
+        let links: Vec<RoleRole> = state
+            .role_roles
+            .iter()
+            .filter(|rr| rr.account.eq_ignore_ascii_case(account))
+            .cloned()
+            .collect();
         // Resolve a lowercase key back to a display name: prefer the seed
         // (caller) casing, then the stored grant casing, then the key.
         let name_for = |k: &str| -> String {
             if let Some(r) = roles.iter().find(|r| key(r) == k) {
                 return r.clone();
             }
-            state
-                .role_roles
+            links
                 .iter()
                 .find(|rr| key(&rr.child) == k)
                 .map(|rr| rr.child.clone())
@@ -630,7 +748,7 @@ impl AccountStore for InMemoryAccountStore {
                 continue;
             }
             out.push(name_for(&next));
-            for rr in state.role_roles.iter().filter(|rr| key(&rr.parent) == next) {
+            for rr in links.iter().filter(|rr| key(&rr.parent) == next) {
                 let ck = key(&rr.child);
                 if !queue.contains(&ck) && !out.iter().any(|r| key(r) == ck) {
                     queue.push(ck);
@@ -640,17 +758,20 @@ impl AccountStore for InMemoryAccountStore {
         Ok(out)
     }
 
-    async fn grant(&self, grant: Grant) -> Result<()> {
+    async fn grant_in(&self, account: &str, grant: Grant) -> Result<()> {
         bump_account_epoch();
+        let mut grant = grant;
+        grant.account = account.to_string();
         let mut state = self.state.write().await;
-        if !state.roles.contains_key(&key(&grant.role)) {
+        if !state.roles.contains_key(&akey(account, &grant.role)) {
             return account_error::RoleNotFoundSnafu {
                 role: grant.role.clone(),
             }
             .fail();
         }
         let exists = state.grants.iter().any(|g| {
-            key(&g.role) == key(&grant.role)
+            g.account.eq_ignore_ascii_case(account)
+                && key(&g.role) == key(&grant.role)
                 && g.privilege == grant.privilege
                 && g.object == grant.object
         });
@@ -662,14 +783,15 @@ impl AccountStore for InMemoryAccountStore {
         Ok(())
     }
 
-    async fn revoke(&self, grant: &Grant) -> Result<()> {
+    async fn revoke_in(&self, account: &str, grant: &Grant) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
         let removed: Vec<Grant> = state
             .grants
             .iter()
             .filter(|g| {
-                key(&g.role) == key(&grant.role)
+                g.account.eq_ignore_ascii_case(account)
+                    && key(&g.role) == key(&grant.role)
                     && g.privilege == grant.privilege
                     && g.object == grant.object
             })
@@ -689,58 +811,62 @@ impl AccountStore for InMemoryAccountStore {
                 .await?;
         }
         state.grants.retain(|g| {
-            !(key(&g.role) == key(&grant.role)
+            !(g.account.eq_ignore_ascii_case(account)
+                && key(&g.role) == key(&grant.role)
                 && g.privilege == grant.privilege
                 && g.object == grant.object)
         });
         Ok(())
     }
 
-    async fn role_grants(&self, role: &str) -> Result<Vec<Grant>> {
+    async fn role_grants_in(&self, account: &str, role: &str) -> Result<Vec<Grant>> {
         let state = self.state.read().await;
         Ok(state
             .grants
             .iter()
-            .filter(|g| key(&g.role) == key(role))
+            .filter(|g| g.account.eq_ignore_ascii_case(account) && key(&g.role) == key(role))
             .cloned()
             .collect())
     }
 
-    async fn object_grants(&self, object: &AccountObject) -> Result<Vec<Grant>> {
+    async fn object_grants_in(&self, account: &str, object: &AccountObject) -> Result<Vec<Grant>> {
         let state = self.state.read().await;
         Ok(state
             .grants
             .iter()
+            .filter(|g| g.account.eq_ignore_ascii_case(account))
             .filter(|g| grant_covers_object(&g.object, object))
             .cloned()
             .collect())
     }
 
-    async fn share_grants(&self, share: &str) -> Result<Vec<ShareGrant>> {
+    async fn share_grants_in(&self, account: &str, share: &str) -> Result<Vec<ShareGrant>> {
         let state = self.state.read().await;
-        if !state.shares.contains_key(&key(share)) {
+        if !state.shares.contains_key(&akey(account, share)) {
             return account_error::ShareNotFoundSnafu { share: share.to_string() }.fail();
         }
         Ok(state
             .share_grants
             .iter()
-            .filter(|g| key(&g.share) == key(share))
+            .filter(|g| g.account.eq_ignore_ascii_case(account) && key(&g.share) == key(share))
             .cloned()
             .collect())
     }
 
-    async fn authenticate(&self, login_name: &str, password: &str) -> Result<Option<User>> {
+    async fn authenticate_in(&self, account: &str, login_name: &str, password: &str) -> Result<Option<User>> {
         let state = self.state.read().await;
         Ok(state
             .users
             .values()
+            .filter(|u| u.account.eq_ignore_ascii_case(account))
             .find(|u| key(&u.login_name) == key(login_name))
             .filter(|u| !u.disabled && u.password == password)
             .cloned())
     }
 
-    async fn record_login(&self, event: LoginEvent) -> Result<()> {
+    async fn record_login_in(&self, account: &str, event: LoginEvent) -> Result<()> {
         let mut event = event;
+        event.account = account.to_string();
         event.sequence = self.login_seq.fetch_add(1, Ordering::Relaxed);
         self.journal_put(&crate::journal::AccountRecord::Login(event.clone()))
             .await?;
@@ -748,72 +874,84 @@ impl AccountStore for InMemoryAccountStore {
         Ok(())
     }
 
-    async fn list_logins(&self) -> Result<Vec<LoginEvent>> {
+    async fn list_logins_in(&self, account: &str) -> Result<Vec<LoginEvent>> {
         let state = self.state.read().await;
-        Ok(state.logins.clone())
+        Ok(state
+            .logins
+            .iter()
+            .filter(|e| e.account.eq_ignore_ascii_case(account))
+            .cloned()
+            .collect())
     }
 
-    async fn allowed(
+    async fn allowed_in(
         &self,
+        account: &str,
         role: &str,
         privilege: Privilege,
         object: &AccountObject,
     ) -> Result<bool> {
         let state = self.state.read().await;
         Ok(state.grants.iter().any(|g| {
-            key(&g.role) == key(role) && g.privilege == privilege && g.object == *object
+            g.account.eq_ignore_ascii_case(account)
+                && key(&g.role) == key(role)
+                && g.privilege == privilege
+                && g.object == *object
         }))
     }
 
-    async fn create_share(&self, name: &str) -> Result<Share> {
+    async fn create_share_in(&self, account: &str, name: &str) -> Result<Share> {
         bump_account_epoch();
         let mut state = self.state.write().await;
-        if state.shares.contains_key(&key(name)) {
+        if state.shares.contains_key(&akey(account, name)) {
             return account_error::ShareAlreadyExistsSnafu { share: name.to_string() }.fail();
         }
         let share = Share {
+            account: account.to_string(),
             name: name.to_string(),
             kind: crate::models::ShareKind::Outbound,
             provider: None,
         };
-        state.shares.insert(key(name), share.clone());
+        state.shares.insert(akey(account, name), share.clone());
         self.journal_put(&crate::journal::AccountRecord::Share(share.clone()))
             .await?;
         Ok(share)
     }
 
-    async fn create_inbound_share(&self, name: &str, provider: &str) -> Result<Share> {
+    async fn create_inbound_share_in(&self, account: &str, name: &str, provider: &str) -> Result<Share> {
         bump_account_epoch();
         let mut state = self.state.write().await;
-        if state.shares.contains_key(&key(name)) {
+        if state.shares.contains_key(&akey(account, name)) {
             return account_error::ShareAlreadyExistsSnafu { share: name.to_string() }.fail();
         }
-        if !state.shares.contains_key(&key(provider)) {
+        if !state.shares.contains_key(&akey(account, provider)) {
             return account_error::ShareNotFoundSnafu {
                 share: provider.to_string(),
             }
             .fail();
         }
         let share = Share {
+            account: account.to_string(),
             name: name.to_string(),
             kind: crate::models::ShareKind::Inbound,
             provider: Some(provider.to_string()),
         };
-        state.shares.insert(key(name), share.clone());
+        state.shares.insert(akey(account, name), share.clone());
         self.journal_put(&crate::journal::AccountRecord::Share(share.clone()))
             .await?;
         Ok(share)
     }
 
-    async fn drop_share(&self, name: &str) -> Result<()> {
+    async fn drop_share_in(&self, account: &str, name: &str) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
-        if state.shares.remove(&key(name)).is_none() {
+        if state.shares.remove(&akey(account, name)).is_none() {
             return account_error::ShareNotFoundSnafu { share: name.to_string() }.fail();
         }
         let removed: Vec<ShareGrant> = state
             .share_grants
             .iter()
+            .filter(|g| g.account.eq_ignore_ascii_case(account))
             .filter(|g| key(&g.share).eq_ignore_ascii_case(&key(name)))
             .cloned()
             .collect();
@@ -822,38 +960,48 @@ impl AccountStore for InMemoryAccountStore {
                 .await?;
         }
         self.journal_delete(&crate::journal::AccountRecord::Share(Share {
+            account: account.to_string(),
             name: name.to_string(),
             kind: crate::models::ShareKind::Outbound,
             provider: None,
         }))
         .await?;
-        state
-            .share_grants
-            .retain(|g| !key(&g.share).eq_ignore_ascii_case(&key(name)));
+        state.share_grants.retain(|g| {
+            !(g.account.eq_ignore_ascii_case(account)
+                && key(&g.share).eq_ignore_ascii_case(&key(name)))
+        });
         Ok(())
     }
 
-    async fn get_share(&self, name: &str) -> Result<Option<Share>> {
+    async fn get_share_in(&self, account: &str, name: &str) -> Result<Option<Share>> {
         let state = self.state.read().await;
-        Ok(state.shares.get(&key(name)).cloned())
+        Ok(state.shares.get(&akey(account, name)).cloned())
     }
 
-    async fn list_shares(&self) -> Result<Vec<Share>> {
+    async fn list_shares_in(&self, account: &str) -> Result<Vec<Share>> {
         let state = self.state.read().await;
-        Ok(state.shares.values().cloned().collect())
+        Ok(state
+            .shares
+            .values()
+            .filter(|s| s.account.eq_ignore_ascii_case(account))
+            .cloned()
+            .collect())
     }
 
-    async fn grant_to_share(&self, grant: ShareGrant) -> Result<()> {
+    async fn grant_to_share_in(&self, account: &str, grant: ShareGrant) -> Result<()> {
         bump_account_epoch();
+        let mut grant = grant;
+        grant.account = account.to_string();
         let mut state = self.state.write().await;
-        if !state.shares.contains_key(&key(&grant.share)) {
+        if !state.shares.contains_key(&akey(account, &grant.share)) {
             return account_error::ShareNotFoundSnafu {
                 share: grant.share.clone(),
             }
             .fail();
         }
         let exists = state.share_grants.iter().any(|g| {
-            key(&g.share) == key(&grant.share)
+            g.account.eq_ignore_ascii_case(account)
+                && key(&g.share) == key(&grant.share)
                 && g.privilege == grant.privilege
                 && g.object == grant.object
         });
@@ -865,14 +1013,15 @@ impl AccountStore for InMemoryAccountStore {
         Ok(())
     }
 
-    async fn revoke_from_share(&self, grant: &ShareGrant) -> Result<()> {
+    async fn revoke_from_share_in(&self, account: &str, grant: &ShareGrant) -> Result<()> {
         bump_account_epoch();
         let mut state = self.state.write().await;
         let removed: Vec<ShareGrant> = state
             .share_grants
             .iter()
             .filter(|g| {
-                key(&g.share) == key(&grant.share)
+                g.account.eq_ignore_ascii_case(account)
+                    && key(&g.share) == key(&grant.share)
                     && g.privilege == grant.privilege
                     && g.object == grant.object
             })
@@ -892,11 +1041,466 @@ impl AccountStore for InMemoryAccountStore {
                 .await?;
         }
         state.share_grants.retain(|g| {
-            !(key(&g.share) == key(&grant.share)
+            !(g.account.eq_ignore_ascii_case(account)
+                && key(&g.share) == key(&grant.share)
                 && g.privilege == grant.privilege
                 && g.object == grant.object)
         });
         Ok(())
+    }
+
+    // ================= accounts (org-level) =================
+
+    async fn create_account_in(
+        &self,
+        name: &str,
+        admin_name: &str,
+        admin_password: &str,
+    ) -> Result<Account> {
+        bump_account_epoch();
+        {
+            let state = self.state.read().await;
+            if name.eq_ignore_ascii_case(DEFAULT_ACCOUNT) {
+                return account_error::AccountAlreadyExistsSnafu {
+                    account: name.to_string(),
+                }
+                .fail();
+            }
+            if state.accounts.contains_key(&key(name)) {
+                return account_error::AccountAlreadyExistsSnafu {
+                    account: name.to_string(),
+                }
+                .fail();
+            }
+            if admin_name.is_empty() || admin_password.is_empty() {
+                return account_error::NotAllowedSnafu {
+                    message: "CREATE ACCOUNT requires ADMIN_NAME and ADMIN_PASSWORD".to_string(),
+                }
+                .fail();
+            }
+        }
+        let account = Account {
+            name: name.to_string(),
+        };
+        {
+            let mut state = self.state.write().await;
+            state.accounts.insert(key(name), account.clone());
+        }
+        self.journal_put(&crate::journal::AccountRecord::Account(account.clone()))
+            .await?;
+        // Seed the account's ACCOUNTADMIN role + initial admin user
+        // (Snowflake requires ADMIN_NAME/ADMIN_PASSWORD at CREATE ACCOUNT).
+        self.create_role_in(name, ACCOUNTADMIN).await?;
+        self.create_user_in(
+            name,
+            User {
+                account: name.to_string(),
+                name: admin_name.to_string(),
+                login_name: admin_name.to_string(),
+                password: admin_password.to_string(),
+                default_role: Some(ACCOUNTADMIN.to_string()),
+                tenant: None,
+                disabled: false,
+            },
+        )
+        .await?;
+        self.grant_role_to_user_in(name, admin_name, ACCOUNTADMIN)
+            .await?;
+        Ok(account)
+    }
+
+    async fn drop_account_in(&self, name: &str) -> Result<()> {
+        bump_account_epoch();
+        if name.eq_ignore_ascii_case(DEFAULT_ACCOUNT) {
+            return account_error::NotAllowedSnafu {
+                message: format!(
+                    "cannot drop the built-in account '{DEFAULT_ACCOUNT}'"
+                ),
+            }
+            .fail();
+        }
+        let mut state = self.state.write().await;
+        if state.accounts.remove(&key(name)).is_none() {
+            return account_error::AccountNotFoundSnafu {
+                account: name.to_string(),
+            }
+            .fail();
+        }
+        drop(state);
+        // Cascade: journalize and remove every record the account owns.
+        let users = self.list_users_in(name).await?;
+        let roles = self.list_roles_in(name).await?;
+        let shares = self.list_shares_in(name).await?;
+        for u in users {
+            self.drop_user_in(name, &u.name).await?;
+        }
+        for r in roles {
+            self.drop_role_in(name, &r.name).await?;
+        }
+        for s in shares {
+            self.drop_share_in(name, &s.name).await?;
+        }
+        self.journal_delete(&crate::journal::AccountRecord::Account(Account {
+            name: name.to_string(),
+        }))
+        .await?;
+        Ok(())
+    }
+
+    async fn list_accounts_in(&self) -> Result<Vec<Account>> {
+        let state = self.state.read().await;
+        let mut out: Vec<Account> = state.accounts.values().cloned().collect();
+        // The default account is implicit; surface it for SHOW ACCOUNTS.
+        if !out.iter().any(|a| a.name.eq_ignore_ascii_case(DEFAULT_ACCOUNT)) {
+            out.push(Account {
+                name: DEFAULT_ACCOUNT.to_string(),
+            });
+        }
+        out.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+        Ok(out)
+    }
+
+    async fn get_account_in(&self, name: &str) -> Result<Option<Account>> {
+        let state = self.state.read().await;
+        if name.eq_ignore_ascii_case(DEFAULT_ACCOUNT) {
+            return Ok(Some(Account {
+                name: DEFAULT_ACCOUNT.to_string(),
+            }));
+        }
+        Ok(state.accounts.get(&key(name)).cloned())
+    }
+}
+
+fn key(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// In-memory + journal key for an account-owned record: the default
+/// account keeps the bare (pre-M15.4) key; other accounts qualify it.
+fn akey(account: &str, name: &str) -> String {
+    crate::journal::account_key(account, key(name))
+}
+
+/// Non-blocking read of the shared state (fast path for `scope`).
+fn try_lock_read_noio(
+    state: &Arc<RwLock<StoreState>>,
+) -> Option<tokio::sync::RwLockReadGuard<'_, StoreState>> {
+    state.try_read().ok()
+}
+
+#[async_trait]
+impl AccountStore for InMemoryAccountStore {
+    async fn create_role(&self, name: &str) -> Result<Role> {
+        self.create_role_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn drop_role(&self, name: &str) -> Result<()> {
+        self.drop_role_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn get_role(&self, name: &str) -> Result<Option<Role>> {
+        self.get_role_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn list_roles(&self) -> Result<Vec<Role>> {
+        self.list_roles_in(DEFAULT_ACCOUNT).await
+    }
+
+    async fn create_user(&self, user: User) -> Result<User> {
+        self.create_user_in(DEFAULT_ACCOUNT, user).await
+    }
+
+    async fn drop_user(&self, name: &str) -> Result<()> {
+        self.drop_user_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn get_user(&self, login_name: &str) -> Result<Option<User>> {
+        self.get_user_in(DEFAULT_ACCOUNT, login_name).await
+    }
+
+    async fn list_users(&self) -> Result<Vec<User>> {
+        self.list_users_in(DEFAULT_ACCOUNT).await
+    }
+
+    async fn grant_role_to_user(&self, user: &str, role: &str) -> Result<()> {
+        self.grant_role_to_user_in(DEFAULT_ACCOUNT, user, role).await
+    }
+
+    async fn revoke_role_from_user(&self, user: &str, role: &str) -> Result<()> {
+        self.revoke_role_from_user_in(DEFAULT_ACCOUNT, user, role).await
+    }
+
+    async fn user_roles(&self, user: &str) -> Result<Vec<String>> {
+        self.user_roles_in(DEFAULT_ACCOUNT, user).await
+    }
+
+    async fn grant_role_to_role(&self, child: &str, parent: &str) -> Result<()> {
+        self.grant_role_to_role_in(DEFAULT_ACCOUNT, child, parent).await
+    }
+
+    async fn revoke_role_from_role(&self, child: &str, parent: &str) -> Result<()> {
+        self.revoke_role_from_role_in(DEFAULT_ACCOUNT, child, parent).await
+    }
+
+    async fn role_children(&self, parent: &str) -> Result<Vec<String>> {
+        self.role_children_in(DEFAULT_ACCOUNT, parent).await
+    }
+
+    async fn effective_roles(&self, roles: &[String]) -> Result<Vec<String>> {
+        self.effective_roles_in(DEFAULT_ACCOUNT, roles).await
+    }
+
+    async fn grant(&self, grant: Grant) -> Result<()> {
+        self.grant_in(DEFAULT_ACCOUNT, grant).await
+    }
+
+    async fn revoke(&self, grant: &Grant) -> Result<()> {
+        self.revoke_in(DEFAULT_ACCOUNT, grant).await
+    }
+
+    async fn role_grants(&self, role: &str) -> Result<Vec<Grant>> {
+        self.role_grants_in(DEFAULT_ACCOUNT, role).await
+    }
+
+    async fn object_grants(&self, object: &AccountObject) -> Result<Vec<Grant>> {
+        self.object_grants_in(DEFAULT_ACCOUNT, object).await
+    }
+
+    async fn create_share(&self, name: &str) -> Result<Share> {
+        self.create_share_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn create_inbound_share(&self, name: &str, provider: &str) -> Result<Share> {
+        self.create_inbound_share_in(DEFAULT_ACCOUNT, name, provider).await
+    }
+
+    async fn drop_share(&self, name: &str) -> Result<()> {
+        self.drop_share_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn get_share(&self, name: &str) -> Result<Option<Share>> {
+        self.get_share_in(DEFAULT_ACCOUNT, name).await
+    }
+
+    async fn list_shares(&self) -> Result<Vec<Share>> {
+        self.list_shares_in(DEFAULT_ACCOUNT).await
+    }
+
+    async fn grant_to_share(&self, grant: ShareGrant) -> Result<()> {
+        self.grant_to_share_in(DEFAULT_ACCOUNT, grant).await
+    }
+
+    async fn revoke_from_share(&self, grant: &ShareGrant) -> Result<()> {
+        self.revoke_from_share_in(DEFAULT_ACCOUNT, grant).await
+    }
+
+    async fn share_grants(&self, share: &str) -> Result<Vec<ShareGrant>> {
+        self.share_grants_in(DEFAULT_ACCOUNT, share).await
+    }
+
+    async fn create_account(
+        &self,
+        name: &str,
+        admin_name: &str,
+        admin_password: &str,
+    ) -> Result<Account> {
+        self.create_account_in(name, admin_name, admin_password).await
+    }
+
+    async fn drop_account(&self, name: &str) -> Result<()> {
+        self.drop_account_in(name).await
+    }
+
+    async fn list_accounts(&self) -> Result<Vec<Account>> {
+        self.list_accounts_in().await
+    }
+
+    async fn get_account(&self, name: &str) -> Result<Option<Account>> {
+        self.get_account_in(name).await
+    }
+
+    async fn account_scope(self: Arc<Self>, account: &str) -> Result<Option<Arc<dyn AccountStore>>> {
+        Ok(self
+            .scope(&account)
+            .map(|s| Arc::new(s) as Arc<dyn AccountStore>))
+    }
+
+    async fn authenticate(&self, login_name: &str, password: &str) -> Result<Option<User>> {
+        self.authenticate_in(DEFAULT_ACCOUNT, login_name, password).await
+    }
+
+    async fn record_login(&self, event: LoginEvent) -> Result<()> {
+        self.record_login_in(DEFAULT_ACCOUNT, event).await
+    }
+
+    async fn list_logins(&self) -> Result<Vec<LoginEvent>> {
+        self.list_logins_in(DEFAULT_ACCOUNT).await
+    }
+
+    async fn allowed(
+        &self,
+        role: &str,
+        privilege: Privilege,
+        object: &AccountObject,
+    ) -> Result<bool> {
+        self.allowed_in(DEFAULT_ACCOUNT, role, privilege, object).await
+    }
+}
+
+#[async_trait]
+impl AccountStore for ScopedAccountStore {
+    async fn create_role(&self, name: &str) -> Result<Role> {
+        self.inner.create_role_in(&self.account, name).await
+    }
+
+    async fn drop_role(&self, name: &str) -> Result<()> {
+        self.inner.drop_role_in(&self.account, name).await
+    }
+
+    async fn get_role(&self, name: &str) -> Result<Option<Role>> {
+        self.inner.get_role_in(&self.account, name).await
+    }
+
+    async fn list_roles(&self) -> Result<Vec<Role>> {
+        self.inner.list_roles_in(&self.account).await
+    }
+
+    async fn create_user(&self, user: User) -> Result<User> {
+        self.inner.create_user_in(&self.account, user).await
+    }
+
+    async fn drop_user(&self, name: &str) -> Result<()> {
+        self.inner.drop_user_in(&self.account, name).await
+    }
+
+    async fn get_user(&self, login_name: &str) -> Result<Option<User>> {
+        self.inner.get_user_in(&self.account, login_name).await
+    }
+
+    async fn list_users(&self) -> Result<Vec<User>> {
+        self.inner.list_users_in(&self.account).await
+    }
+
+    async fn grant_role_to_user(&self, user: &str, role: &str) -> Result<()> {
+        self.inner.grant_role_to_user_in(&self.account, user, role).await
+    }
+
+    async fn revoke_role_from_user(&self, user: &str, role: &str) -> Result<()> {
+        self.inner.revoke_role_from_user_in(&self.account, user, role).await
+    }
+
+    async fn user_roles(&self, user: &str) -> Result<Vec<String>> {
+        self.inner.user_roles_in(&self.account, user).await
+    }
+
+    async fn grant_role_to_role(&self, child: &str, parent: &str) -> Result<()> {
+        self.inner.grant_role_to_role_in(&self.account, child, parent).await
+    }
+
+    async fn revoke_role_from_role(&self, child: &str, parent: &str) -> Result<()> {
+        self.inner.revoke_role_from_role_in(&self.account, child, parent).await
+    }
+
+    async fn role_children(&self, parent: &str) -> Result<Vec<String>> {
+        self.inner.role_children_in(&self.account, parent).await
+    }
+
+    async fn effective_roles(&self, roles: &[String]) -> Result<Vec<String>> {
+        self.inner.effective_roles_in(&self.account, roles).await
+    }
+
+    async fn grant(&self, grant: Grant) -> Result<()> {
+        self.inner.grant_in(&self.account, grant).await
+    }
+
+    async fn revoke(&self, grant: &Grant) -> Result<()> {
+        self.inner.revoke_in(&self.account, grant).await
+    }
+
+    async fn role_grants(&self, role: &str) -> Result<Vec<Grant>> {
+        self.inner.role_grants_in(&self.account, role).await
+    }
+
+    async fn object_grants(&self, object: &AccountObject) -> Result<Vec<Grant>> {
+        self.inner.object_grants_in(&self.account, object).await
+    }
+
+    async fn create_share(&self, name: &str) -> Result<Share> {
+        self.inner.create_share_in(&self.account, name).await
+    }
+
+    async fn create_inbound_share(&self, name: &str, provider: &str) -> Result<Share> {
+        self.inner.create_inbound_share_in(&self.account, name, provider).await
+    }
+
+    async fn drop_share(&self, name: &str) -> Result<()> {
+        self.inner.drop_share_in(&self.account, name).await
+    }
+
+    async fn get_share(&self, name: &str) -> Result<Option<Share>> {
+        self.inner.get_share_in(&self.account, name).await
+    }
+
+    async fn list_shares(&self) -> Result<Vec<Share>> {
+        self.inner.list_shares_in(&self.account).await
+    }
+
+    async fn grant_to_share(&self, grant: ShareGrant) -> Result<()> {
+        self.inner.grant_to_share_in(&self.account, grant).await
+    }
+
+    async fn revoke_from_share(&self, grant: &ShareGrant) -> Result<()> {
+        self.inner.revoke_from_share_in(&self.account, grant).await
+    }
+
+    async fn share_grants(&self, share: &str) -> Result<Vec<ShareGrant>> {
+        self.inner.share_grants_in(&self.account, share).await
+    }
+
+    async fn create_account(
+        &self,
+        name: &str,
+        admin_name: &str,
+        admin_password: &str,
+    ) -> Result<Account> {
+        self.inner.create_account(name, admin_name, admin_password).await
+    }
+
+    async fn drop_account(&self, name: &str) -> Result<()> {
+        self.inner.drop_account(name).await
+    }
+
+    async fn list_accounts(&self) -> Result<Vec<Account>> {
+        self.inner.list_accounts().await
+    }
+
+    async fn get_account(&self, name: &str) -> Result<Option<Account>> {
+        self.inner.get_account(name).await
+    }
+
+    async fn account_scope(self: Arc<Self>, account: &str) -> Result<Option<Arc<dyn AccountStore>>> {
+        self.inner.clone().account_scope(account).await
+    }
+
+    async fn authenticate(&self, login_name: &str, password: &str) -> Result<Option<User>> {
+        self.inner.authenticate_in(&self.account, login_name, password).await
+    }
+
+    async fn record_login(&self, event: LoginEvent) -> Result<()> {
+        self.inner.record_login_in(&self.account, event).await
+    }
+
+    async fn list_logins(&self) -> Result<Vec<LoginEvent>> {
+        self.inner.list_logins_in(&self.account).await
+    }
+
+    async fn allowed(
+        &self,
+        role: &str,
+        privilege: Privilege,
+        object: &AccountObject,
+    ) -> Result<bool> {
+        self.inner.allowed_in(&self.account, role, privilege, object).await
     }
 }
 
@@ -925,7 +1529,8 @@ mod tests {
         s.create_role("analyst").await.unwrap();
         assert!(s.create_role("analyst").await.is_err());
         s.grant(Grant {
-            role: "analyst".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
             privilege: Privilege::Select,
             object: AccountObject::Table("db".into(), "public".into(), "t".into()),
         })
@@ -949,7 +1554,8 @@ mod tests {
             .unwrap());
         // Revoke twice → second fails with GrantNotFound.
         s.revoke(&Grant {
-            role: "analyst".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
             privilege: Privilege::Select,
             object: AccountObject::Table("db".into(), "public".into(), "t".into()),
         })
@@ -957,7 +1563,8 @@ mod tests {
         .unwrap();
         assert!(s
             .revoke(&Grant {
-                role: "analyst".into(),
+                                account: DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Select,
                 object: AccountObject::Table("db".into(), "public".into(), "t".into()),
             })
@@ -980,7 +1587,8 @@ mod tests {
         assert!(s.get_share("VENDOR").await.unwrap().is_some());
 
         let grant = ShareGrant {
-            share: "vendor".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+share: "vendor".into(),
             privilege: Privilege::Select,
             object: AccountObject::Table("db".into(), "public".into(), "t".into()),
         };
@@ -991,7 +1599,8 @@ mod tests {
         // Grants to unknown shares fail.
         assert!(s
             .grant_to_share(ShareGrant {
-                share: "nope".into(),
+                                account: DEFAULT_ACCOUNT.into(),
+share: "nope".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Database("db".into()),
             })
@@ -1038,7 +1647,8 @@ mod tests {
         let s = store();
         s.create_role("r1").await.unwrap();
         s.create_user(User {
-            name: "u1".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+name: "u1".into(),
             login_name: "u1".into(),
             password: "pw".into(),
             default_role: Some("r1".into()),
@@ -1048,7 +1658,8 @@ mod tests {
         .await
         .unwrap();
         assert!(s.create_user(User {
-            name: "u1".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+name: "u1".into(),
             login_name: "x".into(),
             password: String::new(),
             default_role: None,
@@ -1118,7 +1729,8 @@ mod tests {
         s.ensure_admin("embucket", "embucket").await.unwrap();
         s.create_role("analyst").await.unwrap();
         s.create_user(User {
-            name: "u1".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+name: "u1".into(),
             login_name: "u1".into(),
             password: "pw".into(),
             default_role: Some("analyst".into()),
@@ -1129,7 +1741,8 @@ mod tests {
         .unwrap();
         s.grant_role_to_user("u1", "analyst").await.unwrap();
         s.grant(Grant {
-            role: "analyst".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
             privilege: Privilege::Select,
             object: AccountObject::Table("db".into(), "public".into(), "t".into()),
         })
@@ -1137,14 +1750,16 @@ mod tests {
         .unwrap();
         s.create_share("vendor").await.unwrap();
         s.grant_to_share(ShareGrant {
-            share: "vendor".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+share: "vendor".into(),
             privilege: Privilege::Usage,
             object: AccountObject::Database("db".into()),
         })
         .await
         .unwrap();
         s.record_login(LoginEvent {
-            timestamp_ms: 1_000,
+                        account: DEFAULT_ACCOUNT.into(),
+timestamp_ms: 1_000,
             sequence: 0,
             user_name: "u1".into(),
             client_app_id: None,
@@ -1154,7 +1769,8 @@ mod tests {
         .await
         .unwrap();
         s.record_login(LoginEvent {
-            timestamp_ms: 2_000,
+                        account: DEFAULT_ACCOUNT.into(),
+timestamp_ms: 2_000,
             sequence: 0,
             user_name: "u1".into(),
             client_app_id: None,
@@ -1196,7 +1812,8 @@ mod tests {
         s.create_role("analyst").await.unwrap();
         s.grant_role_to_user("embucket", "analyst").await.unwrap();
         s.grant(Grant {
-            role: "analyst".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
             privilege: Privilege::Usage,
             object: AccountObject::Database("db".into()),
         })
@@ -1244,7 +1861,8 @@ mod tests {
         s.create_role("e1").await.unwrap();
         assert!(super::account_epoch() > before, "create_role bumps");
         let event = LoginEvent {
-            timestamp_ms: 0,
+                        account: DEFAULT_ACCOUNT.into(),
+timestamp_ms: 0,
             sequence: 0,
             user_name: "e1".into(),
             client_app_id: None,
@@ -1260,7 +1878,8 @@ mod tests {
         );
         let before_grant = super::account_epoch();
         s.grant(Grant {
-            role: "e1".to_string(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "e1".to_string(),
             privilege: crate::models::Privilege::Select,
             object: crate::models::AccountObject::Table(
                 "db".to_string(),
@@ -1273,7 +1892,8 @@ mod tests {
         assert!(super::account_epoch() > before_grant, "grant bumps");
         let before_revoke = super::account_epoch();
         s.revoke(&Grant {
-            role: "e1".to_string(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "e1".to_string(),
             privilege: crate::models::Privilege::Select,
             object: crate::models::AccountObject::Table(
                 "db".to_string(),
@@ -1373,7 +1993,8 @@ mod tests {
         let t = AccountObject::Table("db".into(), "s".into(), "t".into());
         for role in ["r1", "r2"] {
             s.grant(Grant {
-                role: role.into(),
+                                account: DEFAULT_ACCOUNT.into(),
+role: role.into(),
                 privilege: Privilege::Select,
                 object: t.clone(),
             })
@@ -1382,7 +2003,8 @@ mod tests {
         }
         // Ownership grant from a third role on the same object.
         s.grant(Grant {
-            role: "r1".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "r1".into(),
             privilege: Privilege::Ownership,
             object: t.clone(),
         })
@@ -1399,14 +2021,16 @@ mod tests {
         // Containment (design §23.7): a schema grant is covered by the
         // database and covers its tables.
         s.grant(Grant {
-            role: "r2".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "r2".into(),
             privilege: Privilege::Ownership,
             object: AccountObject::Schema("db".into(), "s".into()),
         })
         .await
         .unwrap();
         s.grant(Grant {
-            role: "r1".into(),
+                        account: DEFAULT_ACCOUNT.into(),
+role: "r1".into(),
             privilege: Privilege::Usage,
             object: AccountObject::Database("db".into()),
         })
@@ -1454,5 +2078,140 @@ mod tests {
             s3.effective_roles(&["sr".to_string()]).await.unwrap().len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn accounts_create_seed_admin_and_isolate() {
+        let s = Arc::new(store());
+        s.create_account("acme", "acmeadmin", "pw1").await.unwrap();
+        assert!(s.create_account("acme", "x", "y").await.is_err());
+        // The built-in account cannot be re-created or dropped.
+        assert!(s.create_account(DEFAULT_ACCOUNT, "x", "y").await.is_err());
+        assert!(s.drop_account(DEFAULT_ACCOUNT).await.is_err());
+        // Seeded admin authenticates only inside the new account.
+        assert!(s.authenticate("acmeadmin", "pw1").await.unwrap().is_none());
+        let scope = Arc::clone(&s).account_scope("acme").await.unwrap().unwrap();
+        assert!(scope.authenticate("acmeadmin", "pw1").await.unwrap().is_some());
+        assert!(scope.authenticate("acmeadmin", "bad").await.unwrap().is_none());
+        assert!(scope.authenticate("embucket", "embucket").await.unwrap().is_none());
+        // The default account's admin is invisible from the new account.
+        assert!(scope.get_user("embucket").await.unwrap().is_none());
+        // Roles are per-account: each account sees only its own.
+        let default_roles = s.list_roles().await.unwrap();
+        let acme_roles = scope.list_roles().await.unwrap();
+        assert!(default_roles.iter().all(|r| r.account == DEFAULT_ACCOUNT));
+        assert!(acme_roles.iter().all(|r| r.account == "acme"));
+        // Same role name in two accounts does not collide.
+        scope.create_role("analyst").await.unwrap();
+        s.create_role("analyst").await.unwrap();
+        scope.grant(Grant {
+            account: "acme".into(),
+            role: "analyst".into(),
+            privilege: Privilege::Select,
+            object: AccountObject::Table("acmedb".into(), "public".into(), "t".into()),
+        })
+        .await
+        .unwrap();
+        assert!(scope
+            .allowed("analyst", Privilege::Select, &AccountObject::Table("acmedb".into(), "public".into(), "t".into()))
+            .await
+            .unwrap());
+        assert!(!s
+            .allowed("analyst", Privilege::Select, &AccountObject::Table("acmedb".into(), "public".into(), "t".into()))
+            .await
+            .unwrap());
+        // Unknown account → no scope.
+        assert!(Arc::clone(&s).account_scope("ghost").await.unwrap().is_none());
+        // SHOW ACCOUNTS surfaces both.
+        let names: Vec<String> =
+            s.list_accounts().await.unwrap().into_iter().map(|a| a.name).collect();
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case("acme")));
+        assert!(names.iter().any(|n| n.eq_ignore_ascii_case(DEFAULT_ACCOUNT)));
+    }
+
+    #[tokio::test]
+    async fn drop_account_cascades_records() {
+        let journal = Arc::new(MockJournal::default());
+        let s = Arc::new(
+            InMemoryAccountStore::new_with_journal(journal.clone())
+                .await
+                .unwrap(),
+        );
+        s.ensure_admin("embucket", "embucket").await.unwrap();
+        s.create_account("acme", "acmeadmin", "pw1").await.unwrap();
+        let scope = Arc::clone(&s).account_scope("acme").await.unwrap().unwrap();
+        scope.create_role("r1").await.unwrap();
+        scope.create_share("vendor").await.unwrap();
+        scope.grant_to_share(ShareGrant {
+            account: "acme".into(),
+            share: "vendor".into(),
+            privilege: Privilege::Usage,
+            object: AccountObject::Database("db".into()),
+        })
+        .await
+        .unwrap();
+        scope.grant(Grant {
+            account: "acme".into(),
+            role: "r1".into(),
+            privilege: Privilege::Select,
+            object: AccountObject::Table("db".into(), "s".into(), "t".into()),
+        })
+        .await
+        .unwrap();
+
+        s.drop_account("acme").await.unwrap();
+        assert!(Arc::clone(&s).account_scope("acme").await.unwrap().is_none());
+        // Default account untouched.
+        assert!(s.authenticate("embucket", "embucket").await.unwrap().is_some());
+        // Replay: no acme records remain in the journal.
+        let s2 = InMemoryAccountStore::new_with_journal(journal).await.unwrap();
+        assert!(s2.get_role("r1").await.unwrap().is_none());
+        assert!(s2.get_share("vendor").await.unwrap().is_none());
+        assert!(s2.authenticate("acmeadmin", "pw1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_shares_are_account_local() {
+        let s = Arc::new(store());
+        s.create_account("acme", "acmeadmin", "pw1").await.unwrap();
+        let acme = Arc::clone(&s).account_scope("acme").await.unwrap().unwrap();
+        // Same share name in both accounts.
+        s.create_share("vendor").await.unwrap();
+        acme.create_share("vendor").await.unwrap();
+        assert_eq!(s.list_shares().await.unwrap().len(), 1);
+        assert_eq!(acme.list_shares().await.unwrap().len(), 1);
+        // Grants made in one account are invisible in the other.
+        acme.grant_to_share(ShareGrant {
+            account: "acme".into(),
+            share: "vendor".into(),
+            privilege: Privilege::Usage,
+            object: AccountObject::Database("acmedb".into()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(acme.share_grants("vendor").await.unwrap().len(), 1);
+        assert!(s.share_grants("vendor").await.unwrap().is_empty());
+        // Dropping the acme share does not touch the default one.
+        acme.drop_share("vendor").await.unwrap();
+        assert!(s.get_share("vendor").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn journal_replays_accounts_and_scopes() {
+        let journal = Arc::new(MockJournal::default());
+        let s = Arc::new(
+            InMemoryAccountStore::new_with_journal(journal.clone())
+                .await
+                .unwrap(),
+        );
+        s.ensure_admin("embucket", "embucket").await.unwrap();
+        s.create_account("acme", "acmeadmin", "pw1").await.unwrap();
+        // "Restart": the account and its admin survive replay.
+        let s2 = Arc::new(InMemoryAccountStore::new_with_journal(journal).await.unwrap());
+        let scope = Arc::clone(&s2).account_scope("acme").await.unwrap().unwrap();
+        assert!(scope.authenticate("acmeadmin", "pw1").await.unwrap().is_some());
+        assert!(scope.get_role(ACCOUNTADMIN).await.unwrap().is_some());
+        // Same-named user in default account stays separate.
+        assert!(s2.authenticate("acmeadmin", "pw1").await.unwrap().is_none());
     }
 }

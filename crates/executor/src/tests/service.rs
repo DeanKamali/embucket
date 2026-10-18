@@ -59,6 +59,7 @@ async fn test_service_upload_file() {
                 properties: None,
                 volume: "test_volume".to_string(),
                 should_refresh: false,
+                account: "embucket".to_string(),
             },
         )
         .await
@@ -190,6 +191,7 @@ async fn test_service_create_table_file_volume() {
                 properties: None,
                 volume: "test_volume".to_string(),
                 should_refresh: false,
+                account: "embucket".to_string(),
             },
         )
         .await

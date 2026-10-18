@@ -169,7 +169,7 @@ async fn execute(stmt: &UndropStatement, session: &UserSession) -> Result<QueryR
                 Arc::clone(session.ctx.state().catalog_list());
             if let Some(list) = crate::share_catalog::ShareCatalogList::unwrap_bare(&catalog_list)
             {
-                list.register_catalog(&ident)
+                list.register_catalog_name(&ident)
                     .await
                     .map_err(|e| external_error("undrop", e))?;
             }

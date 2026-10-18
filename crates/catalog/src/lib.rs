@@ -5,6 +5,7 @@ use tokio::runtime::{Builder, Handle, RuntimeFlavor};
 use tokio::task;
 use tracing::{Span, instrument};
 
+pub mod account_catalog;
 #[allow(clippy::module_inception)]
 pub mod catalog;
 pub mod catalog_list;
@@ -17,6 +18,8 @@ pub mod schema;
 pub mod stream_table;
 pub mod table;
 pub mod utils;
+
+pub use account_catalog::{AccountCatalogList, IntoAccountCatalogList};
 
 #[cfg(test)]
 pub mod tests;

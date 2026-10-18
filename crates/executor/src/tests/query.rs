@@ -100,6 +100,7 @@ pub async fn create_df_session() -> Arc<UserSession> {
                 properties: None,
                 volume: "test_volume".to_string(),
                 should_refresh: false,
+                account: "embucket".to_string(),
             },
         )
         .await

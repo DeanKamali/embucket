@@ -446,7 +446,7 @@ async fn execute(stmt: &CloneStatement, session: &UserSession) -> Result<QueryRe
             let catalog_list: Arc<dyn datafusion::catalog::CatalogProviderList> =
                 Arc::clone(session.ctx.state().catalog_list());
             if let Some(list) = crate::share_catalog::ShareCatalogList::unwrap_bare(&catalog_list) {
-                list.register_catalog(&to)
+                list.register_catalog_name(&to)
                     .await
                     .map_err(|e| external_error("clone", e))?;
             }

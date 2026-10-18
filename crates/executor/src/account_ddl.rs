@@ -14,6 +14,8 @@
 //!   `CREATE [IF NOT EXISTS] INBOUND SHARE <name>` (M15.2), `DROP SHARE
 //!   <name>`, the same `GRANT|REVOKE ... TO|FROM SHARE <s>`, `SHOW SHARES`,
 //!   `DESC SHARE <s>`, `SHOW GRANTS TO SHARE <s>`
+//! - Accounts (design §21.4, M15.4): `CREATE ACCOUNT <name> ADMIN_NAME =
+//!   'u' ADMIN_PASSWORD = 'p'`, `DROP ACCOUNT <name>`, `SHOW ACCOUNTS`
 //!
 //! All account DDL is `ACCOUNTADMIN`-only in v1: the session must be
 //! authorized with the built-in role active. Data-plane DDL (CREATE/DROP
@@ -51,6 +53,18 @@ pub enum AccountStatement {
         tenant: Option<String>,
         if_not_exists: bool,
     },
+    /// M15.4: `CREATE ACCOUNT <name> ADMIN_NAME = 'u' ADMIN_PASSWORD = 'p'`.
+    CreateAccount {
+        name: String,
+        admin_name: String,
+        admin_password: String,
+    },
+    /// M15.4: `DROP ACCOUNT <name>`.
+    DropAccount {
+        name: String,
+    },
+    /// M15.4: `SHOW ACCOUNTS`.
+    ShowAccounts,
     DropUser {
         name: String,
     },
@@ -265,6 +279,9 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
             if tok.len() == 2 && tok[1].eq_ignore_ascii_case("shares") {
                 return Some(AccountStatement::ShowShares);
             }
+            if tok.len() == 2 && tok[1].eq_ignore_ascii_case("accounts") {
+                return Some(AccountStatement::ShowAccounts);
+            }
             return None;
         }
         "DESC" | "DESCRIBE" => {
@@ -295,7 +312,7 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
         "SHARE".to_string()
     } else {
         let k = tok.get(i)?.to_ascii_uppercase();
-        if k != "ROLE" && k != "USER" && k != "SHARE" {
+        if k != "ROLE" && k != "USER" && k != "SHARE" && k != "ACCOUNT" {
             return None;
         }
         i += 1;
@@ -311,6 +328,38 @@ pub fn parse(raw: &str) -> Option<AccountStatement> {
         i += 3;
     }
     let name = (*tok.get(i)?).to_string();
+    if kind == "ACCOUNT" {
+        // CREATE ACCOUNT <name> ADMIN_NAME = 'u' ADMIN_PASSWORD = 'p'
+        if !create {
+            if tok.get(i + 1).is_some() {
+                return None;
+            }
+            return Some(AccountStatement::DropAccount { name });
+        }
+        let mut admin_name = None;
+        let mut admin_password = None;
+        let mut j = i + 1;
+        while j < tok.len() {
+            let key = tok[j].to_ascii_uppercase();
+            let Some(value) = tok.get(j + 2) else {
+                return None;
+            };
+            if !tok[j + 1].eq_ignore_ascii_case("=") {
+                return None;
+            }
+            match key.as_str() {
+                "ADMIN_NAME" => admin_name = Some(value.to_string()),
+                "ADMIN_PASSWORD" => admin_password = Some(value.to_string()),
+                _ => return None, // unknown account option → planner error
+            }
+            j += 3;
+        }
+        return Some(AccountStatement::CreateAccount {
+            name,
+            admin_name: admin_name?,
+            admin_password: admin_password?,
+        });
+    }
     if create {
         if kind == "ROLE" || kind == "SHARE" || inbound_share {
             // M15.2: inbound shares take `FROM <provider_share>`.
@@ -455,6 +504,7 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
         } => {
             let name = norm(name);
             let user = User {
+                account: _authz.account().to_string(),
                 name: name.clone(),
                 login_name: name.clone(),
                 password: password.to_string(),
@@ -519,6 +569,7 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             let (privilege, object) = normalize_grant(privilege.clone(), object, session);
             store
                 .grant(Grant {
+                    account: _authz.account().to_string(),
                     role: norm(role),
                     privilege,
                     object,
@@ -535,6 +586,7 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             let (privilege, object) = normalize_grant(privilege.clone(), object, session);
             store
                 .revoke(&Grant {
+                    account: _authz.account().to_string(),
                     role: norm(role),
                     privilege,
                     object,
@@ -613,6 +665,55 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             .context(ex_error::ArrowSnafu)?;
             Ok(QueryResult::new(vec![batch], schema))
         }
+        AccountStatement::CreateAccount { name, admin_name, admin_password } => {
+            let name = norm(name);
+            match store.create_account(&name, admin_name, admin_password).await {
+                Ok(_) => crate::clone_ddl::status_row(),
+                Err(e) => Err(external_error("account", e)),
+            }
+        }
+        AccountStatement::DropAccount { name } => {
+            let name = norm(name);
+            if name.eq_ignore_ascii_case(avalanche_account::models::DEFAULT_ACCOUNT) {
+                return Err(external_error(
+                    "account",
+                    format!("cannot drop the built-in account '{name}'"),
+                ));
+            }
+            store.drop_account(&name).await.map_err(|e| external_error("account", e))?;
+            crate::clone_ddl::status_row()
+        }
+        AccountStatement::ShowAccounts => {
+            let accounts = store
+                .list_accounts()
+                .await
+                .map_err(|e| external_error("account", e))?;
+            let mut schema_fields = Vec::new();
+            for (name, nullable) in [("created_on", false), ("account_name", false)] {
+                schema_fields.push(Field::new(name, DataType::Utf8, nullable));
+            }
+            let schema = Arc::new(ArrowSchema::new(schema_fields));
+            let mut created_on_col = Vec::new();
+            let mut name_col = Vec::new();
+            for a in accounts {
+                // Timestamps are not tracked in the v1 in-memory store.
+                created_on_col.push(String::new());
+                name_col.push(a.name);
+            }
+            if created_on_col.is_empty() {
+                created_on_col.push(String::new());
+                name_col.push(String::new());
+            }
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(created_on_col)),
+                    Arc::new(StringArray::from(name_col)),
+                ],
+            )
+            .context(ex_error::ArrowSnafu)?;
+            Ok(QueryResult::new(vec![batch], schema))
+        }
         AccountStatement::CreateShare { kind, name, provider, if_not_exists } => {
             let name = norm(name);
             let result = match kind {
@@ -648,6 +749,7 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             let (privilege, object) = normalize_grant(privilege.clone(), object, session);
             store
                 .grant_to_share(ShareGrant {
+                    account: _authz.account().to_string(),
                     share: norm(share),
                     privilege,
                     object,
@@ -664,6 +766,7 @@ async fn execute(stmt: &AccountStatement, session: &UserSession) -> Result<Query
             let (privilege, object) = normalize_grant(privilege.clone(), object, session);
             store
                 .revoke_from_share(&ShareGrant {
+                    account: _authz.account().to_string(),
                     share: norm(share),
                     privilege,
                     object,

@@ -151,17 +151,26 @@ pub fn has_table_function(query: &Query) -> bool {
 }
 
 /// Stable cache key for an eligible query, `None` when not eligible.
-/// The user name is part of the key (a cached result must never cross
-/// users — grants can differ); role and object state are covered by the
-/// fingerprint.
+/// The account (M15.4) and user name are part of the key (a cached result
+/// must never cross accounts or users — databases and grants differ); role
+/// and object state are covered by the fingerprint.
 #[must_use]
 pub fn cache_key(session: &UserSession, sql: &str) -> Option<String> {
     let user = session.metadata.attr(SessionMetadataAttr::UserName)?;
     let warehouse = session.current_warehouse_name().unwrap_or_default();
+    let account = session.authz.as_ref().map_or_else(
+        || {
+            session
+                .metadata
+                .attr(SessionMetadataAttr::AccountName)
+                .unwrap_or_default()
+        },
+        |authz| authz.account().to_string(),
+    );
     // Normalization v1: case-fold + trim. Comments/different spacing in
     // identical-position queries are the common case.
     Some(format!(
-        "{user}|{warehouse}|{}",
+        "{account}|{user}|{warehouse}|{}",
         sql.trim().to_ascii_lowercase()
     ))
 }

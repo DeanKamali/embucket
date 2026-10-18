@@ -130,6 +130,7 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
             properties: source.data.properties.clone(),
             volume: source.data.volume.clone(),
             should_refresh: false,
+            account: source.data.account.clone(),
         };
         self.create_database(&to.to_string(), database).await?;
         let mut cloned = 0;
@@ -247,6 +248,7 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
             properties: source.data.properties.clone(),
             volume: source.data.volume.clone(),
             should_refresh: false,
+            account: source.data.account.clone(),
         };
         self.create_database(&to.to_string(), database).await?;
         let mut cloned = 0usize;
@@ -2622,6 +2624,7 @@ mod undrop_tests {
                 properties: None,
                 volume: "vol".to_string(),
                 should_refresh: false,
+                account: crate::DEFAULT_DATABASE_ACCOUNT.to_string(),
             },
         )
         .await
@@ -2905,6 +2908,7 @@ mod undrop_tests {
                 properties: None,
                 volume: "vol".to_string(),
                 should_refresh: false,
+                account: crate::DEFAULT_DATABASE_ACCOUNT.to_string(),
             },
         )
         .await
@@ -2952,6 +2956,7 @@ mod clone_as_of_tests {
                 properties: None,
                 volume: "vol".to_string(),
                 should_refresh: false,
+                account: crate::DEFAULT_DATABASE_ACCOUNT.to_string(),
             },
         )
         .await
@@ -3088,6 +3093,7 @@ mod automation_tests {
                 properties: None,
                 volume: "vol".to_string(),
                 should_refresh: false,
+                account: crate::DEFAULT_DATABASE_ACCOUNT.to_string(),
             },
         )
         .await

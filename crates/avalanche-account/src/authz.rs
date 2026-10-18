@@ -15,7 +15,7 @@ use crate::error::{self as account_error, Result};
 use crate::models::{AccountObject, Grant, Privilege, ACCOUNTADMIN};
 use crate::store::AccountStore;
 use async_trait::async_trait;
-use catalog::catalog_list::EmbucketCatalogList;
+use catalog::account_catalog::{AccountCatalogList, IntoAccountCatalogList};
 use catalog_metastore::Metastore;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider};
 use datafusion_common::Result as DfResult;
@@ -53,6 +53,9 @@ pub struct SessionAuthz {
     user: String,
     /// Login name (used at login time); kept for diagnostics.
     login_name: String,
+    /// The account this session belongs to (M15.4): the loaded user's own
+    /// account — with a scoped store this is always the session account.
+    account: String,
     role: RwLock<String>,
     snapshot: RwLock<RoleSnapshot>,
     /// Account epoch the snapshot was materialized at (§23.5 result-cache
@@ -86,6 +89,7 @@ impl SessionAuthz {
             metastore,
             user: u.name.clone(),
             login_name: u.login_name.to_ascii_lowercase(),
+            account: u.account.clone(),
             role: RwLock::new(String::new()),
             snapshot: RwLock::new(RoleSnapshot::default()),
             materialized_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -276,6 +280,12 @@ impl SessionAuthz {
         self.snapshot.read().unwrap().admin
     }
 
+    /// The account this session belongs to (M15.4).
+    #[must_use]
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
     /// Sync grant check against the materialized snapshot.
     #[must_use]
     pub fn allowed_now(&self, privilege: Privilege, object: &AccountObject) -> bool {
@@ -426,6 +436,7 @@ impl SessionAuthz {
         }
         self.store
             .grant(Grant {
+                                account: self.account.clone(),
                 role,
                 privilege: Privilege::Ownership,
                 object: object.clone(),
@@ -477,30 +488,36 @@ pub fn is_internal_catalog(name: &str) -> bool {
     name.starts_with("__")
 }
 
-/// Wraps [`EmbucketCatalogList`] with per-session authorization.
+/// Wraps the session's [`AccountCatalogList`] (a pure delegation shell over
+/// the shared list for the default account, an account-scoped list
+/// otherwise) with per-session authorization.
 #[derive(Debug)]
 pub struct AuthzCatalogList {
-    pub inner: Arc<EmbucketCatalogList>,
+    pub inner: Arc<AccountCatalogList>,
     pub authz: Arc<SessionAuthz>,
 }
 
 impl AuthzCatalogList {
-    pub fn new(inner: Arc<EmbucketCatalogList>, authz: Arc<SessionAuthz>) -> Self {
-        Self { inner, authz }
+    pub fn new(inner: impl IntoAccountCatalogList, authz: Arc<SessionAuthz>) -> Self {
+        Self {
+            inner: inner.into_account_catalog_list(),
+            authz,
+        }
     }
 
-    /// Extract the underlying [`EmbucketCatalogList`] from either a bare or
+    /// Extract the underlying [`AccountCatalogList`] from either a bare or
     /// an authorized wrapper — used by hooks that must manipulate the real
-    /// catalog list (time-travel temp catalog, CLONE registration).
+    /// catalog list (time-travel temp catalog, CLONE registration, CREATE /
+    /// DROP DATABASE).
     #[must_use]
     pub fn unwrap(
         catalog_list: &Arc<dyn CatalogProviderList>,
-    ) -> Option<Arc<EmbucketCatalogList>> {
+    ) -> Option<Arc<AccountCatalogList>> {
         // Supertrait upcast to `Any + Send + Sync` first: `Arc::downcast`
         // only exists on that trait object.
         let cloned: Arc<dyn CatalogProviderList> = Arc::clone(catalog_list);
         let any: Arc<dyn std::any::Any + Send + Sync> = cloned;
-        if let Ok(inner) = Arc::downcast::<EmbucketCatalogList>(any) {
+        if let Ok(inner) = Arc::downcast::<AccountCatalogList>(any) {
             return Some(inner);
         }
         let cloned: Arc<dyn CatalogProviderList> = Arc::clone(catalog_list);
@@ -544,9 +561,9 @@ impl CatalogProviderList for AuthzCatalogList {
         name: String,
         catalog: Arc<dyn CatalogProvider>,
     ) -> Option<Arc<dyn CatalogProvider>> {
-        // Full trait qualification: an inherent async `register_catalog`
-        // on `EmbucketCatalogList` shadows the trait method.
-        <EmbucketCatalogList as CatalogProviderList>::register_catalog(
+        // Full trait qualification: an inherent async `register_catalog_name`
+        // helper must not be confused with the trait method.
+        <AccountCatalogList as CatalogProviderList>::register_catalog(
             &*self.inner,
             name,
             catalog,
@@ -669,7 +686,8 @@ mod tests {
             Arc::new(InMemoryAccountStore::new().with_admin("embucket", "embucket"));
         store.create_role("analyst").await.unwrap();
         store.create_user(User {
-            name: "u1".into(),
+                        account: crate::models::DEFAULT_ACCOUNT.into(),
+name: "u1".into(),
             login_name: "u1".into(),
             password: "pw".into(),
             default_role: Some("analyst".into()),
@@ -702,6 +720,7 @@ mod tests {
                     properties: if properties.is_empty() { None } else { Some(properties) },
                     volume: "vol".into(),
                     should_refresh: false,
+                    account: "embucket".to_string(),
                 },
             )
             .await
@@ -723,7 +742,8 @@ mod tests {
         assert!(!authz.warehouse_usable("wh"));
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Database("embucket".into()),
             })
@@ -738,7 +758,8 @@ mod tests {
         assert!(!authz.table_visible("embucket", "public", "t"));
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Schema("embucket".into(), "public".into()),
             })
@@ -772,7 +793,8 @@ mod tests {
         // senior (u2's role) inherits analyst's grants via the hierarchy.
         store.create_role("senior").await.unwrap();
         store.create_user(User {
-            name: "u2".into(),
+                        account: crate::models::DEFAULT_ACCOUNT.into(),
+name: "u2".into(),
             login_name: "u2".into(),
             password: "pw".into(),
             default_role: Some("senior".into()),
@@ -785,7 +807,8 @@ mod tests {
         store.grant_role_to_role("analyst", "senior").await.unwrap();
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Database("embucket".into()),
             })
@@ -833,7 +856,8 @@ mod tests {
         // USAGE on the database enables nothing by itself.
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Database("embucket".into()),
             })
@@ -844,7 +868,8 @@ mod tests {
         assert!(!authz.can_create_table("embucket", "public"), "missing CREATE");
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Schema("embucket".into(), "public".into()),
             })
@@ -852,7 +877,8 @@ mod tests {
             .unwrap();
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Create,
                 object: AccountObject::Schema("embucket".into(), "public".into()),
             })
@@ -863,7 +889,8 @@ mod tests {
         // Container ownership: CREATE on a database enables schema creation.
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Create,
                 object: AccountObject::Database("embucket".into()),
             })
@@ -874,7 +901,8 @@ mod tests {
         // OWNERSHIP on the schema covers dropping its tables.
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Ownership,
                 object: AccountObject::Schema("embucket".into(), "public".into()),
             })
@@ -922,7 +950,8 @@ mod tests {
         // Baseline grants so the un-stamped schema is visible via USAGE.
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Schema("embucket".into(), "public".into()),
             })
@@ -938,7 +967,8 @@ mod tests {
         // A same-tenant user sees the record (admin is bypassed entirely).
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Schema("embucket".into(), "tenantx".into()),
             })
@@ -946,7 +976,8 @@ mod tests {
             .unwrap();
         store
             .create_user(User {
-                name: "uacme".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+name: "uacme".into(),
                 login_name: "uacme".into(),
                 password: "pw".into(),
                 default_role: Some("analyst".into()),
@@ -983,7 +1014,8 @@ mod tests {
         let (store, metastore) = setup(Some("acme")).await;
         store
             .grant(Grant {
-                role: "analyst".into(),
+                                account: crate::models::DEFAULT_ACCOUNT.into(),
+role: "analyst".into(),
                 privilege: Privilege::Usage,
                 object: AccountObject::Database("embucket".into()),
             })
@@ -1015,6 +1047,7 @@ mod tests {
                     properties: Some(properties),
                     volume: "vol".into(),
                     should_refresh: false,
+                    account: "embucket".to_string(),
                 },
             )
             .await

@@ -21,7 +21,7 @@
 
 use avalanche_account::models::{AccountObject, ShareGrant, ShareKind};
 use avalanche_account::store::AccountStore;
-use catalog::catalog_list::EmbucketCatalogList;
+use catalog::account_catalog::AccountCatalogList;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider};
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
@@ -108,14 +108,14 @@ fn external_error(context: &str, message: String) -> Error {
 pub struct ShareCatalogList {
     inner: Arc<dyn CatalogProviderList>,
     /// Delegation target for reading the provider's real tables.
-    bare: Arc<EmbucketCatalogList>,
+    bare: Arc<AccountCatalogList>,
     shares: Vec<MountedShare>,
 }
 
 impl ShareCatalogList {
     pub fn new(
         inner: Arc<dyn CatalogProviderList>,
-        bare: Arc<EmbucketCatalogList>,
+        bare: Arc<AccountCatalogList>,
         shares: Vec<MountedShare>,
     ) -> Self {
         Self { inner, bare, shares }
@@ -127,14 +127,14 @@ impl ShareCatalogList {
         self.shares.iter().map(|s| s.name.clone()).collect()
     }
 
-    /// Reach the bare [`EmbucketCatalogList`] under any wrapping — mirrors
+    /// Reach the bare [`AccountCatalogList`] under any wrapping — mirrors
     /// [`AuthzCatalogList::unwrap`] but also strips this wrapper (used by
     /// hooks that must manipulate the real catalog list: CREATE DATABASE,
     /// CLONE registration, time travel).
     #[must_use]
     pub fn unwrap_bare(
         catalog_list: &Arc<dyn CatalogProviderList>,
-    ) -> Option<Arc<EmbucketCatalogList>> {
+    ) -> Option<Arc<AccountCatalogList>> {
         if let Some(bare) = avalanche_account::authz::AuthzCatalogList::unwrap(catalog_list) {
             return Some(bare);
         }
@@ -186,7 +186,7 @@ impl CatalogProviderList for ShareCatalogList {
 struct ShareCatalog {
     name: String,
     grants: Vec<ShareGrant>,
-    bare: Arc<EmbucketCatalogList>,
+    bare: Arc<AccountCatalogList>,
 }
 
 /// Granted (provider database, provider schema) pairs and their exposure
@@ -462,6 +462,7 @@ mod tests {
         store.create_share("vendor").await.unwrap();
         store
             .grant_to_share(ShareGrant {
+                account: avalanche_account::models::DEFAULT_ACCOUNT.to_string(),
                 share: "vendor".into(),
                 privilege: Privilege::Select,
                 object: AccountObject::Table("db".into(), "public".into(), "t".into()),
@@ -490,6 +491,7 @@ mod tests {
         for (db, table) in [("db1", "t"), ("db2", "u")] {
             store
                 .grant_to_share(ShareGrant {
+                    account: avalanche_account::models::DEFAULT_ACCOUNT.to_string(),
                     share: "wide_prov".into(),
                     privilege: Privilege::Select,
                     object: AccountObject::Table(db.into(), "public".into(), table.into()),

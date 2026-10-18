@@ -109,33 +109,13 @@ impl EmbucketCatalogList {
                 self.s3tables_iceberg_catalog(vol.clone(), &database).await?
             }
             VolumeType::Memory => self
-                .get_embucket_catalog(&database)
+                .get_embucket_catalog(&database, self.metastore.clone())
                 .await?
                 .with_catalog_type(CatalogType::Memory),
-            _ => self.get_embucket_catalog(&database).await?,
+            _ => self.get_embucket_catalog(&database, self.metastore.clone()).await?,
         };
         let caching = Arc::new(catalog);
-        // Warm the schema cache with metastore-backed providers (same as
-        // `CREATE SCHEMA` traffic does for normally created databases).
-        // Without this, `CachingCatalog::lookup_schema_provider` falls back
-        // to the pure-iceberg provider, which resolves non-iceberg tables
-        // (e.g. external parquet tables cloned into this database) as empty.
-        if !matches!(caching.catalog_type, CatalogType::S3tables) {
-            for schema_name in caching.catalog.schema_names() {
-                if let Some(provider) = caching.catalog.schema(&schema_name) {
-                    caching.schemas_cache.insert(
-                        schema_name.clone(),
-                        Arc::new(CachingSchema {
-                            schema: provider,
-                            iceberg_catalog: caching.iceberg_catalog.clone(),
-                            name: schema_name,
-                            tables_cache: DashMap::new(),
-                            config: caching.config.clone(),
-                        }),
-                    );
-                }
-            }
-        }
+        Self::warm_schema_cache(&caching);
         self.catalogs.insert(name.to_owned(), caching);
         Ok(())
     }
@@ -197,6 +177,7 @@ impl EmbucketCatalogList {
             volume: volume_ident.to_owned(),
             properties: None,
             should_refresh: false,
+            account: catalog_metastore::DEFAULT_DATABASE_ACCOUNT.to_string(),
         };
         let database = self
             .metastore
@@ -205,9 +186,9 @@ impl EmbucketCatalogList {
             .context(MetastoreSnafu)?;
 
         let catalog = match &volume.volume {
-            VolumeType::S3(_) | VolumeType::File(_) => self.get_embucket_catalog(&database).await?,
+            VolumeType::S3(_) | VolumeType::File(_) => self.get_embucket_catalog(&database, self.metastore.clone()).await?,
             VolumeType::Memory => self
-                .get_embucket_catalog(&database)
+                .get_embucket_catalog(&database, self.metastore.clone())
                 .await?
                 .with_catalog_type(CatalogType::Memory),
             VolumeType::S3Tables(vol) => {
@@ -262,6 +243,12 @@ impl EmbucketCatalogList {
             .await
             .context(MetastoreSnafu)?;
         for db in databases {
+            // Non-default accounts (M15.4) build their providers per session
+            // under qualified idents; the shared list only ever holds
+            // default-account (bare) names.
+            if db.account != catalog_metastore::DEFAULT_DATABASE_ACCOUNT {
+                continue;
+            }
             let volume = self
                 .metastore
                 .get_volume(&db.volume)
@@ -275,17 +262,101 @@ impl EmbucketCatalogList {
                 VolumeType::S3Tables(vol) => {
                     self.s3tables_iceberg_catalog(vol.clone(), &db).await?
                 }
-                _ => self.get_embucket_catalog(&db).await?,
+                _ => self.get_embucket_catalog(&db, self.metastore.clone()).await?,
             };
             catalogs.push(catalog);
         }
         Ok(catalogs)
     }
 
-    async fn get_embucket_catalog(&self, db: &RwObject<Database>) -> Result<CachingCatalog> {
+    /// Warm the schema cache with metastore-backed providers (same as
+    /// `CREATE SCHEMA` traffic does for normally created databases).
+    /// Without this, `CachingCatalog::lookup_schema_provider` falls back
+    /// to the pure-iceberg provider, which resolves non-iceberg tables
+    /// (e.g. external parquet tables cloned into this database) as empty.
+    fn warm_schema_cache(caching: &CachingCatalog) {
+        if !matches!(caching.catalog_type, CatalogType::S3tables) {
+            for schema_name in caching.catalog.schema_names() {
+                if let Some(provider) = caching.catalog.schema(&schema_name) {
+                    caching.schemas_cache.insert(
+                        schema_name.clone(),
+                        Arc::new(CachingSchema {
+                            schema: provider,
+                            iceberg_catalog: caching.iceberg_catalog.clone(),
+                            name: schema_name,
+                            tables_cache: DashMap::new(),
+                            config: caching.config.clone(),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Catalog names registered in the shared list (raw keys). Used by
+    /// account-scoped views to filter on a `{account}/` prefix.
+    #[must_use]
+    pub fn catalog_keys(&self) -> Vec<String> {
+        self.catalogs.iter().map(|c| c.key().clone()).collect()
+    }
+
+    /// Build a catalog provider for `db` without registering it anywhere
+    /// (M15.4). The Embucket/Iceberg providers address the database as
+    /// `qualified_ident` (so internal `TableIdent` lookups hit the
+    /// account-qualified metastore state) while the returned catalog is
+    /// named `display_name`. For the default account `qualified_ident ==
+    /// display_name` and the result is identical to a regular registration.
+    ///
+    /// # Errors
+    /// Fails when the volume is missing or provider construction fails.
+    #[tracing::instrument(
+        name = "EmbucketCatalogList::build_catalog",
+        level = "debug",
+        skip(self, db, metastore),
+        err
+    )]
+    pub async fn build_catalog(
+        &self,
+        display_name: &str,
+        qualified_ident: &str,
+        db: &RwObject<Database>,
+        metastore: Arc<dyn Metastore>,
+    ) -> Result<CachingCatalog> {
+        let volume = metastore
+            .get_volume(&db.volume)
+            .await
+            .context(MetastoreSnafu)?
+            .context(MissingVolumeSnafu {
+                name: db.volume.clone(),
+            })?;
+        let mut qualified_db = db.clone();
+        qualified_db.data.ident = qualified_ident.to_string();
+        let mut catalog = match &volume.volume {
+            VolumeType::S3Tables(vol) => {
+                let mut display_db = db.clone();
+                display_db.data.ident = display_name.to_string();
+                self.s3tables_iceberg_catalog(vol.clone(), &display_db)
+                    .await?
+            }
+            VolumeType::Memory => self
+                .get_embucket_catalog(&qualified_db, metastore)
+                .await?
+                .with_catalog_type(CatalogType::Memory),
+            _ => self.get_embucket_catalog(&qualified_db, metastore).await?,
+        };
+        catalog.name = display_name.to_string();
+        Self::warm_schema_cache(&catalog);
+        Ok(catalog)
+    }
+
+    async fn get_embucket_catalog(
+        &self,
+        db: &RwObject<Database>,
+        metastore: Arc<dyn Metastore>,
+    ) -> Result<CachingCatalog> {
         let iceberg_catalog: Arc<dyn Catalog> = Arc::new(
             EmbucketIcebergCatalog::new(
-                self.metastore.clone(),
+                metastore.clone(),
                 db.ident.clone(),
                 self.config.clone().into(),
             )
@@ -294,7 +365,7 @@ impl EmbucketCatalogList {
         );
         let catalog_provider: Arc<dyn CatalogProvider> = Arc::new(EmbucketCatalog::new(
             db.ident.clone(),
-            self.metastore.clone(),
+            metastore.clone(),
             iceberg_catalog.clone(),
             self.config.clone().into(),
         ));
@@ -309,7 +380,7 @@ impl EmbucketCatalogList {
             created_at: db.created_at,
             updated_at: db.created_at,
         })
-        .with_metastore(self.metastore.clone()))
+        .with_metastore(metastore.clone()))
     }
 
     #[tracing::instrument(

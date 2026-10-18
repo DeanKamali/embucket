@@ -9,10 +9,33 @@ use serde::{Deserialize, Serialize};
 /// Built-in bootstrap role. Members bypass all authorization checks.
 pub const ACCOUNTADMIN: &str = "ACCOUNTADMIN";
 
+/// The built-in account every pre-M15.4 record belongs to (design §21.4,
+/// M15.4 multi-account tenancy). Journals replayed without an `account`
+/// field deserialize into this account, keeping old deployments working.
+pub const DEFAULT_ACCOUNT: &str = "embucket";
+
+/// Serde default for record `account` fields — journals written before
+/// M15.4 carry no `account` and land in [`DEFAULT_ACCOUNT`].
+#[must_use]
+pub fn default_account() -> String {
+    DEFAULT_ACCOUNT.to_string()
+}
+
+/// A top-level account: the tenancy boundary for users, roles, grants,
+/// shares and databases (M15.4). Created with `CREATE ACCOUNT` (v1: on one
+/// shared account store — same-region trust boundary, §21.1-3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    pub name: String,
+}
+
 /// An account user. `login_name` authenticates over the wire; `name` is the
 /// object name referenced by DDL (`CREATE USER`, `GRANT … TO USER`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct User {
+    /// Owning account (M15.4); defaults to [`DEFAULT_ACCOUNT`] on replay.
+    #[serde(default = "default_account")]
+    pub account: String,
     pub name: String,
     pub login_name: String,
     pub password: String,
@@ -25,6 +48,9 @@ pub struct User {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Role {
+    /// Owning account (M15.4).
+    #[serde(default = "default_account")]
+    pub account: String,
     pub name: String,
 }
 
@@ -106,6 +132,9 @@ impl std::fmt::Display for AccountObject {
 /// A privilege grant: `role` may exercise `privilege` on `object`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
+    /// Owning account (M15.4).
+    #[serde(default = "default_account")]
+    pub account: String,
     pub role: String,
     pub privilege: Privilege,
     pub object: AccountObject,
@@ -114,6 +143,9 @@ pub struct Grant {
 /// A user-role link (`GRANT ROLE <role> TO USER <user>`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRole {
+    /// Owning account (M15.4).
+    #[serde(default = "default_account")]
+    pub account: String,
     pub user: String,
     pub role: String,
 }
@@ -123,6 +155,9 @@ pub struct UserRole {
 /// part of `parent`'s effective privilege set (transitively).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleRole {
+    /// Owning account (M15.4).
+    #[serde(default = "default_account")]
+    pub account: String,
     /// The granted (child) role.
     pub child: String,
     /// The receiving (parent) role.
@@ -139,6 +174,9 @@ pub struct LoginEvent {
     /// (M17.3.1). Events recorded before the field existed default to 0.
     #[serde(default)]
     pub sequence: u64,
+    /// Owning account (M15.4); old events default to [`DEFAULT_ACCOUNT`].
+    #[serde(default = "default_account")]
+    pub account: String,
     pub user_name: String,
     pub client_app_id: Option<String>,
     pub client_ip: Option<String>,
@@ -157,6 +195,9 @@ pub struct LoginEvent {
 /// case); cross-account transport is v2 (replication deferred).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Share {
+    /// Owning account (M15.4).
+    #[serde(default = "default_account")]
+    pub account: String,
     pub name: String,
     pub kind: ShareKind,
     /// The provider-side share an inbound share mounts (None for outbound).
@@ -183,6 +224,9 @@ impl Default for ShareKind {
 /// enforcement path, only a new grantee kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShareGrant {
+    /// Owning account (M15.4).
+    #[serde(default = "default_account")]
+    pub account: String,
     pub share: String,
     pub privilege: Privilege,
     pub object: AccountObject,

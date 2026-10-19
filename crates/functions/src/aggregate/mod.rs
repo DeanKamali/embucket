@@ -25,8 +25,10 @@ pub mod array_unique_agg;
 pub mod booland_agg;
 pub mod boolor_agg;
 pub mod boolxor_agg;
+pub mod count_if;
 pub mod errors;
 pub mod listagg;
+pub mod mode;
 pub mod object_agg;
 pub mod percentile_cont;
 
@@ -40,13 +42,29 @@ pub fn register_udafs(registry: &mut dyn FunctionRegistry) -> datafusion_common:
         booland_agg::get_udaf(),
         boolor_agg::get_udaf(),
         boolxor_agg::get_udaf(),
+        count_if::get_udaf(),
         listagg::get_udaf(),
+        mode::get_udaf(),
         object_agg::get_udaf(),
         percentile_cont::get_udaf(),
     ];
 
     for func in aggregate_functions {
         registry.register_udaf(func)?;
+    }
+
+    // Snowflake spellings of DataFusion's native approximate aggregates.
+    if let Ok(udaf) = registry.udaf("approx_distinct") {
+        let udaf = (*udaf).clone();
+        registry.register_udaf(std::sync::Arc::new(
+            udaf.with_aliases(["hll", "hll_estimate"]),
+        ))?;
+    }
+    if let Ok(udaf) = registry.udaf("approx_percentile_cont") {
+        let udaf = (*udaf).clone();
+        registry.register_udaf(std::sync::Arc::new(
+            udaf.with_aliases(["approx_percentile"]),
+        ))?;
     }
 
     Ok(())

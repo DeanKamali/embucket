@@ -43,12 +43,6 @@ pub const AGGREGATE_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/approx_count_distinct")
     ),
-    ("APPROX_PERCENTILE", FunctionInfo::new(
-        "APPROX_PERCENTILE",
-        "Returns an approximated value for the desired percentile (that is, if column c has n numbers, APPROX_PERCENTILE(c, p) returns a number such that approximately n * p of the numbers in c are smaller than the returned number)."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/approx_percentile")
-    ),
     ("APPROX_PERCENTILE_ACCUMULATE", FunctionInfo::new(
         "APPROX_PERCENTILE_ACCUMULATE",
         "Returns the internal representation of the t-Digest state (as a JSON object) at the end of aggregation."
@@ -139,23 +133,11 @@ pub const AGGREGATE_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/bitxor_agg")
     ),
-    ("COUNT_IF", FunctionInfo::new(
-        "COUNT_IF",
-        "Returns the number of records that satisfy a condition or NULL if no records satisfy the condition."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/count_if")
-    ),
     ("HASH_AGG", FunctionInfo::new(
         "HASH_AGG",
         "Returns an aggregate signed 64-bit hash value over the (unordered) set of input rows."
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/hash_agg")
-    ),
-    ("HLL", FunctionInfo::new(
-        "HLL",
-        "Uses HyperLogLog to return an approximation of the distinct cardinality of the input (i.e. HLL(col1, col2, ... ) returns an approximation of COUNT(DISTINCT col1, col2, ... ))."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/hll")
     ),
     ("HLL_ACCUMULATE", FunctionInfo::new(
         "HLL_ACCUMULATE",
@@ -168,12 +150,6 @@ pub const AGGREGATE_FUNCTIONS: &[(&str, FunctionInfo)] = &[
         "Combines (merges) input states into a single output state."
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/hll_combine")
-    ),
-    ("HLL_ESTIMATE", FunctionInfo::new(
-        "HLL_ESTIMATE",
-        "Returns the cardinality estimate for the given HyperLogLog state."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/hll_estimate")
     ),
     ("HLL_EXPORT", FunctionInfo::new(
         "HLL_EXPORT",
@@ -217,12 +193,6 @@ pub const AGGREGATE_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/min_by")
     ),
-    ("MODE", FunctionInfo::new(
-        "MODE",
-        "Returns the most frequent value for the values within expr1."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/mode")
-    ),
     ("PERCENTILE_DISC", FunctionInfo::new(
         "PERCENTILE_DISC",
         "Returns a percentile value based on a discrete distribution of the input column (specified in order_by_expr)."
@@ -257,28 +227,12 @@ pub const AGGREGATE_FUNCTIONS: &[(&str, FunctionInfo)] = &[
 
 pub const BITWISE_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     (
-        "BITAND",
-        FunctionInfo::new(
-            "BITAND",
-            "Returns the bitwise AND of two numeric or binary expressions.",
-        )
-        .with_docs("https://docs.snowflake.com/en/sql-reference/functions/bitand"),
-    ),
-    (
         "BITNOT",
         FunctionInfo::new(
             "BITNOT",
             "Returns the bitwise negation of a numeric or binary expression.",
         )
         .with_docs("https://docs.snowflake.com/en/sql-reference/functions/bitnot"),
-    ),
-    (
-        "BITOR",
-        FunctionInfo::new(
-            "BITOR",
-            "Returns the bitwise OR of two numeric or binary expressions.",
-        )
-        .with_docs("https://docs.snowflake.com/en/sql-reference/functions/bitor"),
     ),
     (
         "BITSHIFTLEFT",
@@ -297,14 +251,6 @@ pub const BITWISE_FUNCTIONS: &[(&str, FunctionInfo)] = &[
         .with_docs("https://docs.snowflake.com/en/sql-reference/functions/bitshiftright"),
     ),
     (
-        "BITXOR",
-        FunctionInfo::new(
-            "BITXOR",
-            "Returns the bitwise XOR of two numeric or binary expressions.",
-        )
-        .with_docs("https://docs.snowflake.com/en/sql-reference/functions/bitxor"),
-    ),
-    (
         "GETBIT",
         FunctionInfo::new(
             "GETBIT",
@@ -315,14 +261,6 @@ pub const BITWISE_FUNCTIONS: &[(&str, FunctionInfo)] = &[
 ];
 
 pub const CONDITIONAL_FUNCTIONS: &[(&str, FunctionInfo)] = &[
-    (
-        "BOOLNOT",
-        FunctionInfo::new(
-            "BOOLNOT",
-            "Computes the Boolean NOT of a single numeric expression.",
-        )
-        .with_docs("https://docs.snowflake.com/en/sql-reference/functions/boolnot"),
-    ),
     (
         "CASE",
         FunctionInfo::new("CASE", "Works like a cascading “if-then-else” statement.")
@@ -417,12 +355,6 @@ pub const CONTEXT_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/current_transaction")
     ),
-    ("CURRENT_USER", FunctionInfo::new(
-        "CURRENT_USER",
-        "Returns the name of the user currently logged into the system."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/current_user")
-    ),
     ("GETDATE", FunctionInfo::new(
         "GETDATE",
         "Returns the current timestamp for the system in the local time zone."
@@ -507,12 +439,6 @@ pub const CONTEXT_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/policy_context")
     ),
-    ("SYSDATE", FunctionInfo::new(
-        "SYSDATE",
-        "Returns the current timestamp for the system in the UTC time zone."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/sysdate")
-    ),
     ("SYSTIMESTAMP", FunctionInfo::new(
         "SYSTIMESTAMP",
         "Returns the current timestamp for the system."
@@ -589,13 +515,6 @@ pub const CONVERSION_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/to_geometry")
     .with_subcategory("geospatial")
-    ),
-    ("TO_JSON", FunctionInfo::new(
-        "TO_JSON",
-        "Converts a VARIANT value to a string containing the JSON representation of the value."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/to_json")
-    .with_subcategory("semi-structured")
     ),
     ("TO_XML", FunctionInfo::new(
         "TO_XML",
@@ -711,23 +630,11 @@ pub const DATETIME_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/last_successful_scheduled_time")
     ),
-    ("MONTHS_BETWEEN", FunctionInfo::new(
-        "MONTHS_BETWEEN",
-        "Returns the number of months between two DATE or TIMESTAMP values."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/months_between")
-    ),
     ("SCHEDULED_TIME", FunctionInfo::new(
         "SCHEDULED_TIME",
         "Returns the timestamp representing the scheduled time of the current alert."
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/scheduled_time")
-    ),
-    ("TIME_SLICE", FunctionInfo::new(
-        "TIME_SLICE",
-        "Calculates the beginning or end of a “slice” of time, where the length of the slice is a multiple of a standard unit of time (minute, hour, day, etc.)."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/time_slice")
     ),
 ];
 
@@ -1774,29 +1681,11 @@ pub const NOTIFICATION_FUNCTIONS: &[(&str, FunctionInfo)] = &[
 ];
 
 pub const NUMERIC_FUNCTIONS: &[(&str, FunctionInfo)] = &[
-    ("MOD", FunctionInfo::new(
-        "MOD",
-        "Returns the remainder of input expr1 divided by input expr2."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/mod")
-    ),
-    ("SIGN", FunctionInfo::new(
-        "SIGN",
-        "Returns the sign of its argument."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/sign")
-    ),
     ("SQUARE", FunctionInfo::new(
         "SQUARE",
         "Returns the square of a numeric expression (i.e. a numeric expression multiplied by itself)."
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/square")
-    ),
-    ("TRUNCATE", FunctionInfo::new(
-        "TRUNCATE",
-        "Rounds the input expression down to the nearest (or equal) integer closer to zero, or to the nearest equal or smaller value with the specified number of places after the decimal point."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/trunc")
     ),
     ("WIDTH_BUCKET", FunctionInfo::new(
         "WIDTH_BUCKET",
@@ -1977,29 +1866,11 @@ pub const STRING_BINARY_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/base64_decode_binary")
     ),
-    ("BASE64_DECODE_STRING", FunctionInfo::new(
-        "BASE64_DECODE_STRING",
-        "Decodes a Base64-encoded string to a string."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/base64_decode_string")
-    ),
-    ("BASE64_ENCODE", FunctionInfo::new(
-        "BASE64_ENCODE",
-        "Encodes the input (string or binary) using Base64 encoding."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/base64_encode")
-    ),
     ("CHAR", FunctionInfo::new(
         "CHAR",
         "Converts a Unicode code point (including 7-bit ASCII) into the character that matches the input Unicode."
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/chr")
-    ),
-    ("CHARINDEX", FunctionInfo::new(
-        "CHARINDEX",
-        "Searches for the first occurrence of the first argument in the second argument and, if successful, returns the position (1-based) of the first argument in the second argument."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/charindex")
     ),
     ("CLASSIFY_TEXT", FunctionInfo::new(
         "CLASSIFY_TEXT",
@@ -2071,12 +1942,6 @@ pub const STRING_BINARY_FUNCTIONS: &[(&str, FunctionInfo)] = &[
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/embed_text-snowflake-cortex")
     .with_subcategory("llm")
-    ),
-    ("ENDSWITH", FunctionInfo::new(
-        "ENDSWITH",
-        "Returns TRUE if the first expression ends with the second expression."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/endswith")
     ),
     ("EXTRACT_ANSWER", FunctionInfo::new(
         "EXTRACT_ANSWER",
@@ -2239,12 +2104,6 @@ pub const STRING_BINARY_FUNCTIONS: &[(&str, FunctionInfo)] = &[
         "The SPLIT_TEXT_RECURSIVE_CHARACTER function splits a string into shorter stings, recursively, for preprocessing text to be used with text embedding or search indexing functions."
     )
     .with_docs("https://docs.snowflake.com/en/sql-reference/functions/split_text_recursive_character-snowflake-cortex")
-    ),
-    ("STARTSWITH", FunctionInfo::new(
-        "STARTSWITH",
-        "Returns true if expr1 starts with expr2."
-    )
-    .with_docs("https://docs.snowflake.com/en/sql-reference/functions/startswith")
     ),
     ("SUMMARIZE", FunctionInfo::new(
         "SUMMARIZE",

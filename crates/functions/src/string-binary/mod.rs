@@ -4,6 +4,7 @@ use datafusion_expr::ScalarUDF;
 use datafusion_expr::registry::FunctionRegistry;
 use std::sync::Arc;
 
+pub mod charindex;
 pub mod errors;
 pub mod hex_decode_binary;
 pub mod hex_decode_string;
@@ -27,6 +28,7 @@ pub use errors::Error;
 
 pub fn register_udfs(registry: &mut dyn FunctionRegistry) -> datafusion_common::Result<()> {
     let functions: Vec<Arc<ScalarUDF>> = vec![
+        charindex::get_udf(),
         Arc::new(ScalarUDF::from(HexDecodeStringFunc::new(false))),
         Arc::new(ScalarUDF::from(HexDecodeStringFunc::new(true))),
         Arc::new(ScalarUDF::from(HexDecodeBinaryFunc::new(false))),
@@ -48,6 +50,20 @@ pub fn register_udfs(registry: &mut dyn FunctionRegistry) -> datafusion_common::
 
     for func in functions {
         registry.register_udf(func)?;
+    }
+
+    // Snowflake spellings of DataFusion's native starts_with/ends_with.
+    if let Ok(udf) = registry.udf("starts_with") {
+        registry.register_udf(std::sync::Arc::new({
+            let udf = (*udf).clone();
+            udf.with_aliases(["startswith"])
+        }))?;
+    }
+    if let Ok(udf) = registry.udf("ends_with") {
+        registry.register_udf(std::sync::Arc::new({
+            let udf = (*udf).clone();
+            udf.with_aliases(["endswith"])
+        }))?;
     }
 
     Ok(())

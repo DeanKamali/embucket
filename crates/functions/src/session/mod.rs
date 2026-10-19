@@ -86,6 +86,13 @@ fn current_ip_address_udf() -> ScalarUDF {
     create_session_context_udf!("current_ip_address", "")
 }
 
+/// Returns the name of the user currently logged into the session (v1:
+/// the default demo principal, since session metadata is not plumbed
+/// through the UDF registry).
+fn current_user_udf() -> ScalarUDF {
+    create_session_context_udf!("current_user", "embucket")
+}
+
 pub fn register_session_context_udfs(registry: &mut dyn FunctionRegistry) -> Result<()> {
     let udfs = [
         current_client_udf(),
@@ -96,6 +103,7 @@ pub fn register_session_context_udfs(registry: &mut dyn FunctionRegistry) -> Res
         current_schema_udf(),
         current_schemas_udf(),
         current_session_udf(),
+        current_user_udf(),
         current_version_udf(),
         current_warehouse_udf(),
     ];

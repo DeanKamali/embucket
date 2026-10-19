@@ -11,6 +11,7 @@ pub mod typeof_func;
 mod conversion;
 pub mod is_typeof;
 pub mod parse_json;
+pub mod to_json;
 
 use crate::semi_structured::array::{
     array_append, array_cat, array_compact, array_construct, array_contains, array_distinct,
@@ -99,6 +100,7 @@ pub fn register_udfs(registry: &mut dyn FunctionRegistry) -> Result<()> {
         Arc::new(ScalarUDF::from(ParseJsonFunc::new(true))),
         Arc::new(ScalarUDF::from(GetFunc::new(false))),
         Arc::new(ScalarUDF::from(GetFunc::new(true))),
+        to_json::get_udf(),
         typeof_func::get_udf(),
         variant_element::get_udf(),
     ];

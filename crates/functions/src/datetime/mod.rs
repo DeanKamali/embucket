@@ -12,10 +12,14 @@ pub mod dayname;
 pub mod errors;
 pub mod last_day;
 pub mod monthname;
+pub mod months_between;
 pub mod next_day;
 pub mod previous_day;
+pub mod sysdate;
 pub mod time_from_parts;
+pub mod time_slice;
 pub mod timestamp_from_parts;
+pub mod trunc;
 use crate::datetime::convert_timezone::ConvertTimezoneFunc;
 use crate::datetime::date_diff::DateDiffFunc;
 use crate::datetime::last_day::LastDayFunc;
@@ -34,10 +38,14 @@ pub fn register_udfs(
         dayname::get_udf(),
         Arc::new(ScalarUDF::from(LastDayFunc::new(session_params.clone()))),
         monthname::get_udf(),
+        months_between::get_udf(),
         next_day::get_udf(),
         previous_day::get_udf(),
+        sysdate::get_udf(),
         time_from_parts::get_udf(),
+        time_slice::get_udf(),
         timestamp_from_parts::get_udf(),
+        trunc::get_udf(),
     ];
 
     for func in functions {

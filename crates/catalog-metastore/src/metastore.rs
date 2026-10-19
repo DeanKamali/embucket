@@ -21,7 +21,7 @@ use iceberg_rust_spec::{
     table_metadata::{FormatVersion, SnapshotLog, TableMetadataBuilder},
     types::{StructField, Type},
 };
-use object_store::{ObjectStoreExt, ObjectStore, PutPayload, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use snafu::ResultExt;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -111,11 +111,7 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         self.create_schema(to, schema).await?;
         let tables = self.list_tables(from).await?;
         for table in &tables {
-            let target = TableIdent::new(
-                &to.database,
-                &to.schema,
-                &table.data.ident.table,
-            );
+            let target = TableIdent::new(&to.database, &to.schema, &table.data.ident.table);
             let source = &table.data.ident;
             self.clone_table(source, &target).await?;
         }
@@ -142,8 +138,7 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         self.create_database(&to.to_string(), database).await?;
         let mut cloned = 0;
         for schema in self.list_schemas(from).await? {
-            let target_schema =
-                SchemaIdent::new(to.to_string(), schema.data.ident.schema.clone());
+            let target_schema = SchemaIdent::new(to.to_string(), schema.data.ident.schema.clone());
             let source_schema = schema.data.ident.clone();
             cloned += self.clone_schema(&source_schema, &target_schema).await?;
         }
@@ -180,8 +175,10 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
 
     /// Schemas currently tombstoned (dropped) in `database`, most recent
     /// drop first (M17.2.2).
-    async fn list_dropped_schemas(&self, database: &DatabaseIdent)
-    -> Result<Vec<(RwObject<Schema>, i64)>>;
+    async fn list_dropped_schemas(
+        &self,
+        database: &DatabaseIdent,
+    ) -> Result<Vec<(RwObject<Schema>, i64)>>;
 
     /// Databases currently tombstoned (dropped), most recent drop first
     /// (M17.2.2).
@@ -212,10 +209,7 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         self.create_schema(to, schema).await?;
         let mut cloned = 0usize;
         for table in self.list_tables(from).await? {
-            if self
-                .clone_table_record_as_of(&table, to, point_ms)
-                .await?
-            {
+            if self.clone_table_record_as_of(&table, to, point_ms).await? {
                 cloned += 1;
             }
         }
@@ -223,11 +217,7 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
         // undrop) existed live at `point_ms` — clone them from their
         // tombstoned record.
         for (table, dropped_at) in self.list_dropped_tables_with_time(from).await? {
-            if dropped_at > point_ms
-                && self
-                    .clone_table_record_as_of(&table, to, point_ms)
-                    .await?
-            {
+            if dropped_at > point_ms && self.clone_table_record_as_of(&table, to, point_ms).await? {
                 cloned += 1;
             }
         }
@@ -263,8 +253,7 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
             if rw_ms(&schema) > point_ms {
                 continue; // created after the point
             }
-            let target_schema =
-                SchemaIdent::new(to.to_string(), schema.data.ident.schema.clone());
+            let target_schema = SchemaIdent::new(to.to_string(), schema.data.ident.schema.clone());
             let source_schema = schema.data.ident.clone();
             cloned += self
                 .clone_schema_as_of(&source_schema, &target_schema, point_ms)
@@ -371,8 +360,10 @@ pub trait Metastore: std::fmt::Debug + Send + Sync {
     ) -> Result<RwObject<DynamicTable>>;
     async fn get_dynamic_table(&self, ident: &TableIdent)
     -> Result<Option<RwObject<DynamicTable>>>;
-    async fn list_dynamic_tables(&self, schema: &SchemaIdent)
-    -> Result<Vec<RwObject<DynamicTable>>>;
+    async fn list_dynamic_tables(
+        &self,
+        schema: &SchemaIdent,
+    ) -> Result<Vec<RwObject<DynamicTable>>>;
     /// Every dynamic-table record across the metastore (scheduler iteration).
     async fn list_all_dynamic_tables(&self) -> Result<Vec<RwObject<DynamicTable>>>;
     async fn update_dynamic_table(
@@ -475,17 +466,22 @@ impl InMemoryMetastore {
     async fn replay(journal: &Arc<dyn CatalogJournal>) -> Result<MetastoreState> {
         let mut state = MetastoreState::default();
         for domain in journal::domain::REPLAY_ORDER {
-            let entries = journal
-                .list(domain)
-                .await
-                .map_err(|e| metastore_error::JournalSnafu { message: e.to_string() }.build())?;
+            let entries = journal.list(domain).await.map_err(|e| {
+                metastore_error::JournalSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
             for (_, value) in entries {
                 let record = CatalogRecord::from_bytes(domain, &value).map_err(|e| {
                     // One corrupt record must not brick the whole catalog:
                     // log and skip (matches the metering ledger's tolerant
                     // load).
                     tracing::error!(domain, error = %e, "skipping corrupt catalog record");
-                    metastore_error::JournalSnafu { message: e.to_string() }.build()
+                    metastore_error::JournalSnafu {
+                        message: e.to_string(),
+                    }
+                    .build()
                 })?;
                 Self::apply_record(&mut state, record);
             }
@@ -498,15 +494,17 @@ impl InMemoryMetastore {
     fn apply_record(state: &mut MetastoreState, record: CatalogRecord) {
         match record {
             CatalogRecord::Volume(row) => {
-                state.volumes.insert(row.data.ident.to_ascii_lowercase(), row);
+                state
+                    .volumes
+                    .insert(row.data.ident.to_ascii_lowercase(), row);
             }
             CatalogRecord::Database(row) => {
-                state.databases.insert(row.data.ident.to_ascii_lowercase(), row);
+                state
+                    .databases
+                    .insert(row.data.ident.to_ascii_lowercase(), row);
             }
             CatalogRecord::Schema(row) => {
-                state
-                    .schemas
-                    .insert(Self::schema_key(&row.data.ident), row);
+                state.schemas.insert(Self::schema_key(&row.data.ident), row);
             }
             CatalogRecord::Table(row) => {
                 state.tables.insert(Self::table_key(&row.data.ident), row);
@@ -549,9 +547,12 @@ impl InMemoryMetastore {
     /// mutation. With no journal this is a no-op.
     async fn journal_put(&self, record: &CatalogRecord) -> Result<()> {
         if let Some(journal) = &self.journal {
-            journal::put_record(journal, record)
-                .await
-                .map_err(|e| metastore_error::JournalSnafu { message: e.to_string() }.build())?;
+            journal::put_record(journal, record).await.map_err(|e| {
+                metastore_error::JournalSnafu {
+                    message: e.to_string(),
+                }
+                .build()
+            })?;
         }
         Ok(())
     }
@@ -559,15 +560,12 @@ impl InMemoryMetastore {
     /// Write-through: remove a record from the journal.
     async fn journal_delete(&self, domain: &str, key: &str) -> Result<()> {
         if let Some(journal) = &self.journal {
-            journal
-                .delete(domain, key)
-                .await
-                .map_err(|e| {
-                    metastore_error::JournalSnafu {
-                        message: format!("{domain}/{key}: {e}"),
-                    }
-                    .build()
-                })?;
+            journal.delete(domain, key).await.map_err(|e| {
+                metastore_error::JournalSnafu {
+                    message: format!("{domain}/{key}: {e}"),
+                }
+                .build()
+            })?;
         }
         Ok(())
     }
@@ -732,7 +730,8 @@ impl Metastore for InMemoryMetastore {
             .fail();
         }
         let row = RwObject::new(volume);
-        self.journal_put(&CatalogRecord::Volume(row.clone())).await?;
+        self.journal_put(&CatalogRecord::Volume(row.clone()))
+            .await?;
         state.volumes.insert(name.clone(), row.clone());
         self.object_store_cache.insert(name.clone(), object_store);
         Ok(row)
@@ -806,11 +805,8 @@ impl Metastore for InMemoryMetastore {
             for key in table_keys {
                 if let Some(table) = state.tables.remove(&key) {
                     let dropped_at = self.tombstone_ms();
-                    self.journal_put(&CatalogRecord::DroppedTable(
-                        table.clone(),
-                        dropped_at,
-                    ))
-                    .await?;
+                    self.journal_put(&CatalogRecord::DroppedTable(table.clone(), dropped_at))
+                        .await?;
                     self.journal_delete(
                         journal::domain::TABLES,
                         &Self::table_journal_key(&key.0, &key.1, &key.2),
@@ -821,11 +817,8 @@ impl Metastore for InMemoryMetastore {
             }
             for db in in_use {
                 state.databases.remove(&db);
-                self.journal_delete(
-                    journal::domain::DATABASES,
-                    &Self::database_journal_key(&db),
-                )
-                .await?;
+                self.journal_delete(journal::domain::DATABASES, &Self::database_journal_key(&db))
+                    .await?;
             }
         } else if !in_use.is_empty() {
             return metastore_error::VolumeInUseSnafu {
@@ -836,11 +829,8 @@ impl Metastore for InMemoryMetastore {
         if state.volumes.remove(name).is_some() {
             self.object_store_cache.remove(name);
         }
-        self.journal_delete(
-            journal::domain::VOLUMES,
-            &Self::database_journal_key(name),
-        )
-        .await?;
+        self.journal_delete(journal::domain::VOLUMES, &Self::database_journal_key(name))
+            .await?;
         Ok(())
     }
 
@@ -929,7 +919,13 @@ impl Metastore for InMemoryMetastore {
             .filter(|(db, _)| db == name)
             .cloned()
             .collect();
-        if !schema_keys.is_empty() && !cascade {
+        // Auxiliary schema-scoped objects (streams, tasks, dynamic tables,
+        // sequences) also block a non-cascade drop.
+        let aux_in_use = state.streams.keys().any(|(db, _, _)| db == name)
+            || state.tasks.keys().any(|(db, _, _)| db == name)
+            || state.dynamic_tables.keys().any(|(db, _, _)| db == name)
+            || state.sequences.keys().any(|(db, _, _)| db == name);
+        if (!schema_keys.is_empty() || aux_in_use) && !cascade {
             return metastore_error::DatabaseInUseSnafu {
                 database: name,
                 schema: schema_keys
@@ -946,11 +942,8 @@ impl Metastore for InMemoryMetastore {
         let dropped_at = self.tombstone_ms();
         for key in &schema_keys {
             if let Some(schema) = state.schemas.remove(key) {
-                self.journal_put(&CatalogRecord::DroppedSchema(
-                    schema.clone(),
-                    dropped_at,
-                ))
-                .await?;
+                self.journal_put(&CatalogRecord::DroppedSchema(schema.clone(), dropped_at))
+                    .await?;
                 state
                     .dropped_schemas
                     .insert(key.clone(), (schema, dropped_at));
@@ -969,11 +962,8 @@ impl Metastore for InMemoryMetastore {
             .collect();
         for key in &table_keys {
             if let Some(table) = state.tables.remove(key) {
-                self.journal_put(&CatalogRecord::DroppedTable(
-                    table.clone(),
-                    dropped_at,
-                ))
-                .await?;
+                self.journal_put(&CatalogRecord::DroppedTable(table.clone(), dropped_at))
+                    .await?;
                 self.journal_delete(
                     journal::domain::TABLES,
                     &Self::table_journal_key(&key.0, &key.1, &key.2),
@@ -983,6 +973,67 @@ impl Metastore for InMemoryMetastore {
                     .dropped_tables
                     .insert(key.clone(), (table, dropped_at));
             }
+        }
+        // Cascade the auxiliary domains too: streams, tasks, dynamic tables
+        // and sequences are schema-scoped records that must not survive (or
+        // block re-creation in) a dropped database. They are removed from
+        // the state maps and the journal but not tombstoned — UNDROP
+        // DATABASE restores schemas/tables only (M17.2.2 scope).
+        let stream_keys: Vec<_> = state
+            .streams
+            .keys()
+            .filter(|(db, _, _)| db == name)
+            .cloned()
+            .collect();
+        for key in stream_keys {
+            state.streams.remove(&key);
+            self.journal_delete(
+                journal::domain::STREAMS,
+                &Self::table_journal_key(&key.0, &key.1, &key.2),
+            )
+            .await?;
+        }
+        let task_keys: Vec<_> = state
+            .tasks
+            .keys()
+            .filter(|(db, _, _)| db == name)
+            .cloned()
+            .collect();
+        for key in task_keys {
+            state.tasks.remove(&key);
+            self.journal_delete(
+                journal::domain::TASKS,
+                &Self::table_journal_key(&key.0, &key.1, &key.2),
+            )
+            .await?;
+        }
+        let dt_keys: Vec<_> = state
+            .dynamic_tables
+            .keys()
+            .filter(|(db, _, _)| db == name)
+            .cloned()
+            .collect();
+        for key in dt_keys {
+            state.dynamic_tables.remove(&key);
+            self.journal_delete(
+                journal::domain::DYNAMIC_TABLES,
+                &Self::table_journal_key(&key.0, &key.1, &key.2),
+            )
+            .await?;
+        }
+        let seq_keys: Vec<_> = state
+            .sequences
+            .keys()
+            .filter(|(db, _, _)| db == name)
+            .cloned()
+            .collect();
+        for key in seq_keys {
+            state.sequences.remove(&key);
+            self.journal_delete(
+                journal::domain::SEQUENCES,
+                &Self::table_journal_key(&key.0, &key.1, &key.2),
+            )
+            .await?;
         }
         // M17.2.2: tombstone the database record itself (UNDROP DATABASE).
         if let Some(database) = state.databases.remove(name) {
@@ -1093,7 +1144,15 @@ impl Metastore for InMemoryMetastore {
             .filter(|(db, schema, _)| db == &ident.database && schema == &ident.schema)
             .cloned()
             .collect();
-        if !tables.is_empty() && !cascade {
+        // Auxiliary schema-scoped objects also block a non-cascade drop.
+        let aux_in_use = state
+            .streams
+            .keys()
+            .chain(state.tasks.keys())
+            .chain(state.dynamic_tables.keys())
+            .chain(state.sequences.keys())
+            .any(|(db, schema, _)| db == &ident.database && schema == &ident.schema);
+        if (!tables.is_empty() || aux_in_use) && !cascade {
             return metastore_error::SchemaNotFoundSnafu {
                 schema: ident.schema.clone(),
                 db: ident.database.clone(),
@@ -1106,11 +1165,8 @@ impl Metastore for InMemoryMetastore {
         let dropped_at = self.tombstone_ms();
         for key in tables {
             if let Some(table) = state.tables.remove(&key) {
-                self.journal_put(&CatalogRecord::DroppedTable(
-                    table.clone(),
-                    dropped_at,
-                ))
-                .await?;
+                self.journal_put(&CatalogRecord::DroppedTable(table.clone(), dropped_at))
+                    .await?;
                 self.journal_delete(
                     journal::domain::TABLES,
                     &Self::table_journal_key(&key.0, &key.1, &key.2),
@@ -1119,14 +1175,70 @@ impl Metastore for InMemoryMetastore {
                 state.dropped_tables.insert(key, (table, dropped_at));
             }
         }
+        // Cascade the auxiliary domains of this schema (streams, tasks,
+        // dynamic tables, sequences): removed from state + journal, not
+        // tombstoned (UNDROP SCHEMA restores tables only, M17.2.2 scope).
+        let stream_keys: Vec<_> = state
+            .streams
+            .keys()
+            .filter(|(db, schema, _)| db == &ident.database && schema == &ident.schema)
+            .cloned()
+            .collect();
+        for key in stream_keys {
+            state.streams.remove(&key);
+            self.journal_delete(
+                journal::domain::STREAMS,
+                &Self::table_journal_key(&key.0, &key.1, &key.2),
+            )
+            .await?;
+        }
+        let task_keys: Vec<_> = state
+            .tasks
+            .keys()
+            .filter(|(db, schema, _)| db == &ident.database && schema == &ident.schema)
+            .cloned()
+            .collect();
+        for key in task_keys {
+            state.tasks.remove(&key);
+            self.journal_delete(
+                journal::domain::TASKS,
+                &Self::table_journal_key(&key.0, &key.1, &key.2),
+            )
+            .await?;
+        }
+        let dt_keys: Vec<_> = state
+            .dynamic_tables
+            .keys()
+            .filter(|(db, schema, _)| db == &ident.database && schema == &ident.schema)
+            .cloned()
+            .collect();
+        for key in dt_keys {
+            state.dynamic_tables.remove(&key);
+            self.journal_delete(
+                journal::domain::DYNAMIC_TABLES,
+                &Self::table_journal_key(&key.0, &key.1, &key.2),
+            )
+            .await?;
+        }
+        let seq_keys: Vec<_> = state
+            .sequences
+            .keys()
+            .filter(|(db, schema, _)| db == &ident.database && schema == &ident.schema)
+            .cloned()
+            .collect();
+        for key in seq_keys {
+            state.sequences.remove(&key);
+            self.journal_delete(
+                journal::domain::SEQUENCES,
+                &Self::table_journal_key(&key.0, &key.1, &key.2),
+            )
+            .await?;
+        }
         // M17.2.2: tombstone the schema record itself (UNDROP SCHEMA, as-of
         // container clones) before removing it.
         if let Some(schema) = state.schemas.remove(&Self::schema_key(ident)) {
-            self.journal_put(&CatalogRecord::DroppedSchema(
-                schema.clone(),
-                dropped_at,
-            ))
-            .await?;
+            self.journal_put(&CatalogRecord::DroppedSchema(schema.clone(), dropped_at))
+                .await?;
             self.journal_delete(
                 journal::domain::SCHEMAS,
                 &Self::schema_journal_key(&ident.database, &ident.schema),
@@ -1292,12 +1404,7 @@ impl Metastore for InMemoryMetastore {
     /// source's snapshots/manifests (absolute paths) and volume, but gets its
     /// own location and a fresh metadata JSON, so subsequent commits to
     /// either table are independent.
-    #[instrument(
-        name = "Metastore::clone_table",
-        level = "debug",
-        skip(self),
-        err
-    )]
+    #[instrument(name = "Metastore::clone_table", level = "debug", skip(self), err)]
     async fn clone_table(&self, from: &TableIdent, to: &TableIdent) -> Result<RwObject<Table>> {
         let source = self.get_table(from).await?.ok_or_else(|| {
             metastore_error::TableNotFoundSnafu {
@@ -1555,11 +1662,8 @@ impl Metastore for InMemoryMetastore {
         let mut state = self.state.write().await;
         if let Some(table) = state.tables.remove(&Self::table_key(ident)) {
             let dropped_at = self.tombstone_ms();
-            self.journal_put(&CatalogRecord::DroppedTable(
-                table.clone(),
-                dropped_at,
-            ))
-            .await?;
+            self.journal_put(&CatalogRecord::DroppedTable(table.clone(), dropped_at))
+                .await?;
             self.journal_delete(
                 journal::domain::TABLES,
                 &Self::table_journal_key(&ident.database, &ident.schema, &ident.table),
@@ -1576,7 +1680,10 @@ impl Metastore for InMemoryMetastore {
     async fn undrop_table(&self, ident: &TableIdent) -> Result<RwObject<Table>> {
         let mut state = self.state.write().await;
         let key = Self::table_key(ident);
-        if !state.schemas.contains_key(&Self::schema_key(&ident.clone().into())) {
+        if !state
+            .schemas
+            .contains_key(&Self::schema_key(&ident.clone().into()))
+        {
             // Parent schema gone (dropped): UNDROP TABLE would create an
             // orphan — Snowflake errors; UNDROP SCHEMA restores the pair.
             return metastore_error::SchemaNotFoundSnafu {
@@ -1601,7 +1708,8 @@ impl Metastore for InMemoryMetastore {
             }
             .fail();
         };
-        self.journal_put(&CatalogRecord::Table(table.clone())).await?;
+        self.journal_put(&CatalogRecord::Table(table.clone()))
+            .await?;
         self.journal_delete(
             journal::domain::DROPPED_TABLES,
             &Self::table_journal_key(&ident.database, &ident.schema, &ident.table),
@@ -1611,7 +1719,12 @@ impl Metastore for InMemoryMetastore {
         Ok(table)
     }
 
-    #[instrument(name = "Metastore::list_dropped_tables", level = "trace", skip(self), err)]
+    #[instrument(
+        name = "Metastore::list_dropped_tables",
+        level = "trace",
+        skip(self),
+        err
+    )]
     async fn list_dropped_tables(&self, schema: &SchemaIdent) -> Result<Vec<RwObject<Table>>> {
         let state = self.state.read().await;
         let mut items: Vec<(RwObject<Table>, i64)> = state
@@ -1644,11 +1757,7 @@ impl Metastore for InMemoryMetastore {
         Ok(items)
     }
 
-    #[instrument(
-        name = "Metastore::list_dropped_schemas",
-        level = "trace",
-        ret
-    )]
+    #[instrument(name = "Metastore::list_dropped_schemas", level = "trace", ret)]
     async fn list_dropped_schemas(
         &self,
         database: &DatabaseIdent,
@@ -1738,16 +1847,10 @@ impl Metastore for InMemoryMetastore {
     async fn undrop_database(&self, ident: &DatabaseIdent) -> Result<RwObject<Database>> {
         let mut state = self.state.write().await;
         if state.databases.contains_key(ident) {
-            return metastore_error::DatabaseAlreadyExistsSnafu {
-                db: ident.clone(),
-            }
-            .fail();
+            return metastore_error::DatabaseAlreadyExistsSnafu { db: ident.clone() }.fail();
         }
         let Some((database, dropped_at)) = state.dropped_databases.remove(ident) else {
-            return metastore_error::DatabaseNotFoundSnafu {
-                db: ident.clone(),
-            }
-            .fail();
+            return metastore_error::DatabaseNotFoundSnafu { db: ident.clone() }.fail();
         };
         // Restore the schema tombstones the cascade created (schemas dropped
         // individually before the database drop stay tombstoned), then the
@@ -1825,10 +1928,7 @@ impl Metastore for InMemoryMetastore {
         );
         {
             let state = self.state.read().await;
-            if !state
-                .schemas
-                .contains_key(&Self::schema_key(to_schema))
-            {
+            if !state.schemas.contains_key(&Self::schema_key(to_schema)) {
                 return metastore_error::SchemaNotFoundSnafu {
                     schema: to_schema.schema.clone(),
                     db: to_schema.database.clone(),
@@ -1864,22 +1964,15 @@ impl Metastore for InMemoryMetastore {
                 .max_by_key(|e| e.timestamp_ms)
                 .map(|e| e.snapshot_id);
             let snapshot = match snapshot_id {
-                Some(id) => Some(
-                    source
-                        .data
-                        .metadata
-                        .snapshots
-                        .get(&id)
-                        .ok_or_else(|| {
-                            metastore_error::SnapshotNotFoundSnafu {
-                                snapshot: id,
-                                table: to.table.clone(),
-                                schema: to.schema.clone(),
-                                db: to.database.clone(),
-                            }
-                            .build()
-                        })?,
-                ),
+                Some(id) => Some(source.data.metadata.snapshots.get(&id).ok_or_else(|| {
+                    metastore_error::SnapshotNotFoundSnafu {
+                        snapshot: id,
+                        table: to.table.clone(),
+                        schema: to.schema.clone(),
+                        db: to.database.clone(),
+                    }
+                    .build()
+                })?),
                 None => None,
             };
             let (snapshots, snapshot_log, refs) = match (snapshot_id, snapshot) {
@@ -1921,19 +2014,15 @@ impl Metastore for InMemoryMetastore {
                 .build()
                 .context(metastore_error::TableMetadataBuilderSnafu)?;
 
-            let object_store =
-                self.table_object_store(&to)
-                    .await?
-                    .ok_or_else(|| {
-                        metastore_error::TableObjectStoreNotFoundSnafu {
-                            table: to.table.clone(),
-                            schema: to.schema.clone(),
-                            db: to.database.clone(),
-                        }
-                        .build()
-                    })?;
-            let metadata_location =
-                self.put_metadata(&to, object_store, &metadata).await?;
+            let object_store = self.table_object_store(&to).await?.ok_or_else(|| {
+                metastore_error::TableObjectStoreNotFoundSnafu {
+                    table: to.table.clone(),
+                    schema: to.schema.clone(),
+                    db: to.database.clone(),
+                }
+                .build()
+            })?;
+            let metadata_location = self.put_metadata(&to, object_store, &metadata).await?;
 
             let clone = Table {
                 ident: to.clone(),
@@ -1946,8 +2035,7 @@ impl Metastore for InMemoryMetastore {
                 format: source.data.format.clone(),
             };
             let row = RwObject::new(clone);
-            self.journal_put(&CatalogRecord::Table(row.clone()))
-                .await?;
+            self.journal_put(&CatalogRecord::Table(row.clone())).await?;
             self.state
                 .write()
                 .await
@@ -1962,8 +2050,7 @@ impl Metastore for InMemoryMetastore {
             ..table.data.clone()
         };
         let row = RwObject::new(clone);
-        self.journal_put(&CatalogRecord::Table(row.clone()))
-            .await?;
+        self.journal_put(&CatalogRecord::Table(row.clone())).await?;
         self.state
             .write()
             .await
@@ -2029,7 +2116,12 @@ impl Metastore for InMemoryMetastore {
         self.settings_config.clone()
     }
 
-    #[instrument(name = "Metastore::create_stream", level = "debug", skip(self, stream), err)]
+    #[instrument(
+        name = "Metastore::create_stream",
+        level = "debug",
+        skip(self, stream),
+        err
+    )]
     async fn create_stream(&self, ident: &TableIdent, stream: Stream) -> Result<RwObject<Stream>> {
         let mut state = self.state.write().await;
         if !state
@@ -2067,7 +2159,12 @@ impl Metastore for InMemoryMetastore {
             .collect())
     }
 
-    #[instrument(name = "Metastore::update_stream", level = "debug", skip(self, stream), err)]
+    #[instrument(
+        name = "Metastore::update_stream",
+        level = "debug",
+        skip(self, stream),
+        err
+    )]
     async fn update_stream(&self, ident: &TableIdent, stream: Stream) -> Result<RwObject<Stream>> {
         let mut state = self.state.write().await;
         let row = state
@@ -2110,7 +2207,12 @@ impl Metastore for InMemoryMetastore {
         Ok(())
     }
 
-    #[instrument(name = "Metastore::create_task", level = "debug", skip(self, task), err)]
+    #[instrument(
+        name = "Metastore::create_task",
+        level = "debug",
+        skip(self, task),
+        err
+    )]
     async fn create_task(&self, ident: &TableIdent, task: Task) -> Result<RwObject<Task>> {
         let mut state = self.state.write().await;
         if !state
@@ -2153,7 +2255,12 @@ impl Metastore for InMemoryMetastore {
         Ok(state.tasks.values().cloned().collect())
     }
 
-    #[instrument(name = "Metastore::update_task", level = "debug", skip(self, task), err)]
+    #[instrument(
+        name = "Metastore::update_task",
+        level = "debug",
+        skip(self, task),
+        err
+    )]
     async fn update_task(&self, ident: &TableIdent, task: Task) -> Result<RwObject<Task>> {
         let mut state = self.state.write().await;
         let row = state
@@ -2175,17 +2282,14 @@ impl Metastore for InMemoryMetastore {
     #[instrument(name = "Metastore::delete_task", level = "debug", skip(self), err)]
     async fn delete_task(&self, ident: &TableIdent) -> Result<()> {
         let mut state = self.state.write().await;
-        let removed = state
-            .tasks
-            .remove(&Self::table_key(ident))
-            .ok_or_else(|| {
-                metastore_error::TaskNotFoundSnafu {
-                    task: ident.table.clone(),
-                    schema: ident.schema.clone(),
-                    db: ident.database.clone(),
-                }
-                .build()
-            })?;
+        let removed = state.tasks.remove(&Self::table_key(ident)).ok_or_else(|| {
+            metastore_error::TaskNotFoundSnafu {
+                task: ident.table.clone(),
+                schema: ident.schema.clone(),
+                db: ident.database.clone(),
+            }
+            .build()
+        })?;
         drop(removed);
         self.journal_delete(
             journal::domain::TASKS,
@@ -2242,7 +2346,12 @@ impl Metastore for InMemoryMetastore {
             .collect())
     }
 
-    #[instrument(name = "Metastore::list_all_sequences", level = "debug", skip(self), err)]
+    #[instrument(
+        name = "Metastore::list_all_sequences",
+        level = "debug",
+        skip(self),
+        err
+    )]
     async fn list_all_sequences(&self) -> Result<Vec<RwObject<Sequence>>> {
         let state = self.state.read().await;
         Ok(state.sequences.values().cloned().collect())
@@ -2360,7 +2469,12 @@ impl Metastore for InMemoryMetastore {
         Ok(row)
     }
 
-    #[instrument(name = "Metastore::get_dynamic_table", level = "debug", skip(self), err)]
+    #[instrument(
+        name = "Metastore::get_dynamic_table",
+        level = "debug",
+        skip(self),
+        err
+    )]
     async fn get_dynamic_table(
         &self,
         ident: &TableIdent,
@@ -2369,7 +2483,12 @@ impl Metastore for InMemoryMetastore {
         Ok(state.dynamic_tables.get(&Self::table_key(ident)).cloned())
     }
 
-    #[instrument(name = "Metastore::list_dynamic_tables", level = "debug", skip(self), err)]
+    #[instrument(
+        name = "Metastore::list_dynamic_tables",
+        level = "debug",
+        skip(self),
+        err
+    )]
     async fn list_dynamic_tables(
         &self,
         schema: &SchemaIdent,
@@ -2423,7 +2542,12 @@ impl Metastore for InMemoryMetastore {
         Ok(row.clone())
     }
 
-    #[instrument(name = "Metastore::delete_dynamic_table", level = "debug", skip(self), err)]
+    #[instrument(
+        name = "Metastore::delete_dynamic_table",
+        level = "debug",
+        skip(self),
+        err
+    )]
     async fn delete_dynamic_table(&self, ident: &TableIdent) -> Result<()> {
         let mut state = self.state.write().await;
         let removed = state
@@ -2621,9 +2745,12 @@ mod undrop_tests {
 
     async fn metastore_with_table(db: &str, schema: &str, table: &str) -> InMemoryMetastore {
         let ms = InMemoryMetastore::new();
-        ms.create_volume(&"vol".to_string(), Volume::new("vol".into(), VolumeType::Memory))
-            .await
-            .expect("volume");
+        ms.create_volume(
+            &"vol".to_string(),
+            Volume::new("vol".into(), VolumeType::Memory),
+        )
+        .await
+        .expect("volume");
         ms.create_database(
             &db.to_string(),
             Database {
@@ -2673,7 +2800,12 @@ mod undrop_tests {
         ms.delete_table(&ident, false).await.expect("drop");
         // Hidden from resolution and listing…
         assert!(!ms.get_table(&ident).await.unwrap().is_some());
-        assert!(ms.list_tables(&SchemaIdent::new("d".into(), "s".into())).await.unwrap().is_empty());
+        assert!(
+            ms.list_tables(&SchemaIdent::new("d".into(), "s".into()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // …but tombstoned.
         let dropped = ms
             .list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
@@ -2685,11 +2817,12 @@ mod undrop_tests {
         let restored = ms.undrop_table(&ident).await.expect("undrop");
         assert_eq!(restored.ident, ident);
         assert!(ms.get_table(&ident).await.unwrap().is_some());
-        assert!(ms
-            .list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            ms.list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         // UNDROP of a live table errors (name occupied).
         let err = ms.undrop_table(&ident).await.unwrap_err().to_string();
@@ -2763,11 +2896,12 @@ mod undrop_tests {
         ms.undrop_schema(&SchemaIdent::new("d".into(), "s".into()))
             .await
             .expect("undrop schema");
-        assert!(ms
-            .get_schema(&SchemaIdent::new("d".into(), "s".into()))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            ms.get_schema(&SchemaIdent::new("d".into(), "s".into()))
+                .await
+                .unwrap()
+                .is_some()
+        );
         // The cascade table tombstone was consumed by the schema restore.
         assert!(ms.get_table(&ident).await.unwrap().is_some());
         let dropped = ms
@@ -2816,7 +2950,10 @@ mod undrop_tests {
             .expect("db drop");
         assert!(!ms.get_database(&"d".to_string()).await.unwrap().is_some());
         assert_eq!(
-            ms.list_dropped_schemas(&"d".to_string()).await.unwrap().len(),
+            ms.list_dropped_schemas(&"d".to_string())
+                .await
+                .unwrap()
+                .len(),
             2
         );
 
@@ -2827,23 +2964,31 @@ mod undrop_tests {
         assert_eq!(restored.data.ident, "d");
         // Both schemas and both cascade tables are back; tombstones consumed.
         for s in ["s1", "s2"] {
-            assert!(ms
-                .get_schema(&SchemaIdent::new("d".into(), s.into()))
+            assert!(
+                ms.get_schema(&SchemaIdent::new("d".into(), s.into()))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            ms.get_table(&TableIdent::new("d", "s1", "t1"))
                 .await
                 .unwrap()
-                .is_some());
-        }
-        assert!(ms
-            .get_table(&TableIdent::new("d", "s1", "t1"))
-            .await
-            .unwrap()
-            .is_some());
-        assert!(ms
-            .get_table(&TableIdent::new("d", "s2", "t2"))
-            .await
-            .unwrap()
-            .is_some());
-        assert!(ms.list_dropped_schemas(&"d".to_string()).await.unwrap().is_empty());
+                .is_some()
+        );
+        assert!(
+            ms.get_table(&TableIdent::new("d", "s2", "t2"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            ms.list_dropped_schemas(&"d".to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(ms.list_dropped_databases().await.unwrap().is_empty());
     }
 
@@ -2864,16 +3009,18 @@ mod undrop_tests {
             .await
             .expect("undrop schema");
         // t2 (cascade drop) is restored; t1 (individual drop) stays dropped.
-        assert!(ms
-            .get_table(&TableIdent::new("d", "s", "t2"))
-            .await
-            .unwrap()
-            .is_some());
-        assert!(!ms
-            .get_table(&TableIdent::new("d", "s", "t1"))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            ms.get_table(&TableIdent::new("d", "s", "t2"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !ms.get_table(&TableIdent::new("d", "s", "t1"))
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             ms.list_dropped_tables(&SchemaIdent::new("d".into(), "s".into()))
                 .await
@@ -2953,9 +3100,12 @@ mod clone_as_of_tests {
 
     async fn metastore_with_table(db: &str, schema: &str, table: &str) -> InMemoryMetastore {
         let ms = InMemoryMetastore::new();
-        ms.create_volume(&"vol".to_string(), Volume::new("vol".into(), VolumeType::Memory))
-            .await
-            .expect("volume");
+        ms.create_volume(
+            &"vol".to_string(),
+            Volume::new("vol".into(), VolumeType::Memory),
+        )
+        .await
+        .expect("volume");
         ms.create_database(
             &db.to_string(),
             Database {
@@ -3012,11 +3162,12 @@ mod clone_as_of_tests {
             .to_string();
         assert!(err.contains("Snapshot 42 not found"), "got: {err}");
         // Target must not have been created by the failed clone.
-        assert!(!ms
-            .get_table(&TableIdent::new("d", "s", "t2"))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            !ms.get_table(&TableIdent::new("d", "s", "t2"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -3040,11 +3191,12 @@ mod clone_as_of_tests {
             .await
             .expect("clone as-of before creation");
         assert_eq!(cloned, 0);
-        assert!(!ms
-            .get_table(&TableIdent::new("d", "s2", "t"))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            !ms.get_table(&TableIdent::new("d", "s2", "t"))
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         // Point after creation: the never-committed record clones as-is.
         let cloned = ms
@@ -3056,11 +3208,12 @@ mod clone_as_of_tests {
             .await
             .expect("clone as-of after creation");
         assert_eq!(cloned, 1);
-        assert!(ms
-            .get_table(&TableIdent::new("d", "s3", "t"))
-            .await
-            .unwrap()
-            .is_some());
+        assert!(
+            ms.get_table(&TableIdent::new("d", "s3", "t"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -3090,9 +3243,12 @@ mod automation_tests {
 
     async fn metastore_with_table(db: &str, schema: &str, table: &str) -> InMemoryMetastore {
         let ms = InMemoryMetastore::new();
-        ms.create_volume(&"vol".to_string(), Volume::new("vol".into(), VolumeType::Memory))
-            .await
-            .expect("volume");
+        ms.create_volume(
+            &"vol".to_string(),
+            Volume::new("vol".into(), VolumeType::Memory),
+        )
+        .await
+        .expect("volume");
         ms.create_database(
             &db.to_string(),
             Database {
@@ -3180,7 +3336,11 @@ mod automation_tests {
             append_only: false,
             comment: None,
         };
-        assert!(ms.create_stream(&stream.ident.clone(), stream).await.is_err());
+        assert!(
+            ms.create_stream(&stream.ident.clone(), stream)
+                .await
+                .is_err()
+        );
         // A second stream with the same name is rejected.
         let st = TableIdent::new("d", "s", "st");
         let stream = Stream {
@@ -3212,8 +3372,8 @@ mod automation_tests {
         };
         assert!(ms.create_task(&st, task.clone()).await.is_err());
         // Table colliding with the stream is rejected.
-        assert!(ms
-            .create_table(
+        assert!(
+            ms.create_table(
                 &st,
                 TableCreateRequest {
                     ident: st.clone(),
@@ -3229,7 +3389,8 @@ mod automation_tests {
                 }
             )
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3263,10 +3424,7 @@ mod automation_tests {
         assert_eq!(after.state, TaskState::Suspended);
         assert_eq!(after.last_run_state, Some(TaskRunState::Succeeded));
 
-        assert_eq!(
-            ms.list_all_tasks().await.expect("list_all").len(),
-            1
-        );
+        assert_eq!(ms.list_all_tasks().await.expect("list_all").len(), 1);
         assert_eq!(
             ms.list_tasks(&SchemaIdent::new("d".to_string(), "s".to_string()))
                 .await
@@ -3274,11 +3432,12 @@ mod automation_tests {
                 .len(),
             1
         );
-        assert!(ms
-            .list_tasks(&SchemaIdent::new("d".to_string(), "other".to_string()))
-            .await
-            .expect("list other")
-            .is_empty());
+        assert!(
+            ms.list_tasks(&SchemaIdent::new("d".to_string(), "other".to_string()))
+                .await
+                .expect("list other")
+                .is_empty()
+        );
 
         ms.delete_task(&ident).await.expect("delete");
         assert!(ms.get_task(&ident).await.expect("get").is_none());
@@ -3298,7 +3457,9 @@ mod automation_tests {
             base_table: None,
             stream_ident: None,
         };
-        ms.create_dynamic_table(&ident, record).await.expect("create");
+        ms.create_dynamic_table(&ident, record)
+            .await
+            .expect("create");
         let fetched = ms
             .get_dynamic_table(&ident)
             .await
@@ -3318,10 +3479,275 @@ mod automation_tests {
             1
         );
         ms.delete_dynamic_table(&ident).await.expect("delete");
-        assert!(ms
-            .get_dynamic_table(&ident)
+        assert!(ms.get_dynamic_table(&ident).await.expect("get").is_none());
+    }
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    //! Cascade-drop regression (design §22.9): `delete_database` /
+    //! `delete_schema` must also drop the auxiliary domains (streams,
+    //! tasks, dynamic tables, sequences) from state *and* the journal, or
+    //! re-creating a same-named database/schema fails with
+    //! "already exists" (M16.4 probe regression).
+
+    use super::*;
+    use crate::models::automation::{RefreshMode, TaskSchedule, TaskState};
+    use crate::models::table::TableFormat;
+    use crate::models::volumes::{Volume, VolumeType};
+    use iceberg_rust_spec::types::PrimitiveType;
+
+    fn test_schema() -> IcebergSchema {
+        let mut builder = IcebergSchema::builder();
+        builder.with_schema_id(0);
+        builder.with_struct_field(StructField::new(
+            1,
+            "id",
+            false,
+            Type::Primitive(PrimitiveType::Long),
+            None,
+        ));
+        builder.build().expect("schema builds")
+    }
+
+    async fn metastore_with_fixtures(db: &str, schema: &str) -> InMemoryMetastore {
+        let ms = InMemoryMetastore::new();
+        ms.create_volume(
+            &"vol".to_string(),
+            Volume::new("vol".into(), VolumeType::Memory),
+        )
+        .await
+        .expect("volume");
+        ms.create_database(
+            &db.to_string(),
+            Database {
+                ident: db.to_string(),
+                properties: None,
+                volume: "vol".to_string(),
+                should_refresh: false,
+                account: crate::DEFAULT_DATABASE_ACCOUNT.to_string(),
+            },
+        )
+        .await
+        .expect("database");
+        ms.create_schema(
+            &SchemaIdent::new(db.to_string(), schema.to_string()),
+            Schema {
+                ident: SchemaIdent::new(db.to_string(), schema.to_string()),
+                properties: None,
+            },
+        )
+        .await
+        .expect("schema");
+        ms.create_table(
+            &TableIdent::new(db, schema, "src"),
+            TableCreateRequest {
+                ident: TableIdent::new(db, schema, "src"),
+                properties: None,
+                format: Some(TableFormat::Iceberg),
+                location: None,
+                schema: test_schema(),
+                partition_spec: None,
+                sort_order: None,
+                stage_create: None,
+                volume_ident: Some("vol".to_string()),
+                is_temporary: Some(false),
+            },
+        )
+        .await
+        .expect("table");
+
+        let stream_ident = TableIdent::new(db, schema, "st1");
+        ms.create_stream(
+            &stream_ident,
+            Stream {
+                ident: stream_ident.clone(),
+                source: TableIdent::new(db, schema, "src"),
+                offset_snapshot: Some(1),
+                append_only: false,
+                comment: None,
+            },
+        )
+        .await
+        .expect("stream");
+        let task_ident = TableIdent::new(db, schema, "tk1");
+        ms.create_task(
+            &task_ident,
+            Task {
+                ident: task_ident.clone(),
+                definition: "SELECT 1".to_string(),
+                schedule: Some(TaskSchedule::Minutes(5)),
+                state: TaskState::Suspended,
+                warehouse: None,
+                predecessor: None,
+                last_run_ms: None,
+                last_run_state: None,
+            },
+        )
+        .await
+        .expect("task");
+        let dt_ident = TableIdent::new(db, schema, "dt1");
+        ms.create_dynamic_table(
+            &dt_ident,
+            DynamicTable {
+                ident: dt_ident.clone(),
+                definition: "SELECT 1".to_string(),
+                warehouse: None,
+                target_lag_seconds: Some(60),
+                last_refresh_ms: None,
+                refresh_mode: RefreshMode::Full,
+                base_table: None,
+                stream_ident: None,
+            },
+        )
+        .await
+        .expect("dynamic table");
+        let seq_ident = TableIdent::new(db, schema, "sq1");
+        ms.create_sequence(
+            &seq_ident,
+            Sequence {
+                ident: seq_ident.clone(),
+                start: 1,
+                increment: 1,
+                current: 0,
+                comment: None,
+            },
+        )
+        .await
+        .expect("sequence");
+        ms
+    }
+
+    async fn recreate_database_and_schema(ms: &InMemoryMetastore, db: &str, schema: &str) {
+        ms.create_database(
+            &db.to_string(),
+            Database {
+                ident: db.to_string(),
+                properties: None,
+                volume: "vol".to_string(),
+                should_refresh: false,
+                account: crate::DEFAULT_DATABASE_ACCOUNT.to_string(),
+            },
+        )
+        .await
+        .expect("recreate database");
+        ms.create_schema(
+            &SchemaIdent::new(db.to_string(), schema.to_string()),
+            Schema {
+                ident: SchemaIdent::new(db.to_string(), schema.to_string()),
+                properties: None,
+            },
+        )
+        .await
+        .expect("recreate schema");
+    }
+
+    async fn assert_aux_lists_empty(ms: &InMemoryMetastore, db: &str, schema: &str) {
+        let schema_ident = SchemaIdent::new(db.to_string(), schema.to_string());
+        assert!(
+            ms.list_streams(&schema_ident)
+                .await
+                .expect("streams")
+                .is_empty()
+        );
+        assert!(
+            ms.list_tasks(&schema_ident)
+                .await
+                .expect("tasks")
+                .is_empty()
+        );
+        assert!(
+            ms.list_dynamic_tables(&schema_ident)
+                .await
+                .expect("dynamic tables")
+                .is_empty()
+        );
+        assert!(
+            ms.list_sequences(&schema_ident)
+                .await
+                .expect("sequences")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_database_cascades_aux_domains_and_allows_recreation() {
+        let ms = metastore_with_fixtures("d", "s").await;
+        ms.delete_database(&"d".to_string(), true)
             .await
-            .expect("get")
-            .is_none());
+            .expect("cascade drop");
+        recreate_database_and_schema(&ms, "d", "s").await;
+        assert_aux_lists_empty(&ms, "d", "s").await;
+
+        // Same names must be free again (the old "already exists" bug).
+        let stream_ident = TableIdent::new("d", "s", "st1");
+        ms.create_stream(
+            &stream_ident,
+            Stream {
+                ident: stream_ident.clone(),
+                source: TableIdent::new("d", "s", "src"),
+                offset_snapshot: None,
+                append_only: false,
+                comment: None,
+            },
+        )
+        .await
+        .expect("re-create stream");
+        let seq_ident = TableIdent::new("d", "s", "sq1");
+        ms.create_sequence(
+            &seq_ident,
+            Sequence {
+                ident: seq_ident.clone(),
+                start: 1,
+                increment: 1,
+                current: 0,
+                comment: None,
+            },
+        )
+        .await
+        .expect("re-create sequence");
+    }
+
+    #[tokio::test]
+    async fn delete_schema_cascades_aux_domains_and_allows_recreation() {
+        let ms = metastore_with_fixtures("d", "s").await;
+        ms.delete_schema(&SchemaIdent::new("d".to_string(), "s".to_string()), true)
+            .await
+            .expect("cascade drop");
+        ms.create_schema(
+            &SchemaIdent::new("d".to_string(), "s".to_string()),
+            Schema {
+                ident: SchemaIdent::new("d".to_string(), "s".to_string()),
+                properties: None,
+            },
+        )
+        .await
+        .expect("recreate schema");
+        assert_aux_lists_empty(&ms, "d", "s").await;
+
+        let seq_ident = TableIdent::new("d", "s", "sq1");
+        ms.create_sequence(
+            &seq_ident,
+            Sequence {
+                ident: seq_ident.clone(),
+                start: 1,
+                increment: 1,
+                current: 0,
+                comment: None,
+            },
+        )
+        .await
+        .expect("re-create sequence");
+    }
+
+    #[tokio::test]
+    async fn delete_database_non_cascade_still_rejects_aux_domains() {
+        let ms = metastore_with_fixtures("d", "s").await;
+        let err = ms
+            .delete_database(&"d".to_string(), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("in use"), "got: {err}");
     }
 }

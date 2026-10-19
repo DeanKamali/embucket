@@ -424,6 +424,11 @@ impl UserQuery {
         // reserve value chunks at parse time, before the text re-serializes
         // (the rewritten text is what actually plans/executes).
         if let DFStatement::Statement(stmt) = &mut statement {
+            // Session-variable reads (design §22.9): inline `$name` into
+            // literals before the text re-serializes and plans.
+            crate::session_variables::rewrite_session_variables(stmt, &|name| {
+                self.session.get_session_variable(name)
+            });
             crate::sequences::rewrite_sequences(&self.session, stmt, |parts| {
                 Self::normalized_to_table_ident(self.resolve_table_object_name(parts)?)
             })
@@ -601,7 +606,8 @@ impl UserQuery {
                     return Box::pin(self.show_query(*s)).await;
                 }
                 Statement::Truncate(truncate) => {
-                    return Box::pin(self.truncate_table(truncate.table_names)).await;
+                    return Box::pin(self.truncate_table(truncate.table_names, truncate.if_exists))
+                        .await;
                 }
                 Statement::Query(subquery) => {
                     return self.execute_query_statement(subquery).await;
@@ -2796,12 +2802,27 @@ impl UserQuery {
     pub async fn truncate_table(
         &self,
         table_names: Vec<TruncateTableTarget>,
+        if_exists: bool,
     ) -> Result<QueryResult> {
         let Some(first_table) = table_names.into_iter().next() else {
             return ex_error::NoTableNamesForTruncateTableSnafu {}.fail();
         };
 
         let object_name = self.resolve_table_object_name(first_table.name.0)?;
+        if if_exists {
+            // Snowflake: TRUNCATE TABLE IF EXISTS on a missing table is a
+            // no-op success rather than a compilation error.
+            let resolved = self.resolve_table_ref(object_name.to_string());
+            let exists = self
+                .get_catalog(&resolved.catalog)
+                .ok()
+                .and_then(|c| c.schema(&resolved.schema))
+                .map(|s| s.table_exist(&resolved.table))
+                .unwrap_or(false);
+            if !exists {
+                return self.status_response();
+            }
+        }
         let mut query = self.session.query(
             format!(
                 "CREATE OR REPLACE TABLE {object_name} as (SELECT * FROM {object_name} WHERE FALSE)",

@@ -23,6 +23,7 @@ pub mod result_cache;
 pub mod running_queries;
 pub mod scheduler;
 pub mod sequences;
+pub mod session_variables;
 pub mod service;
 pub mod session;
 pub mod share_catalog;

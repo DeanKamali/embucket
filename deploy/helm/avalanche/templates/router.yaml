@@ -34,6 +34,8 @@ spec:
             - secretRef:
                 name: {{ include "avalanche.fullname" . }}-auth
           env:
+            - name: BUCKET_HOST
+              value: "0.0.0.0"
             - name: BUCKET_PORT
               value: {{ .Values.router.service.port | quote }}
             - name: WAREHOUSE_DRIVER

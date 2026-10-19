@@ -1,0 +1,76 @@
+{{/* PG state store: catalog journal (`state_catalog`), sessions, warehouses,
+metering. Single replica is the tested shape; the router replays on startup,
+so PG is the only durable piece. */}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "avalanche.fullname" . }}-pg
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "avalanche.labels" . | nindent 4 }}
+    app.kubernetes.io/component: statestore
+spec:
+  serviceName: {{ include "avalanche.fullname" . }}-pg
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "avalanche.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: statestore
+  template:
+    metadata:
+      labels:
+        {{- include "avalanche.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: statestore
+    spec:
+      containers:
+        - name: pg
+          image: {{ .Values.statestore.image }}
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.statestore.username | quote }}
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.statestore.password | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.statestore.database | quote }}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.statestore.username | quote }}, "-d", {{ .Values.statestore.database | quote }}]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          {{- with .Values.statestore.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.statestore.storage }}
+        {{- with .Values.statestore.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "avalanche.fullname" . }}-pg
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "avalanche.labels" . | nindent 4 }}
+    app.kubernetes.io/component: statestore
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "avalanche.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: statestore
+  ports:
+    - port: {{ .Values.statestore.servicePort }}
+      targetPort: 5432

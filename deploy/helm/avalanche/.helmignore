@@ -1,0 +1,6 @@
+*.swp
+*.bak
+*.orig
+.project
+.idea
+.DS_Store

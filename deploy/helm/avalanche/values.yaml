@@ -1,0 +1,67 @@
+# Default values for the Avalanche "from zero" bundle.
+#
+# Installs: PG state store (StatefulSet), embucketd router (Deployment +
+# NodePort Service), and the compute-isolation NetworkPolicy that the
+# docker/k8s/networkpolicy.yaml manifest ships for warehouse pods.
+#
+# Warehouse compute (scheduler/executor pods per warehouse) is NOT templated
+# here: the router's KubectlDriver creates it lazily on CREATE WAREHOUSE, and
+# the operator CRD (v2) is the declarative path. The chart only tells the
+# router which images to use and where to put the pods.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# --- PG state store (catalog journal, sessions, warehouses, metering) -------
+statestore:
+  image: postgres:16
+  username: embucket
+  password: embucket # dev default; override for anything real
+  database: avalanche
+  servicePort: 5432
+  storage: 10Gi
+  storageClass: ""
+  resources: {}
+
+# --- embucketd router -------------------------------------------------------
+router:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/deankamali/embucketd
+    tag: "latest" # prefer pinning a sha-<rev> tag for reproducibility
+    pullPolicy: Always
+  auth:
+    demoUser: embucket
+    demoPassword: embucket
+    jwtSecret: "dev-secret" # override for anything real
+  service:
+    type: NodePort
+    port: 3090
+    nodePort: 30090
+  resources: {}
+  # Optional hostPath mount so file:// external tables work (single node).
+  hostDataPath: ""
+  extraEnv: []
+
+# --- warehouse compute (driven by the router) -------------------------------
+warehouse:
+  driver: k8s
+  namespace: "" # empty -> the release namespace
+  # Pull policy applied to warehouse pods the router creates. `Always`
+  # requires a registry (the production path); `IfNotPresent` works with
+  # pre-imported images on the node (the air-gapped path).
+  imagePullPolicy: IfNotPresent
+  schedulerImage: ghcr.io/deankamali/avalanche-scheduler:latest
+  executorImage: ghcr.io/deankamali/avalanche-executor:latest
+
+# --- network isolation for warehouse pods ------------------------------------
+networkPolicy:
+  enabled: true
+  # Adjust for your CNI: k3s flannel default pod CIDR.
+  podCidr: 10.42.0.0/16
+  # Node/router host IPs allowed to dial warehouse compute.
+  hostCidrs:
+    - 184.107.176.4/32
+
+# Optional registry credentials for pulling GHCR images on private clusters.
+imagePullSecrets: []

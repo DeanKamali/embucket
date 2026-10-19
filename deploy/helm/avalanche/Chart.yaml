@@ -1,0 +1,8 @@
+apiVersion: v2
+name: avalanche
+description: Avalanche Data Engine on Kubernetes (router, PG state store, network isolation)
+type: application
+version: 0.1.0
+appVersion: "m15"
+maintainers:
+  - name: Dean Kamali

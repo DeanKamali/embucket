@@ -1,0 +1,91 @@
+{{/* Router deployment + Service. Stateless; sessions rehydrate from PG, so
+rolling updates are safe. Warehouse compute is driven via env overrides
+(WAREHOUSE_SCHEDULER_IMAGE / WAREHOUSE_EXECUTOR_IMAGE) and lands in
+warehouse.namespace. */}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "avalanche.fullname" . }}-router
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "avalanche.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+spec:
+  replicas: {{ .Values.router.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "avalanche.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: router
+  template:
+    metadata:
+      labels:
+        {{- include "avalanche.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: router
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: router
+          image: "{{ .Values.router.image.repository }}:{{ .Values.router.image.tag }}"
+          imagePullPolicy: {{ .Values.router.image.pullPolicy }}
+          envFrom:
+            - secretRef:
+                name: {{ include "avalanche.fullname" . }}-auth
+          env:
+            - name: BUCKET_PORT
+              value: {{ .Values.router.service.port | quote }}
+            - name: WAREHOUSE_DRIVER
+              value: {{ .Values.warehouse.driver | quote }}
+            - name: WAREHOUSE_NAMESPACE
+              value: {{ .Values.warehouse.namespace | default .Release.Namespace | quote }}
+            - name: WAREHOUSE_IMAGE_PULL_POLICY
+              value: {{ .Values.warehouse.imagePullPolicy | quote }}
+            - name: WAREHOUSE_SCHEDULER_IMAGE
+              value: {{ .Values.warehouse.schedulerImage | quote }}
+            - name: WAREHOUSE_EXECUTOR_IMAGE
+              value: {{ .Values.warehouse.executorImage | quote }}
+            - name: RUST_MIN_STACK
+              value: "33554432"
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - containerPort: {{ .Values.router.service.port }}
+          {{- if .Values.router.hostDataPath }}
+          volumeMounts:
+            - name: host-data
+              mountPath: {{ .Values.router.hostDataPath }}
+          {{- end }}
+          {{- with .Values.router.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- if .Values.router.hostDataPath }}
+      volumes:
+        - name: host-data
+          hostPath:
+            path: {{ .Values.router.hostDataPath }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "avalanche.fullname" . }}-router
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "avalanche.labels" . | nindent 4 }}
+    app.kubernetes.io/component: router
+spec:
+  type: {{ .Values.router.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "avalanche.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: router
+  ports:
+    - port: {{ .Values.router.service.port }}
+      targetPort: {{ .Values.router.service.port }}
+      {{- if and (eq .Values.router.service.type "NodePort") .Values.router.service.nodePort }}
+      nodePort: {{ .Values.router.service.nodePort }}
+      {{- end }}

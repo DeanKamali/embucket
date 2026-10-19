@@ -1,0 +1,31 @@
+{{/*
+Wraps docker/k8s/networkpolicy.yaml: default-deny ingress for warehouse
+pods, then allows same-namespace compute traffic and the router host.
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: avalanche-compute-isolation
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "avalanche.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: avalanche
+  policyTypes: ["Ingress"]
+  ingress:
+    # scheduler <-> executors (all warehouse compute traffic)
+    - from:
+        - podSelector: {}
+    # router on the host dialing scheduler gRPC (50050) and scheduler
+    # dialing executor flight services (50051/50052)
+    - from:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.podCidr | quote }}
+        {{- range .Values.networkPolicy.hostCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+{{- end }}

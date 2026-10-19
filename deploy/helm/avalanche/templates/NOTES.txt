@@ -1,0 +1,17 @@
+Avalanche Data Engine installed.
+
+  namespace: {{ .Release.Namespace }}
+  router Service: {{ include "avalanche.fullname" . }}-router ({{ .Values.router.service.type }}, port {{ .Values.router.service.port }})
+
+Health check:
+  curl http://<node-ip>:{{ .Values.router.service.nodePort | default .Values.router.service.port }}/health
+
+Connect (any Snowflake client) and create a warehouse; scheduler/executor
+pods appear in namespace {{ .Values.warehouse.namespace | default .Release.Namespace }}:
+  CREATE WAREHOUSE etl_wh WITH WAREHOUSE_SIZE = 'MEDIUM' AUTO_SUSPEND = 300;
+  SHOW WAREHOUSES;
+
+Override warehouse images (GHCR sha tags recommended):
+  --set warehouse.schedulerImage=ghcr.io/deankamali/avalanche-scheduler:<sha> \
+  --set warehouse.executorImage=ghcr.io/deankamali/avalanche-executor:<sha> \
+  --set warehouse.imagePullPolicy=Always

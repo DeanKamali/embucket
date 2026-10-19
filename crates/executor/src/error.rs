@@ -362,6 +362,13 @@ pub enum Error {
         location: Location,
     },
 
+    #[snafu(display("Streaming channel error: {message}"))]
+    StreamingChannel {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("CatalogList failed"))]
     CatalogListDowncast {
         #[snafu(implicit)]

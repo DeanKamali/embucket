@@ -1,6 +1,7 @@
 use super::handlers::{abort, heartbeat, login, logout, query, session};
 use super::layer::require_auth;
 use super::state::AppState;
+use super::streaming::{create_streaming_auth_router, create_streaming_router};
 use api_snowflake_rest_sessions::layer::Host;
 use axum::middleware;
 use axum::routing::post;
@@ -37,9 +38,26 @@ pub fn make_snowflake_router(app_state: AppState) -> Router {
             require_auth,
         ));
     let snowflake_auth_router = create_auth_router()
-        .with_state(app_state)
-        .layer(compression_layer)
+        .with_state(app_state.clone())
+        .layer(compression_layer.clone())
         .layer(Extension(Host(String::default())));
 
-    snowflake_router.merge(snowflake_auth_router)
+    let streaming_auth_router = create_streaming_auth_router()
+        .with_state(app_state.clone())
+        .layer(compression_layer.clone())
+        .layer(Extension(Host(String::default())));
+
+    let streaming_router = create_streaming_router()
+        .with_state(app_state.clone())
+        .layer(compression_layer)
+        .layer(Extension(Host(String::default())))
+        .layer(middleware::from_fn_with_state(
+            app_state,
+            require_auth,
+        ));
+
+    snowflake_router
+        .merge(snowflake_auth_router)
+        .merge(streaming_auth_router)
+        .merge(streaming_router)
 }

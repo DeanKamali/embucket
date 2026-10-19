@@ -7,5 +7,6 @@ pub mod logic;
 pub mod router;
 pub mod server_models;
 pub mod state;
+pub mod streaming;
 
 pub use router::make_snowflake_router;

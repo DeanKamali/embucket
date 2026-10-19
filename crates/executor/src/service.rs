@@ -58,6 +58,65 @@ pub const TIMEOUT_SIGNAL_INTERVAL_SECONDS: u64 = 60;
 
 pub const TIMEOUT_DISCARD_INTERVAL_SECONDS: u64 = 60;
 
+/// Streaming ingest channel (Snowpipe-compatible named channel, M18.1):
+/// durable channel state kept in the state store. The sequencer generation
+/// is bumped on every channel (re)open so continuation tokens from older
+/// generations go stale; the committed offset token is the client's own
+/// identifier (exactly-once bookkeeping stays with the client).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct StreamingChannelRecord {
+    pub database: String,
+    pub schema: String,
+    pub pipe: String,
+    pub channel: String,
+    /// Generation bumped on every channel (re)open; continuation tokens
+    /// from older generations are stale.
+    pub sequencer: u64,
+    /// Counter the next append must present as its continuation token.
+    pub next_continuation: u64,
+    pub last_committed_offset_token: Option<String>,
+    pub rows_inserted: u64,
+    pub rows_parsed: u64,
+    pub rows_error_count: u64,
+    pub last_error_message: Option<String>,
+    pub created_on_ms: i64,
+}
+
+impl StreamingChannelRecord {
+    /// State-store key: `{db}.{schema}.{pipe}.{channel}` (lowercased).
+    #[must_use]
+    pub fn ident_key(&self) -> String {
+        streaming_channel_key(
+            &self.database,
+            &self.schema,
+            &self.pipe,
+            &self.channel,
+        )
+    }
+}
+
+/// `{db}.{schema}.{pipe}.{channel}` key for [`StreamingChannelRecord`]
+/// (Snowflake resolves these names case-insensitively; storage key is
+/// lowercased).
+#[must_use]
+pub fn streaming_channel_key(database: &str, schema: &str, pipe: &str, channel: &str) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        database.to_lowercase(),
+        schema.to_lowercase(),
+        pipe.to_lowercase(),
+        channel.to_lowercase()
+    )
+}
+
+/// State-store raw domain for streaming channel records.
+pub const STREAMING_CHANNELS_DOMAIN: &str = "streaming_channels";
+
+/// Session id shared by all Snowpipe-style ingest requests (channels carry
+/// their own target table; the session is just the DataFusion execution
+/// context).
+pub const STREAMING_INGEST_SESSION_ID: &str = "snowpipe-streaming-ingest";
+
 #[async_trait::async_trait]
 pub trait ExecutionService: Send + Sync {
     /// Creates (or returns an existing) session.
@@ -159,6 +218,25 @@ pub trait ExecutionService: Send + Sync {
         data: Bytes,
         file_name: &str,
         format: Format,
+    ) -> Result<usize>;
+
+    // --- Snowpipe-compatible streaming ingest channels (M18.1) ---
+    /// Persist or replace one streaming channel record.
+    async fn put_streaming_channel(&self, record: &StreamingChannelRecord) -> Result<()>;
+    /// List all streaming channel records (small counts; list-then-find is
+    /// the access path).
+    async fn list_streaming_channels(&self) -> Result<Vec<StreamingChannelRecord>>;
+    /// Remove a streaming channel record by key; a missing channel is not
+    /// an error.
+    async fn delete_streaming_channel(&self, key: &str) -> Result<()>;
+
+    /// Insert pre-parsed record batches into `{db}.{schema}.{table}`,
+    /// creating the table if missing (streaming ingest path).
+    async fn upload_batches_to_table(
+        &self,
+        session_id: &str,
+        table_ident: &MetastoreTableIdent,
+        batches: Vec<RecordBatch>,
     ) -> Result<usize>;
 
     async fn timeout_signal(&self, interval: Duration, idle_timeout: Duration) -> ();
@@ -1191,6 +1269,151 @@ impl ExecutionService for CoreExecutionService {
             .iter()
             .map(|batch: &RecordBatch| batch.num_rows())
             .sum();
+
+        let table = MemTable::try_new(schema, vec![batches]).context(ex_error::DataFusionSnafu)?;
+        user_session
+            .ctx
+            .register_table(source_table.clone(), Arc::new(table))
+            .context(ex_error::DataFusionSnafu)?;
+
+        let table = source_table.clone();
+        let query = if exists {
+            format!("INSERT INTO {table_ident} SELECT * FROM {table}")
+        } else {
+            format!("CREATE TABLE {table_ident} AS SELECT * FROM {table}")
+        };
+
+        let mut query = user_session.query(&query, QueryContext::default());
+        Box::pin(query.execute()).await?;
+
+        user_session
+            .ctx
+            .deregister_table(source_table)
+            .context(ex_error::DataFusionSnafu)?;
+
+        Ok(rows_loaded)
+    }
+
+    #[cfg(feature = "state-store")]
+    async fn put_streaming_channel(&self, record: &StreamingChannelRecord) -> Result<()> {
+        let value = serde_json::to_vec(record).map_err(|err| {
+            ex_error::StreamingChannelSnafu {
+                message: format!("serialize channel {}: {err}", record.ident_key()),
+            }
+            .build()
+        })?;
+        self.state_store
+            .put_raw(STREAMING_CHANNELS_DOMAIN, &record.ident_key(), value)
+            .await
+            .context(ex_error::StateStoreSnafu)
+    }
+
+    #[cfg(not(feature = "state-store"))]
+    async fn put_streaming_channel(&self, _record: &StreamingChannelRecord) -> Result<()> {
+        ex_error::StreamingChannelSnafu {
+            message: "state store is required for streaming channels",
+        }
+        .fail()
+    }
+
+    #[cfg(feature = "state-store")]
+    async fn list_streaming_channels(&self) -> Result<Vec<StreamingChannelRecord>> {
+        let mut records = Vec::new();
+        for (_, value) in self
+            .state_store
+            .list_raw(STREAMING_CHANNELS_DOMAIN)
+            .await
+            .context(ex_error::StateStoreSnafu)?
+        {
+            match serde_json::from_slice::<StreamingChannelRecord>(&value) {
+                Ok(record) => records.push(record),
+                Err(err) => {
+                    // Skip corrupt rows rather than failing every channel.
+                    tracing::warn!(error = %err, "skipping corrupt streaming channel record");
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    #[cfg(not(feature = "state-store"))]
+    async fn list_streaming_channels(&self) -> Result<Vec<StreamingChannelRecord>> {
+        ex_error::StreamingChannelSnafu {
+            message: "state store is required for streaming channels",
+        }
+        .fail()
+    }
+
+    #[cfg(feature = "state-store")]
+    async fn delete_streaming_channel(&self, key: &str) -> Result<()> {
+        self.state_store
+            .delete_raw(STREAMING_CHANNELS_DOMAIN, key)
+            .await
+            .context(ex_error::StateStoreSnafu)
+    }
+
+    #[cfg(not(feature = "state-store"))]
+    async fn delete_streaming_channel(&self, _key: &str) -> Result<()> {
+        ex_error::StreamingChannelSnafu {
+            message: "state store is required for streaming channels",
+        }
+        .fail()
+    }
+
+    async fn upload_batches_to_table(
+        &self,
+        session_id: &str,
+        table_ident: &MetastoreTableIdent,
+        batches: Vec<RecordBatch>,
+    ) -> Result<usize> {
+        let user_session = {
+            let sessions = self.df_sessions.read().await;
+            sessions
+                .get(session_id)
+                .ok_or_else(|| {
+                    ex_error::MissingDataFusionSessionSnafu {
+                        id: session_id.to_string(),
+                    }
+                    .build()
+                })?
+                .clone()
+        };
+
+        let schema = batches
+            .first()
+            .map(|batch| batch.schema())
+            .ok_or_else(|| {
+                ex_error::StreamingChannelSnafu {
+                    message: "no rows in payload",
+                }
+                .build()
+            })?;
+
+        let unique_id = Uuid::new_v4().to_string().replace('-', "_");
+        let source_table =
+            TableReference::full("tmp_db", "tmp_schema", format!("tmp_table_{unique_id}"));
+        let target_table = TableReference::full(
+            table_ident.database.clone(),
+            table_ident.schema.clone(),
+            table_ident.table.clone(),
+        );
+        let inmem_catalog = MemoryCatalogProvider::new();
+        inmem_catalog
+            .register_schema(
+                source_table.schema().unwrap_or_default(),
+                Arc::new(MemorySchemaProvider::new()),
+            )
+            .context(ex_error::DataFusionSnafu)?;
+        user_session.ctx.register_catalog(
+            source_table.catalog().unwrap_or_default(),
+            Arc::new(inmem_catalog),
+        );
+        let exists = user_session
+            .ctx
+            .table_exist(target_table.clone())
+            .context(ex_error::DataFusionSnafu)?;
+
+        let rows_loaded = batches.iter().map(RecordBatch::num_rows).sum();
 
         let table = MemTable::try_new(schema, vec![batches]).context(ex_error::DataFusionSnafu)?;
         user_session

@@ -6,6 +6,7 @@ on:
     branches: [m15-shares]
     paths:
       - 'docker/**'
+      - '.dockerignore'
       - '.github/workflows/images.yml'
     tags: ['v*']
 

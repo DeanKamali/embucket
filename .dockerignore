@@ -1,4 +1,11 @@
-target
+# Keep the build tree out of the image context, but the Dockerfiles COPY
+# the three release binaries, so those files have to stay visible.
+target/*
+!target/release
+target/release/*
+!target/release/embucketd
+!target/release/avalanche-scheduler
+!target/release/avalanche-executor
 .git
 .github
 data

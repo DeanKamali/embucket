@@ -1,0 +1,14 @@
+# Sample warehouse. `spec.executors` is explicit in the spike (the
+# size-to-executor ladder stays in the router's manager for now).
+# scheduler_image/executor_image point at the registry path; for the local
+# k3s test they use the upstream Ballista images already on the node.
+apiVersion: avalanche.stackblaze.cloud/v1
+kind: AvalancheWarehouse
+metadata:
+  name: etl
+spec:
+  executors: 2
+  suspended: false
+  scheduler_image: ghcr.io/apache/datafusion-ballista-scheduler:latest
+  executor_image: ghcr.io/apache/datafusion-ballista-executor:latest
+  image_pull_policy: IfNotPresent

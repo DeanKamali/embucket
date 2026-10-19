@@ -1,0 +1,42 @@
+# Operator RBAC (namespaced spike): the controller manages warehouse compute
+# in its namespace only. ClusterRole would be the production shape once the
+# operator owns CRDs + admission.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: avalanche-operator
+  namespace: avalanche
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: avalanche-operator
+  namespace: avalanche
+rules:
+  # Warehouse compute + status writes on the CRD itself
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["avalanche.stackblaze.cloud"]
+    resources: ["avalanchewarehouses"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["avalanche.stackblaze.cloud"]
+    resources: ["avalanchewarehouses/status"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["avalanche.stackblaze.cloud"]
+    resources: ["avalanchewarehouses/finalizers"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: avalanche-operator
+  namespace: avalanche
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: avalanche-operator
+subjects:
+  - kind: ServiceAccount
+    name: avalanche-operator
+    namespace: avalanche
